@@ -16,6 +16,8 @@ test("Linux onboarding lists optional asset tools and their actual skip behavior
     "skips them and exits successfully",
     "skips it when Chrome is absent",
     "Khronos fetch and voxel generation",
+    "exits nonzero after attempting the independent fetchers",
+    "masks/T_Cloud.png",
     "node tools/fetch-khronos.ts",
     "manifest.json",
   ]) {
