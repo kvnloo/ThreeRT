@@ -129,7 +129,24 @@ npm install @threert/scene @threert/gameplay
 
 ### Build the engine from source
 
-The engine is Rust and [wgpu](https://wgpu.rs): hardware ray queries where the GPU has them (Metal, Vulkan), a software BVH where it does not. You need Rust, Node 24 and [Bun](https://bun.sh).
+The engine is Rust and [wgpu](https://wgpu.rs): hardware ray queries where the GPU has them (Metal, Vulkan), a software BVH where it does not. You need Rust 1.100.0 (pinned in `rust-toolchain.toml`), Node 24 and [Bun](https://bun.sh).
+
+#### Linux prerequisites and optional demo assets
+
+On Linux, install Git, `curl`, `unzip`, Python 3 with `venv` and `pip`, and a Vulkan driver/loader for GPU rendering. Asset setup uses the network and creates an `assets/` symlink to a machine-shared store; the binaries are not committed. For example, on Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git curl unzip python3 python3-venv python3-pip
+```
+
+The **full demo catalog** also needs these optional tools (neither is needed for CPU-only checks):
+
+- **Blender** (`blender` on `PATH`, or `BLENDER=/absolute/path/to/blender`) converts the ORCA Bistro and Zero-Day models. `scripts/orca.ts` skips them and exits successfully if Blender is missing; Blender also makes the optional Quaternius walker LOD.
+- **Chrome/Chromium** (set `CHROME=/absolute/path/to/chrome` on Linux) downloads Quaternius' animation library. `scripts/setup.ts` skips it when Chrome is absent and the library has not already been fetched, leaving mannequin demos without their GLB.
+- **Kabukichō signs** need Python 3 (Pillow/NumPy are installed into a venv) and Japanese fonts. The generator still uses macOS-only Hiragino filenames, so a stock Linux install may fail that step. Setup now continues after sign failure to the Khronos fetch and voxel generation, but exits nonzero after attempting the independent fetchers, listing every failed step; downloaded Khronos assets do not mean setup succeeded. See [issue #73](https://github.com/meshy-dev/ThreeRT/issues/73) and the separate open font fix [#75](https://github.com/meshy-dev/ThreeRT/pull/75); a font directory alone is not enough unless the required Hiragino filenames exist. The missing Bistro plant is separately tracked in [#76](https://github.com/meshy-dev/ThreeRT/pull/76).
+
+If sign generation fails, `node tools/fetch-khronos.ts` can also fetch the three Khronos sample GLBs independently **after** the `assets/` link exists. A failed sign run may leave an empty `assets/kabukicho/textures/` directory; setup now checks `textures/manifest.json` and the final `masks/T_Cloud.png` before skipping generation on retry. These file-existence checks do not validate every generated texture.
 
 ```bash
 npm install && bun scripts/setup.ts      # assets/ -> the machine's shared asset store, then fetch what is missing
@@ -147,6 +164,18 @@ In the window: drag to orbit, right-drag to pan, wheel to zoom, WASD/QE to fly, 
 npm test && npm run typecheck && (cd renderer && cargo test --release)   # scene API, gameplay, runtime and engine tests
 npm run test:render                                                      # the render test suite, on the GPU
 ```
+
+#### CPU-only checks (no GPU)
+
+```bash
+npm ci
+bun scripts/setup.ts --no-fetch    # link the asset store; no downloads or asset completeness check
+npm run typecheck
+npm test
+node tools/three-compat.ts --no-render
+```
+
+These check the TypeScript API and compatibility bindings without opening a GPU. The compatibility command reports unsupported snippets; these checks do **not** prove demo assets are complete or that render/pixel tests pass. `npm run test:render` requires a renderer/GPU.
 
 ## Demos in this repository
 

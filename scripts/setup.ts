@@ -12,6 +12,7 @@
 import { $ } from "bun";
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { fetchSetupAssets } from "./setup-fetch.ts";
 
 const args = process.argv.slice(2);
 const opt = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : undefined);
@@ -78,24 +79,20 @@ for (const wt of worktrees) {
 
 if (args.includes("--no-fetch")) process.exit(0);
 
-// Fetchers (each skips what exists). Kabukichō's generated textures need python3; Quaternius needs Google Chrome; the
-// ORCA scenes need Blender.
-const a = (p: string) => join(root, "assets", p);
-const helmet = a("DamagedHelmet.glb");
-if (!existsSync(helmet)) {
-  console.log("fetching DamagedHelmet.glb");
-  await $`curl -fL -C - --retry 5 -o ${helmet} https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb`;
-}
-await $`node tools/fetch-polyhaven.ts`.cwd(root);
-await $`node tools/fetch-polyhaven.ts --set kabukicho-ue --res 2k`.cwd(root);
-if (!existsSync(a("kabukicho/textures"))) await $`node tools/kabukicho-assets.ts`.cwd(root);
-await $`node tools/fetch-khronos.ts`.cwd(root);
+// Independent fetchers are run in order; failure is reported at the end, not hidden by a later success.
 const chrome = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-if (existsSync(chrome) || existsSync(a("quaternius/ual/UAL1_Standard.glb"))) await $`node tools/fetch-quaternius.ts`.cwd(root);
-else console.log("skipping Quaternius (needs Google Chrome, or CHROME=<binary>): the mannequin scenes and animation/skinned-pose test need it");
-// Bistro and Zero Day (ORCA, FBX + DDS -> glTF; needs Blender, skips itself without it; ~2 GB download once).
-await $`bun scripts/orca.ts`.cwd(root);
-// The voxel benchmark level (games/voxel-level, ROADMAP § 6 step 2): generated, not downloaded (~4 s, ~0.3 GB; skips a
-// level already built). Other box granularities: `node tools/voxel-level/generate.ts --granularity brick|object`.
-await $`node tools/voxel-level/generate.ts --granularity region`.cwd(root);
+await fetchSetupAssets(join(root, "assets"), existsSync(chrome), {
+  helmet: async () => {
+    const helmet = join(root, "assets/DamagedHelmet.glb");
+    console.log("fetching DamagedHelmet.glb");
+    await $`curl -fL -C - --retry 5 -o ${helmet} https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb`;
+  },
+  polyhaven: async () => { await $`node tools/fetch-polyhaven.ts`.cwd(root); },
+  kabukichoPolyhaven: async () => { await $`node tools/fetch-polyhaven.ts --set kabukicho-ue --res 2k`.cwd(root); },
+  signs: async () => { await $`node tools/kabukicho-assets.ts`.cwd(root); },
+  khronos: async () => { await $`node tools/fetch-khronos.ts`.cwd(root); },
+  quaternius: async () => { await $`node tools/fetch-quaternius.ts`.cwd(root); },
+  orca: async () => { await $`bun scripts/orca.ts`.cwd(root); },
+  voxel: async () => { await $`node tools/voxel-level/generate.ts --granularity region`.cwd(root); },
+});
 console.log((await $`du -sh ${store}`.text()).trim());
