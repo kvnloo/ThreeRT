@@ -19,6 +19,10 @@ pub struct Gpu {
     pub uniform_tables: bool,
     /// The kernel's switches this device was opened with (`KernelSwitches`): they are in `source`.
     pub switches: KernelSwitches,
+    /// The approximations a live view's kernel takes (`A_*`): the options' (`GpuOptions::approx`) unless a view asked
+    /// for others (`set_approx`).
+    pub approx: u32,
+    approx_default: u32,
     /// Compiled pipelines kept between runs (`GpuOptions::pipeline_cache`), where the backend has such a cache.
     pipeline_cache: Option<crate::pipeline_cache::PipelineCache>,
     /// Kernel source (hardware or software traversal spliced in); scenes with material functions get their own module.
@@ -33,7 +37,7 @@ pub struct Gpu {
     pipeline_layout: wgpu::PipelineLayout,
     /// Kernel variants by (feature mask, material-function code hash, LIVE): `FEAT` compiles out the features a scene
     /// does not use (they cost registers even when idle); `LIVE` = one fresh sample per dispatch for the viewport.
-    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), wgpu::ComputePipeline>>,
+    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), wgpu::ComputePipeline>>,
     layout: wgpu::BindGroupLayout,
     /// Group 1, the live viewport's: primary visibility (texture_2d<u32>), the radiance cache (`CacheBuffers`) and
     /// what the live passes read of a trace (`KernelBufs`). Offline renders bind `no_vis` (1x1 texture `no_vis_view`,
@@ -54,9 +58,9 @@ pub struct Gpu {
     /// pipelines (`translucent`, `volume_train`) by the kernel's variant key.
     tl_layout: Option<wgpu::BindGroupLayout>,
     tl_pipeline_layout: Option<wgpu::PipelineLayout>,
-    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), TranslucentPipelines>>,
+    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), TranslucentPipelines>>,
     /// The live media passes (pathtrace.wgsl `media_train`, `media_composite`) by kernel variant and entry point.
-    media_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str), wgpu::ComputePipeline>>,
+    media_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str, u32), wgpu::ComputePipeline>>,
     /// The procedural blobs of the last upload (`upload_procs`).
     proc_cache: std::sync::Mutex<Option<ProcCache>>,
     /// The last upload's procedural BLASes by geometry hash (read-only once built; another upload may share them), with
@@ -1108,11 +1112,14 @@ pub struct GpuOptions {
     /// A directory to keep compiled pipelines in between runs (pipeline_cache.rs). None: nothing is kept.
     pub pipeline_cache: Option<std::path::PathBuf>,
     pub kernel: KernelSwitches,
+    /// The live renderer's approximations (`A_*`). None: all of them (`A_LIVE`). 0: a live view whose kernel is the
+    /// offline one's estimator, slower, for holding its picture to the offline render's.
+    pub approx: Option<u32>,
 }
 
 impl GpuOptions {
-    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, and the kernel's switches
-    /// (`KernelSwitches::from_env`).
+    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, THREERT_APPROX=<bits of `A_*`>, and the
+    /// kernel's switches (`KernelSwitches::from_env`).
     pub fn from_env() -> GpuOptions {
         Self::from_vars(&|name| std::env::var(name).ok(), cfg!(target_os = "android"))
     }
@@ -1123,6 +1130,7 @@ impl GpuOptions {
             uniform_tables: var("THREERT_UNIFORM_TABLES").map(|v| v == "1"),
             pipeline_cache: var("THREERT_PIPELINE_CACHE").filter(|d| !d.is_empty()).map(std::path::PathBuf::from),
             kernel: KernelSwitches::from_vars(var, android),
+            approx: var("THREERT_APPROX").and_then(|v| v.trim().parse().ok()),
         }
     }
 
@@ -1344,9 +1352,21 @@ pub struct Kernel {
     /// The scene's geometry functions and their dispatch (pathtrace.wgsl `geometry_function`), spliced like `functions`.
     pub geometry_functions: String,
     pub hash: u64,
+    /// The approximations its live pipelines are compiled with (`A_*`; an offline pipeline has none): the device's
+    /// (`Gpu::approx`) unless a view sets others.
+    pub approx: u32,
 }
 
 impl Kernel {
+    /// A pipeline's constants: `LIVE`, `FEAT`, `APPROX`.
+    fn constants(&self, live: bool) -> [(&'static str, f64); 3] {
+        [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", self.features as f64), ("APPROX", self.approx_of(live) as f64)]
+    }
+
+    fn approx_of(&self, live: bool) -> u32 {
+        if live { self.approx } else { 0 }
+    }
+
     pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
         let mut functions = String::new();
         if !scene.shaders.is_empty() {
@@ -1435,9 +1455,19 @@ impl Kernel {
         functions.hash(&mut h);
         volume_functions.hash(&mut h);
         geometry_functions.hash(&mut h);
-        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish() }
+        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish(), approx: A_LIVE }
     }
 }
+
+// The live renderer's approximations (`override APPROX` in pathtrace.wgsl, which says what each is; docs/RUNTIME.md
+// "How live differs from offline").
+pub const A_GLASS_SHADOWS: u32 = 1;
+pub const A_MEDIA_SHADOWS: u32 = 2;
+pub const A_CUTOUT_PATHS: u32 = 4;
+pub const A_CUTOUT_EMITTERS: u32 = 8;
+pub const A_FAR_EMITTERS: u32 = 16;
+/// All of them: what a live view takes unless it asks otherwise (`GpuOptions::approx`).
+pub const A_LIVE: u32 = 31;
 
 // Kernel features (`override FEAT` in pathtrace.wgsl).
 pub const F_MASKED: u32 = 1;
@@ -1678,6 +1708,7 @@ impl Gpu {
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));
         let switches = options.kernel;
+        let approx = options.approx.unwrap_or(A_LIVE) & A_LIVE;
         let src = kernel_template();
         // Bounds checks are not needed: all indices come from our own BVH / scene builder.
         let module = unsafe {
@@ -1721,7 +1752,7 @@ impl Gpu {
         } else {
             (None, None)
         };
-        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_pipelines: Default::default(), media_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
+        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_pipelines: Default::default(), media_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
     }
 
     /// Whether this device's kernel buffers have the loop guard's count (`guard_room`; always in the merged layout).
@@ -1743,14 +1774,19 @@ impl Gpu {
         }
     }
 
+    /// The approximations of the live views made on this device from now on (`A_*`; None: the options').
+    pub fn set_approx(&mut self, approx: Option<u32>) {
+        self.approx = approx.unwrap_or(self.approx_default) & A_LIVE;
+    }
+
     /// The path-tracing kernel specialised for a scene (feature mask + material functions), compiled on first use.
     pub fn pipeline(&self, k: &Kernel, live: bool) -> wgpu::ComputePipeline {
         let mut cache = self.pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
                     layout: Some(&self.pipeline_layout),
@@ -1806,10 +1842,10 @@ impl Gpu {
     pub fn media_pipeline(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
         let mut cache = self.media_passes.lock().unwrap();
         cache
-            .entry((k.features, k.hash, entry))
+            .entry((k.features, k.hash, entry, k.approx))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", 1.0), ("FEAT", k.features as f64)];
+                let constants = k.constants(true);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: Some(&self.pipeline_layout),
@@ -1828,10 +1864,10 @@ impl Gpu {
     pub fn translucent_pipelines(&self, k: &Kernel, live: bool) -> TranslucentPipelines {
         let mut cache = self.tl_pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let make = |entry: &str| {
                     self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some(entry),
@@ -2264,7 +2300,7 @@ impl Gpu {
         });
         let bg_parts = BindParts { nodes: b_nodes, tex_view, env_view, sampler, grid_view };
         let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, verts: &b_verts, attrs: &b_attrs, heap: &heap, words: &words, prev_verts: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
-        let kernel = Kernel::new(scene, groups);
+        let kernel = Kernel { approx: self.approx, ..Kernel::new(scene, groups) };
         // Translucent particles (hardware RT): their own BLAS + TLAS, rebuilt after the particle pass.
         let translucent = match &accel {
             Some(_) if !scene.trans_tris.is_empty() => {
@@ -3340,6 +3376,20 @@ mod tests {
             seen |= bit;
         }
         let wgsl = include_str!("../shaders/pathtrace.wgsl");
+        // The live approximations: one bit each, the shader's the same, `A_LIVE` all of them.
+        let approx = [("A_GLASS_SHADOWS", A_GLASS_SHADOWS), ("A_MEDIA_SHADOWS", A_MEDIA_SHADOWS), ("A_CUTOUT_PATHS", A_CUTOUT_PATHS), ("A_CUTOUT_EMITTERS", A_CUTOUT_EMITTERS), ("A_FAR_EMITTERS", A_FAR_EMITTERS)];
+        assert_eq!(approx.iter().fold(0, |all, a| { assert!(a.1.is_power_of_two() && all & a.1 == 0, "{} = {}", a.0, a.1); all | a.1 }), A_LIVE);
+        let declared: Vec<&str> = wgsl.lines().filter(|l| l.starts_with("const A_")).collect();
+        assert_eq!(declared.len(), approx.len());
+        for (name, bit) in approx {
+            assert!(declared.iter().any(|l| l.starts_with(&format!("const {name}: u32 = {bit}u;"))), "{name}: pathtrace.wgsl and gpu.rs differ");
+        }
+        // (The render tests' names for them: tests/render/lib.ts `APPROX`.)
+        let lib = include_str!("../../tests/render/lib.ts");
+        for (name, bit) in [("glassShadows", A_GLASS_SHADOWS), ("mediaShadows", A_MEDIA_SHADOWS), ("cutoutPaths", A_CUTOUT_PATHS), ("cutoutEmitters", A_CUTOUT_EMITTERS), ("farEmitters", A_FAR_EMITTERS)] {
+            assert!(lib.contains(&format!("{name}: {bit},")), "{name}: tests/render/lib.ts and gpu.rs differ");
+        }
+        assert!(lib.contains(&format!("all: {A_LIVE},")));
         assert!(wgsl.contains(&format!("const RIS_EXACT: u32 = {RIS_EXACT}u;")), "RIS_EXACT: pathtrace.wgsl and gpu.rs differ");
         for line in wgsl.lines().filter(|l| l.starts_with("const F_")) {
             let name = &line[6..line.find(':').unwrap()];
@@ -3557,7 +3607,7 @@ mod tests {
             let plain = v(hwrt, KernelSwitches::default());
             let strict = v(hwrt, KernelSwitches { strict: true, ..Default::default() });
             let queries = strict.matches("rayQueryInitialize(").count();
-            assert_eq!(queries, if hwrt { 3 } else { 0 });
+            assert_eq!(queries, if hwrt { 2 } else { 0 });
             assert_eq!(strict.matches("ray_bad(o, d, tmax").count(), queries, "every ray query is guarded");
             assert_eq!(strict.matches("fn ray_bad(").count(), hwrt as usize);
             assert!(!strict.contains("env_cdf_at(y - 1u)") && !strict.contains("env_cdf_at(base + x - 1u)") && plain.contains("env_cdf_at(y - 1u)"));
@@ -3567,7 +3617,7 @@ mod tests {
             let sun = v(hwrt, KernelSwitches { last_sun: true, ..Default::default() });
             assert_eq!((sun.matches("radiance += dz;").count(), sun.matches("fn sun_light(").count(), sun.matches("sun_light(s, lobes(").count()), (1, 1, 1));
             assert!(!plain.contains("sun_light"));
-            assert_eq!(lit.matches("env_on = take_env && has_env;").count(), 1);
+            assert_eq!(lit.matches("env_on = take_env && has_env && !lights_only;").count(), 1);
             assert_eq!(lit.contains("let steps = 4u;"), hwrt);
             assert_eq!(v(hwrt, KernelSwitches { cutout_lite: 2, ..Default::default() }) == plain, !hwrt);
         }
