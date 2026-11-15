@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import runpy
 import sys
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops
@@ -15,10 +16,11 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "generated", "textures")
 os.makedirs(OUT, exist_ok=True)
 
-FONT_DIR = "/System/Library/Fonts"
-GOTHIC = {w: os.path.join(FONT_DIR, f"ヒラギノ角ゴシック W{w}.ttc") for w in range(0, 10)}
-MINCHO = os.path.join(FONT_DIR, "ヒラギノ明朝 ProN.ttc")
-MARU = os.path.join(FONT_DIR, "ヒラギノ丸ゴ ProN W4.ttc")
+# Keep the macOS Hiragino originals; use installed Japanese fonts on Linux.
+# run_path works with the isolated Python (-I) used by kabukicho-assets.ts.
+GOTHIC, MINCHO, MARU = runpy.run_path(
+    os.path.join(os.path.dirname(__file__), "font_paths.py")
+)["resolve_fonts"]()
 
 rng = random.Random(20261104)
 manifest = []
