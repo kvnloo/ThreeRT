@@ -1026,6 +1026,7 @@ export class MeshStandardMaterial {
   setValues(params: MeshPhysicalMaterialParameters): this {
     for (const [k, v] of Object.entries(params)) {
       if (v === undefined) continue;
+      if (!(k in this)) continue;
       if (k === "color" || k === "emissive" || k === "specular") (this as unknown as Record<string, Color>)[k] = new Color(v as ColorLike);
       else (this as unknown as Record<string, unknown>)[k] = v;
     }
