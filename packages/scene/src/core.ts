@@ -2242,7 +2242,8 @@ export class FogExp2 extends ExponentialHeightFog {
     super(density, 0, color);
   }
   clone(): FogExp2 {
-    return new FogExp2(this.color, this.density);
+    const { heightFalloff, intensity, height, startDistance, maxOpacity } = this;
+    return Object.assign(new FogExp2(this.color, this.density), { heightFalloff, intensity, height, startDistance, maxOpacity, volumetric: structuredClone(this.volumetric) });
   }
 }
 
