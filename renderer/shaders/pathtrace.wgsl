@@ -120,7 +120,7 @@ struct Params {
     ltile: vec4<u32>,      // live light tiles (`lt_list_start`): 1 with last frame's lists (0: none), tiles a row, the grid's offset when they were built (x | y << 16), candidates a vertex the camera sees takes from its list
     ltile2: vec4<u32>,     // the traced size they were built at, -, -
     lt_cam: array<vec4<f32>, 4>, // the camera they were built under: position (w = tan(fov/2)), forward (w = aspect), right, up
-    table_first: array<vec4<u32>, 3>, // each table's first vec4 in `tables` (heap.rs `Table`): light tree (0), materials, lights, light groups; emitters, tex_info, objects, instances; media, energy LUT, -, -
+    table_first: array<vec4<u32>, 3>, // each table's first vec4 in `tables` (heap.rs `Table`): light tree (0), materials, lights, light groups; emitters, tex_info, objects, instances; media, energy LUT, glass energy, -
     word_first: vec4<u32>, // each stream's first word in `words` (heap.rs `Stream`): environment CDF (0), procedural data, vertex colours, -
     live_first: array<vec4<u32>, 2>, // the merged layout: each of group 1's vec4 sections' first vec4 in `ML.vecs` (heap.rs `Live`): cache values (0), refl, motion, direct; lists, -, -, -
     live_len: vec4<u32>,   // and the vec4s of refl, motion, direct, lists
@@ -169,7 +169,8 @@ struct Medium { w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, a: vec4<u32>, b: ve
 //  - objects, per object (scene node): pivot (world position), world bounds size (UE ObjectPositionWS /
 //    ObjectBounds), then what `OBJECT_STRIDE` says;
 //  - instances (Instance), media (Medium);
-//  - the GGX energy LUT: (E.x, E.y) for 32 roughness x 32 NoV, two per vec4.
+//  - the GGX energy LUT: (E.x, E.y) for 32 roughness x 32 NoV, two per vec4;
+//  - the glass energy table (`glass_energy`): four values per vec4.
 // The buffer whole is `tables` in every layout (unsigned words: integers are read as they are, floats by a bit
 // cast): the light groups, the light tree and the energy LUT are read from it, and what a scene has more of is
 // another section of it, not another binding.
@@ -180,6 +181,7 @@ fn table_i(i: u32) -> vec4<i32> { return bitcast<vec4<i32>>(tables[i]); }
 fn lt_node(i: u32) -> vec4<f32> { return table_f(i); }
 fn light_group_at(i: u32) -> vec4<f32> { return table_f(P.table_first[0].w + i); }
 fn energy_at(i: u32) -> vec4<f32> { return table_f(P.table_first[2].y + i); }
+fn glass_energy_at(i: u32) -> vec4<f32> { return table_f(P.table_first[2].z + i); }
 // The seven tables read at every hit or light, through `material_at`, `light_at`, `emitter_at`, `tex_info_at`,
 // `object_at`, `instance_at` and `medium_at` in every layout.
 @if(merged) {
@@ -827,7 +829,7 @@ fn light_vis(shadows: bool, o: vec3<f32>, d: vec3<f32>, tmax: f32, rd: u32) -> v
 }
 
 // Glass at a hit along d, `t` from the ray's start (texture LOD): its geometric normal, the share of the ray its
-// transmission lobe takes at that angle (transmission (x its texture) x (1 - E_spec), as lobes(); 0: not glass), its
+// transmission takes at that angle (transmission (x its texture) x (1 - a Schlick specular albedo); 0: not glass), its
 // tint (base colour x texture: what the transmission lobe passes), and whether a ray from that side is totally
 // reflected.
 struct GlassAt { ng: vec3<f32>, share: f32, tir: bool, tint: vec3<f32> };
@@ -867,6 +869,9 @@ fn glass_at(h: Hit, d: vec3<f32>, t: f32) -> GlassAt {
     let ior = max(m.layer.y, 1.0001);
     let eta = select(1.0 / ior, ior, dot(g.ng, d) > 0.0);
     g.tir = eta * eta * (1.0 - c * c) >= 1.0;
+    // (Schlick from either side, no total reflection: the ray goes straight where the light it stands for refracts,
+    // glass_tr. With the dielectric's own reflectance a surface seen past the critical angle let the whole sky
+    // through: water/furnace 1.16.)
     let r = (ior - 1.0) / (ior + 1.0);
     let f0 = r * r;
     let e = energy_lookup(clamp(m.params.y, 0.02, 1.0), c);
@@ -1358,13 +1363,117 @@ fn lut(x: u32, y: u32) -> vec2<f32> {
     return select(v.xy, v.zw, (i & 1u) == 1u);
 }
 
-// Base layer: diffuse + GGX specular (p_spec: the specular share of the base's samples). Over it a clearcoat (GGX, F0
-// 0.04; the base gets what the coat's directional albedo e_coat lets through), and for glass a transmitted share
-// `tint` (delta lobe, sampled with p_trans) in place of the diffuse. p_coat / p_trans: shares of all samples.
+// Base layer: diffuse + GGX specular (e_spec: the specular's directional albedo; kd: what it leaves the diffuse
+// under it; p_spec: the specular share of the base's samples). Over it a clearcoat (GGX, F0 0.04; the base gets what
+// the coat's directional albedo e_coat lets through). Glass: a share of the base is a dielectric interface (below,
+// "The dielectric"), the rest keeps the diffuse and the specular. p_coat / p_trans: the coat's and the dielectric's
+// shares of all samples.
 struct Lobes {
-    diffuse: vec3<f32>, f0: vec3<f32>, f90: vec3<f32>, w: vec3<f32>, e_spec: vec3<f32>, a2: f32, p_spec: f32,
+    diffuse: vec3<f32>, f0: vec3<f32>, f90: vec3<f32>, w: vec3<f32>, e_spec: vec3<f32>, kd: vec3<f32>, a2: f32, p_spec: f32,
     coat: f32, coat_alpha: f32, e_coat: f32, p_coat: f32, tint: vec3<f32>, p_trans: f32,
+    // The dielectric: its share of the base under the coat x its energy compensation (reflection's factor), `tint`
+    // the same x the base colour (transmission's); n(far side) / n(view side); whether its transmission has a density;
+    // its directional reflection albedo (before the coat).
+    t: f32, eta: f32, rough_t: bool, e_glass: f32,
 };
+
+// ------------------------------------------------------------------------------------------------
+// The dielectric (glass): a rough interface between two indices of refraction, Walter et al. 2007 (GGX): light
+// reflects off a microfacet or refracts through it by the Fresnel reflectance there, exact (total internal
+// reflection is reflection, untinted). Both have a value and a density, so lights are sampled through frosted glass
+// and weighed against the BSDF's rays. Below GLASS_DELTA its transmission is a delta lobe (a clear pane: what lies
+// behind is seen straight, `through` in the path loop); its reflection keeps the microfacet lobe. Single scattering
+// loses energy as the roughness grows (leaving glass at 0.6: a quarter); the whole is scaled by 1 / (R + T) from a
+// table (Turquin 2019, as Cycles), P.misc.z of it.
+// Not here: the radiance scaling by the indices' ratio squared (as Cycles and glTF's formula: it cancels over a
+// closed solid, and a single-sheet pane, which refracts as a solid here, would be scaled once); thin walls;
+// absorption by distance.
+const GLASS_DELTA: f32 = 0.05; // roughness (RTXPT 0.04, Falcor 0.08)
+
+// Unpolarised Fresnel reflectance: `c` the cosine on the incident side, `eta` = n(far) / n(incident); 1 at total
+// internal reflection (Walter eq. 22).
+fn fresnel_dielectric(c: f32, eta: f32) -> f32 {
+    let g2 = eta * eta - 1.0 + c * c;
+    if (g2 <= 0.0) { return 1.0; }
+    let g = sqrt(g2);
+    let a = (g - c) / (g + c);
+    let b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+    return 0.5 * a * a * (1.0 + b * b);
+}
+
+// Smith's Lambda (GGX) at |cosine| c: g1 = 1 / (1 + Lambda).
+fn lambda_ggx(a2: f32, c: f32) -> f32 {
+    let c2 = c * c;
+    return 0.5 * (sqrt(1.0 + a2 * (1.0 - c2) / max(c2, 1e-8)) - 1.0);
+}
+
+// The glass energy table (lib.rs `glass_energy_lut`, `GLASS_E`): R + T of the interface at GLASS_E_MU nodes over
+// sqrt(cos), GLASS_E_ROUGH over the roughness, GLASS_E_IOR over sqrt((ior - 1) / (ior + 1)) up to GLASS_E_ZMAX
+// (ior 3); entering, then leaving.
+const GLASS_E_MU: u32 = 16u;
+const GLASS_E_ROUGH: u32 = 16u;
+const GLASS_E_IOR: u32 = 8u;
+const GLASS_E_ZMAX: f32 = 0.70710678;
+// (A select chain: the vec4 indexed by a variable cost the glass scene's trace 1.5 %.)
+fn glass_e_at(i: u32) -> f32 {
+    let v = glass_energy_at(i / 4u);
+    let k = i & 3u;
+    return select(select(v.x, v.y, k == 1u), select(v.z, v.w, k == 3u), k >= 2u);
+}
+// One (roughness, ior, side) row of it at x, between the nodes.
+fn glass_e_row(row: u32, x: f32) -> f32 {
+    let x0 = u32(x);
+    return mix(glass_e_at(row * GLASS_E_MU + x0), glass_e_at(row * GLASS_E_MU + min(x0 + 1u, GLASS_E_MU - 1u)), x - f32(x0));
+}
+fn glass_energy(nov: f32, roughness: f32, ior: f32, leaving: bool) -> f32 {
+    let x = clamp(sqrt(nov), 0.0, 1.0) * f32(GLASS_E_MU - 1u);
+    let y = clamp(roughness, 0.0, 1.0) * f32(GLASS_E_ROUGH - 1u);
+    let z = clamp(sqrt(max(ior - 1.0, 0.0) / (ior + 1.0)) / GLASS_E_ZMAX, 0.0, 1.0) * f32(GLASS_E_IOR - 1u);
+    let y0 = u32(y);
+    let y1 = min(y0 + 1u, GLASS_E_ROUGH - 1u);
+    let z0 = select(0u, GLASS_E_IOR, leaving) + u32(z);
+    let z1 = select(0u, GLASS_E_IOR, leaving) + min(u32(z) + 1u, GLASS_E_IOR - 1u);
+    let e0 = mix(glass_e_row(z0 * GLASS_E_ROUGH + y0, x), glass_e_row(z0 * GLASS_E_ROUGH + y1, x), y - f32(y0));
+    let e1 = mix(glass_e_row(z1 * GLASS_E_ROUGH + y0, x), glass_e_row(z1 * GLASS_E_ROUGH + y1, x), y - f32(y0));
+    return mix(e0, e1, z - floor(z));
+}
+
+// Whether lights on both sides of the surface reach it: rough glass.
+fn two_sided(lb: Lobes) -> bool { return has(F_GLASS) && lb.rough_t; }
+
+// The dielectric's transmission toward l (the far side; nov, nol: |cosines|) x |n.l|: Walter eq. 21 from the view
+// side. `h` = the microfacet normal that refracts v to l, on the shading normal's side.
+fn dielectric_t(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>, nov: f32, nol: f32) -> vec3<f32> {
+    if (!lb.rough_t) { return vec3<f32>(0.0); }
+    var h = normalize(v + lb.eta * l);
+    if (dot(h, s.n) < 0.0) { h = -h; }
+    let voh = dot(v, h);
+    let loh = dot(l, h);
+    if (voh <= 0.0 || loh >= 0.0) { return vec3<f32>(0.0); }
+    let den = voh + lb.eta * loh;
+    let g2 = 1.0 / (1.0 + lambda_ggx(lb.a2, nov) + lambda_ggx(lb.a2, nol));
+    return lb.tint * ((1.0 - fresnel_dielectric(voh, lb.eta)) * d_ggx(lb.a2, max(dot(s.n, h), 0.0)) * g2 * voh * lb.eta * lb.eta * -loh / (nov * max(den * den, 1e-12)));
+}
+
+// Density of l under the dielectric's sampling (`sample_bsdf`: a visible microfacet normal, the ray reflected or
+// refracted by the Fresnel reflectance there; at the shading normal's for smooth glass), x its share of the samples.
+fn pdf_dielectric(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>) -> f32 {
+    let nov = max(dot(s.n, v), 1e-4);
+    if (dot(s.n, l) > 0.0) {
+        let h = normalize(v + l);
+        let voh = max(dot(v, h), 1e-6);
+        let f = fresnel_dielectric(select(nov, voh, lb.rough_t), lb.eta);
+        return lb.p_trans * f * g1(lb.a2, nov) * d_ggx(lb.a2, max(dot(s.n, h), 0.0)) / (4.0 * nov);
+    }
+    if (!lb.rough_t) { return 0.0; }
+    var h = normalize(v + lb.eta * l);
+    if (dot(h, s.n) < 0.0) { h = -h; }
+    let voh = dot(v, h);
+    let loh = dot(l, h);
+    if (voh <= 0.0 || loh >= 0.0) { return 0.0; }
+    let den = voh + lb.eta * loh;
+    return lb.p_trans * (1.0 - fresnel_dielectric(voh, lb.eta)) * g1(lb.a2, nov) * voh * d_ggx(lb.a2, max(dot(s.n, h), 0.0)) * lb.eta * lb.eta * -loh / (nov * max(den * den, 1e-12));
+}
 
 fn lobes(s: Surface, nov: f32) -> Lobes {
     var l: Lobes;
@@ -1382,10 +1491,16 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
     // misc.z = multiple-scattering compensation amount (1 = energy conserving, matches the white furnace).
     l.w = 1.0 + P.misc.z * l.f0 * ((1.0 - e.x) / e.x);
     l.e_spec = l.w * (e.x * l.f0 + e.y * (l.f90 - l.f0));
+    l.kd = 1.0 - l.e_spec;
+    if (has(F_GLASS) && t > 0.0) {
+        // The share that is not the dielectric keeps this specular lobe (the diffuse, 1 - t of it already, under it).
+        l.w *= 1.0 - t;
+        l.e_spec *= 1.0 - t;
+    }
     let r = s.roughness;
     l.a2 = r * r * r * r;
     let ws = dot(l.e_spec, vec3<f32>(0.3, 0.6, 0.1));
-    let wd = dot(l.diffuse * (1.0 - l.e_spec), vec3<f32>(0.3, 0.6, 0.1));
+    let wd = dot(l.diffuse * l.kd, vec3<f32>(0.3, 0.6, 0.1));
     l.p_spec = clamp(ws / max(ws + wd, 1e-6), 0.05, 1.0);
     if (wd <= 0.0) { l.p_spec = 1.0; }
     l.coat_alpha = 1.0;
@@ -1396,8 +1511,17 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
         l.coat_alpha = s.coat_rough * s.coat_rough;
     }
     let under = 1.0 - l.e_coat;
-    l.tint = s.base * t * (1.0 - l.e_spec) * under;
-    let wt = dot(l.tint, vec3<f32>(0.3, 0.6, 0.1));
+    var wt = 0.0;
+    if (has(F_GLASS) && t > 0.0) {
+        l.eta = select(1.0 / s.ior, s.ior, s.front);
+        l.rough_t = s.roughness > GLASS_DELTA && abs(s.ior - 1.0) > 1e-3;
+        var comp = 1.0;
+        if (l.rough_t) { comp = mix(1.0, 1.0 / glass_energy(nov, s.roughness, s.ior, !s.front), P.misc.z); }
+        l.t = t * under * comp;
+        l.tint = s.base * l.t;
+        l.e_glass = t * fresnel_dielectric(nov, l.eta);
+        wt = under * (l.e_glass + (t - l.e_glass) * dot(s.base, vec3<f32>(0.3, 0.6, 0.1)));
+    }
     let total = (ws + wd) * under + l.e_coat + wt;
     l.p_coat = l.e_coat / max(total, 1e-6);
     l.p_trans = wt / max(total, 1e-6);
@@ -1425,18 +1549,27 @@ fn f_schlick(f0: vec3<f32>, f90: vec3<f32>, voh: f32) -> vec3<f32> {
 fn eval_bsdf_k(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>, k: f32) -> vec3<f32> {
     let nol = dot(s.n, l);
     let nov = max(dot(s.n, v), 1e-4);
+    if (two_sided(lb) && nol < 0.0 && dot(s.ng, l) < 0.0) {
+        split_frac = vec3<f32>(1.0);
+        return dielectric_t(s, lb, v, l, nov, -nol);
+    }
     if (nol <= 0.0 || dot(s.ng, l) <= 0.0) { return vec3<f32>(0.0); }
     let h = normalize(v + l);
     let noh = max(dot(s.n, h), 0.0);
     let voh = max(dot(v, h), 0.0);
-    var spec = d_ggx(lb.a2, noh) * vis_smith_joint_approx(lb.a2, nov, nol) * f_schlick(lb.f0, lb.f90, voh) * lb.w * k;
-    var diff = lb.diffuse * (1.0 / PI) * (1.0 - lb.e_spec);
+    let dv = d_ggx(lb.a2, noh) * vis_smith_joint_approx(lb.a2, nov, nol);
+    var spec = dv * f_schlick(lb.f0, lb.f90, voh) * lb.w * k;
+    // (The dielectric's reflection: lb.t holds the coat's share already, so it joins after the coat's layering.)
+    var glass = 0.0;
+    if (has(F_GLASS) && lb.t > 0.0) { glass = lb.t * fresnel_dielectric(voh, lb.eta) * dv * k; }
+    var diff = lb.diffuse * (1.0 / PI) * lb.kd;
     if (has(F_COAT) && lb.coat > 0.0) {
         let ca2 = lb.coat_alpha * lb.coat_alpha;
         let coat = d_ggx(ca2, noh) * vis_smith_joint_approx(ca2, nov, nol) * f_schlick(vec3<f32>(0.04), vec3<f32>(1.0), voh).x * lb.coat * k;
         diff *= 1.0 - lb.e_coat;
         spec = spec * (1.0 - lb.e_coat) + vec3<f32>(coat);
     }
+    spec += vec3<f32>(glass);
     split_frac = spec / max(diff + spec, vec3<f32>(1e-12));
     return (diff + spec) * nol;
 }
@@ -1452,7 +1585,9 @@ fn g1(a2: f32, nov: f32) -> f32 {
 
 fn pdf_bsdf(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>) -> f32 {
     let nol = dot(s.n, l);
-    if (nol <= 0.0) { return 0.0; }
+    var pg = 0.0;
+    if (has(F_GLASS) && lb.p_trans > 0.0) { pg = pdf_dielectric(s, lb, v, l); }
+    if (nol <= 0.0) { return pg; }
     let nov = max(dot(s.n, v), 1e-4);
     let h = normalize(v + l);
     let noh = max(dot(s.n, h), 0.0);
@@ -1465,8 +1600,8 @@ fn pdf_bsdf(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>) -> f32 {
         let ca2 = lb.coat_alpha * lb.coat_alpha;
         pc = g1(ca2, nov) * d_ggx(ca2, noh) / (4.0 * nov);
     }
-    // The delta transmission lobe has no density here: its share of samples only lowers the others'.
-    return lb.p_coat * pc + (1.0 - lb.p_coat - lb.p_trans) * (lb.p_spec * ps + (1.0 - lb.p_spec) * pd);
+    // (Smooth glass's transmission is a delta lobe, without a density: its samples only lower the others' share.)
+    return pg + lb.p_coat * pc + (1.0 - lb.p_coat - lb.p_trans) * (lb.p_spec * ps + (1.0 - lb.p_spec) * pd);
 }
 
 // MIS weight of a light sample (solid-angle pdf `pdf_l`) against BSDF sampling. A_CUTOUT_PATHS: light that reached
@@ -1491,6 +1626,7 @@ fn light_mis(pdf_l: f32, s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>) -> f
             let ca2 = lb.coat_alpha * lb.coat_alpha;
             p += lb.p_coat * g1(ca2, nov) * d_ggx(ca2, noh) / (4.0 * nov);
         }
+        if (has(F_GLASS) && lb.p_trans > 0.0) { p += pdf_dielectric(s, lb, v, l); }
         see = min(p / pb, 1.0);
     }
     return 1.0 - see * (1.0 - w);
@@ -1523,6 +1659,8 @@ fn sample_vndf(v: vec3<f32>, tbn: mat3x3<f32>, alpha: f32, u1: f32, u2: f32) -> 
     return tbn * hl;
 }
 
+// A direction by the BSDF's lobes (`pdf_bsdf` its density; which lobe: sampled_spec, sampled_trans). The zero vector:
+// no sample (every value and density of it is 0).
 fn sample_bsdf(s: Surface, lb: Lobes, v: vec3<f32>) -> vec3<f32> {
     let tbn = basis(s.n);
     let r = rng4(rng_dim(D_BSDF));
@@ -1534,14 +1672,21 @@ fn sample_bsdf(s: Surface, lb: Lobes, v: vec3<f32>) -> vec3<f32> {
             return reflect(-v, sample_vndf(v, tbn, lb.coat_alpha, r.z, r.w));
         }
         if (u < lb.p_coat + lb.p_trans) {
-            // Refraction through a microfacet normal (Walter et al. 2007; smooth glass: the shading normal).
+            // The dielectric: a visible microfacet normal; reflected off it, or refracted through it (smooth glass:
+            // through the shading normal), by the Fresnel reflectance there.
+            let h = sample_vndf(v, tbn, s.roughness * s.roughness, r.z, r.w);
+            var m = s.n;
+            if (lb.rough_t) { m = h; }
+            let t = refract(-v, m, 1.0 / lb.eta);
+            sampled_spec = u - lb.p_coat < fresnel_dielectric(max(dot(v, m), 1e-4), lb.eta) * lb.p_trans || all(t == vec3<f32>(0.0));
+            // A ray reflected under the surface, or refracted and still above it, is one the microfacets' masking
+            // stops: no sample.
+            if (sampled_spec) {
+                let rl = reflect(-v, h);
+                return select(rl, vec3<f32>(0.0), dot(rl, s.n) <= 0.0);
+            }
             sampled_trans = true;
-            sampled_spec = false;
-            var h = s.n;
-            if (s.roughness > 0.05) { h = sample_vndf(v, tbn, s.roughness * s.roughness, r.z, r.w); }
-            let t = refract(-v, h, select(s.ior, 1.0 / s.ior, s.front));
-            // Total internal reflection: the ray stays inside.
-            return select(t, reflect(-v, h), all(t == vec3<f32>(0.0)));
+            return select(t, vec3<f32>(0.0), dot(t, s.n) >= 0.0);
         }
     }
     sampled_spec = r.y < lb.p_spec;
@@ -1826,6 +1971,14 @@ fn lt_in_list(i: u32) -> bool {
     return false;
 }
 
+// A shadow ray's origin toward l at a surface: on the side l leaves it from (`o`: the near side's, as computed once).
+// Only a surface that lets light through has a value for the far side, so only a kernel with glass has the code
+// (in every kernel, at its five inlined sites, it cost Bistro's trace 4 %).
+fn light_origin(s: Surface, o: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
+    if (has(F_GLASS) && dot(l, s.ng) < 0.0) { return offset_origin(s.p, -s.ng); }
+    return o;
+}
+
 fn local_lights(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>, x: vec3<f32>, vol: bool, d: vec3<f32>, rd: u32) -> vec3<f32> {
     let nd = P.counts2.x;
     let nl = P.counts.x - nd;
@@ -1856,12 +2009,12 @@ fn local_lights(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>, x: vec3<f32>,
                 let dc = li.pos.xyz - x;
                 let reach = li.color.w + select(li.dir.w, length(li.ext.xyz) + li.dir.w, u32(li.pos.w) == 3u);
                 if (li.color.w > 0.0 && dot(dc, dc) > reach * reach) { continue; }
-                if (u32(li.pos.w) != 3u && dot(dc, s.ng) < -li.dir.w) { continue; } // eval_bsdf rejects it anyway
+                if (u32(li.pos.w) != 3u && dot(dc, s.ng) < -li.dir.w && !two_sided(lb)) { continue; } // eval_bsdf rejects it anyway
                 let ls = local_light(li, x, rng2(rng_sub(rd, i)));
                 if (all(ls.c <= vec3<f32>(0.0))) { continue; }
                 let f = eval_bsdf_k(s, lb, v, ls.l, li.x.y);
                 if (any(f > vec3<f32>(0.0))) {
-                    let vis = light_vis(li.ext.w >= 0.5, o, ls.sl, ls.dist * 0.999, rng_sub(rd ^ 0x40000000u, i));
+                    let vis = light_vis(li.ext.w >= 0.5, light_origin(s, o, ls.l), ls.sl, ls.dist * 0.999, rng_sub(rd ^ 0x40000000u, i));
                     if (any(vis > vec3<f32>(0.0))) {
                         sum += ls.c * f * tr3(vis);
                         dl_spec += ls.c * f * tr3(vis) * split_frac;
@@ -1903,7 +2056,7 @@ fn local_lights(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>, x: vec3<f32>,
         }
         let ls = local_light(light_at(idx), x, r4.yz);
         var ph = luminance(ls.c);
-        if (vol) { ph *= light_at(idx).x.x; } else { ph *= max(dot(s.n, ls.l), 0.0) + 0.05 * max(dot(s.ng, ls.l), 0.0); }
+        if (vol) { ph *= light_at(idx).x.x; } else if (two_sided(lb)) { ph *= abs(dot(s.n, ls.l)); } else { ph *= max(dot(s.n, ls.l), 0.0) + 0.05 * max(dot(s.ng, ls.l), 0.0); }
         if (ph <= 0.0) { continue; }
         if (nt > 0u && k < m_cand && lt_in_list(idx)) { continue; }
         let w = ph * stands;
@@ -1919,7 +2072,7 @@ fn local_lights(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>, x: vec3<f32>,
         let lk = light_at(pick).x;
         if (vol) { c = pick_ls.c * hg_phase(P.vol.y, dot(pick_ls.l, d)) * lk.x; } else { c = pick_ls.c * eval_bsdf_k(s, lb, v, pick_ls.l, lk.y); }
         if (any(c > vec3<f32>(0.0))) {
-            let vis = light_vis(light_at(pick).ext.w >= 0.5, o, pick_ls.sl, pick_ls.dist * 0.999, rng_sub(rd, 0xffffffffu));
+            let vis = light_vis(light_at(pick).ext.w >= 0.5, light_origin(s, o, pick_ls.l), pick_ls.sl, pick_ls.dist * 0.999, rng_sub(rd, 0xffffffffu));
             if (any(vis > vec3<f32>(0.0))) {
                 let r = c * tr3(vis) * (wsum * f32(count) / (f32(m_cand) * pick_ph));
                 sum += r;
@@ -1989,7 +2142,7 @@ fn sample_emitter_ris(x: vec3<f32>, n: vec3<f32>, m: u32, sf: Surface, lb: Lobes
         let dl = lp - x;
         let d2 = max(dot(dl, dl), 1e-8);
         let l = dl * inverseSqrt(d2);
-        var g = abs(dot(ln, l)) * max(dot(n, l), 0.0) / d2;
+        var g = abs(dot(ln, l)) * select(max(dot(n, l), 0.0), 1.0, dot(n, n) == 0.0) / d2;
         if (m > 1u) { g = abs(dot(ln, l)) * luminance(eval_bsdf(sf, lb, v, l)) / d2; }
         // target (emitted luminance x G) over source pdf (luminance x light LOD / total, per area) = total x G / LOD;
         // with the tree the source pdf is its selection probability / area (weight / area = luminance x power)
@@ -2101,7 +2254,7 @@ fn hg_phase(g: f32, c: f32) -> f32 {
         let l = basis(to_light) * vec3<f32>(sin_t * cos(phi), sin_t * sin(phi), cos_t);
         let f = eval_bsdf_k(s, lb, v, l, li.x.y);
         if (any(f > vec3<f32>(0.0))) {
-            let vis = light_vis(li.ext.w >= 0.5, o, l, INF, rng_sub(rng_dim(D_SUN_VIS), i));
+            let vis = light_vis(li.ext.w >= 0.5, light_origin(s, o, l), l, INF, rng_sub(rng_dim(D_SUN_VIS), i));
             if (any(vis > vec3<f32>(0.0))) {
                 let pdf_l = 1.0 / (2.0 * PI * (1.0 - cos_max));
                 sum += li.color.rgb * f * light_mis(pdf_l, s, lb, v, l) * tr3(vis);
@@ -2121,7 +2274,7 @@ fn env_light(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>) -> vec3<f32> {
     if (any(f > vec3<f32>(0.0))) {
         let pdf_e = env_pdf(l);
         if (pdf_e > 0.0) {
-            let vis = sky_tr(o, l, rng_dim(D_ENV_VIS));
+            let vis = sky_tr(light_origin(s, o, l), l, rng_dim(D_ENV_VIS));
             if (any(vis > vec3<f32>(0.0))) { return env_radiance(l) * f * light_mis(pdf_e, s, lb, v, l) / pdf_e * tr3(vis); }
         }
     }
@@ -2147,7 +2300,7 @@ fn direct_light(s: Surface, lb: Lobes, v: vec3<f32>) -> vec3<f32> {
         if (all(li.color.rgb <= vec3<f32>(0.0))) { continue; }
         let f = eval_bsdf_k(s, lb, v, l, li.x.y);
         if (any(f > vec3<f32>(0.0))) {
-            let vis = light_vis(li.ext.w >= 0.5, o, l, INF, rng_sub(rng_dim(D_SUN_VIS), i));
+            let vis = light_vis(li.ext.w >= 0.5, light_origin(s, o, l), l, INF, rng_sub(rng_dim(D_SUN_VIS), i));
             if (any(vis > vec3<f32>(0.0))) {
                 let pdf_l = 1.0 / (2.0 * PI * (1.0 - cos_max));
                 let frac = split_frac;
@@ -2185,18 +2338,22 @@ fn direct_light(s: Surface, lb: Lobes, v: vec3<f32>) -> vec3<f32> {
     @if(!light_pick) sum += local_lights(s, lb, v, o, s.p, false, vec3<f32>(0.0), rng_dim(D_LOCAL));
     @if(light_pick) if (take_local) { sum += local_lights(s, lb, v, o, s.p, false, vec3<f32>(0.0), rng_dim(D_LOCAL)); }
     // Emissive triangles (incl. rect lights)
+    // (Rough glass takes emitters from both sides: as a point without a hemisphere does, the samples and `emit_mis`
+    // alike. The tree's bound has no two-sided cosine; without one the estimate is the same, its noise a little more.)
+    var ne = s.n;
+    if (two_sided(lb)) { ne = vec3<f32>(0.0); }
     mis_x = o;
-    mis_n = s.n;
+    mis_n = ne;
     var emitters = P.counts.y;
     @if(light_pick) if (!take_emit) { emitters = 0u; }
     if (emitters > 0u) {
         var es: ES;
         // With the light tree its candidates are already near the point: P.ltree.y of them at camera hits, one elsewhere.
-        if (lt_on()) { es = sample_emitter_ris(o, s.n, select(1u, u32(P.ltree.w), cur_depth == 0u), s, lb, v, rng_dim(D_EMIT)); } else if (seen_directly()) { es = sample_emitter_ris(o, s.n, select(EMIT_RIS_M / 2u, EMIT_RIS_M, cur_depth == 0u), s, lb, v, rng_dim(D_EMIT)); } else if (P.light_lod.w > 0.0) { es = sample_emitter_ris(o, s.n, 2u, s, lb, v, rng_dim(D_EMIT)); } else { es = sample_emitter(o, s.n, rng_dim(D_EMIT)); }
+        if (lt_on()) { es = sample_emitter_ris(o, ne, select(1u, u32(P.ltree.w), cur_depth == 0u), s, lb, v, rng_dim(D_EMIT)); } else if (seen_directly()) { es = sample_emitter_ris(o, ne, select(EMIT_RIS_M / 2u, EMIT_RIS_M, cur_depth == 0u), s, lb, v, rng_dim(D_EMIT)); } else if (P.light_lod.w > 0.0) { es = sample_emitter_ris(o, ne, 2u, s, lb, v, rng_dim(D_EMIT)); } else { es = sample_emitter(o, ne, rng_dim(D_EMIT)); }
         if (es.pdf_w > 0.0) {
             let f = eval_bsdf(s, lb, v, es.l);
             if (any(f > vec3<f32>(0.0))) {
-                let vis = emitter_tr(o, es.l, es.dist * 0.999, rng_dim(D_EMIT_VIS));
+                let vis = emitter_tr(light_origin(s, o, es.l), es.l, es.dist * 0.999, rng_dim(D_EMIT_VIS));
                 if (vis > 0.0) {
                     let frac = split_frac;
                     let wgt = light_mis(es.pdf_w, s, lb, v, es.l) * tr1(vis);
@@ -3077,6 +3234,7 @@ fn white_lobes() -> Lobes {
     l.f90 = vec3<f32>(0.0);
     l.w = vec3<f32>(1.0);
     l.e_spec = vec3<f32>(0.0);
+    l.kd = vec3<f32>(1.0);
     l.a2 = 1.0;
     l.p_spec = 0.0;
     l.coat_alpha = 1.0;
@@ -3087,7 +3245,8 @@ fn white_lobes() -> Lobes {
 // diffuse + directional specular albedo, under the coat's (as `eval_bsdf_k` layers them; without the coat's term a
 // coated surface reflected e_coat (1 - the rest) too little).
 fn cache_reflectance(lb: Lobes) -> vec3<f32> {
-    let r = lb.diffuse * (1.0 - lb.e_spec) + lb.e_spec;
+    var r = lb.diffuse * lb.kd + lb.e_spec;
+    if (has(F_GLASS)) { r += vec3<f32>(lb.e_glass); }
     if (has(F_COAT)) { return r * (1.0 - lb.e_coat) + lb.e_coat; }
     return r;
 }
@@ -3731,9 +3890,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         let l = sample_bsdf(s, lb, v);
-        // Through glass: a delta lobe (weight tint / its sampling share, no MIS: what lies behind counts in full) whose
-        // light the live viewport files with the specular, like a reflection.
-        let through = has(F_GLASS) && sampled_trans;
+        // Through smooth glass: a delta lobe (weight tint / its sampling share, no MIS: what lies behind counts in full).
+        // Rough glass's transmission has a density like any lobe. Either way the live viewport files the light with
+        // the specular, like a reflection.
+        let through = has(F_GLASS) && sampled_trans && !lb.rough_t;
         var pdf = 0.0;
         var wgt = lb.tint / max(lb.p_trans, 1e-6);
         if (through) {
@@ -3747,7 +3907,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             k_spec = split_frac;
             rad0 = radiance;
             split = true;
-            spec_lobe = sampled_spec || through;
+            spec_lobe = sampled_spec || sampled_trans;
             through0 = through;
             glass0 = has(F_GLASS) && s.transmission > 0.0;
             refl_e = lb.e_spec;
@@ -3763,7 +3923,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             behind_glass = true;
             bent = !bent;
         } else if (through) {
-            // Total internal reflection: a specular vertex (no light sampling covers what it reflects).
+            // (A refracted direction the geometric normal keeps on this side: a specular vertex.)
             last_pdf = 0.0;
             specular_bounce = true;
             behind_glass = false;
@@ -3777,7 +3937,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         straight = straight && through;
         cone_w = width;
         cone_a += 2.0 * s.roughness * s.roughness;
-        mirror_path = (depth == 0u || mirror_path) && s.roughness < MIRROR_ROUGHNESS && (sampled_spec || through);
+        mirror_path = (depth == 0u || mirror_path) && s.roughness < MIRROR_ROUGHNESS && (sampled_spec || sampled_trans);
         if (depth >= P.counts.w) {
             let q = min(max(thr.x, max(thr.y, thr.z)), 0.95);
             if (rng1(rng_dim(D_RR)) > q) { break; }
