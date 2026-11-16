@@ -344,13 +344,23 @@ export class Object3D {
   userData: Record<string, unknown> = {};
   /**
    * The local transform as a matrix (three.js): `updateMatrix()` composes it from position / quaternion / scale, which
-   * `updateWorldMatrix` does first while `matrixAutoUpdate` is on. The engine is always sent position / rotation /
-   * scale, so a matrix set by hand moves only what reads it (`matrixWorld`, `setMatrixAt(i, o.matrix)`).
+   * `updateWorldMatrix` does first while `matrixAutoUpdate` is on. Normally the engine is sent local position /
+   * rotation / scale. With `matrixWorldAutoUpdate = false`, the binding instead derives a local transform from the
+   * authored world matrix for the renderer. Editing `matrix` alone still affects only readers of that matrix.
    */
   readonly matrix = new Matrix4();
   matrixAutoUpdate = true;
-  /** Set false to retain a manually supplied matrixWorld during world-space updates, as in three.js. */
-  matrixWorldAutoUpdate = true;
+  private _matrixWorldAutoUpdate = true;
+  /** Set false to retain and render a manually supplied matrixWorld, as in three.js. */
+  get matrixWorldAutoUpdate(): boolean {
+    return this._matrixWorldAutoUpdate;
+  }
+  set matrixWorldAutoUpdate(value: boolean) {
+    if (value !== this._matrixWorldAutoUpdate) {
+      this._matrixWorldAutoUpdate = value;
+      touched(this);
+    }
+  }
   readonly matrixWorld = new Matrix4();
 
   /**
