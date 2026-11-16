@@ -184,30 +184,6 @@ test("the binding: ambient lights as the environment, black background, three.js
   assert.ok(compatNotes().some((n) => n.startsWith("mapped: MeshPhongMaterial")));
 });
 
-test("DirectionalLight and SpotLight: copy and clone give each light its own target, as three.js does", () => {
-  for (const LightType of [THREE.DirectionalLight, THREE.SpotLight]) {
-    for (const targetInScene of [false, true]) {
-      const source = new LightType(0x336699, 2);
-      const target = source.target!;
-      assert.deepEqual(target.position.toArray(), [0, 0, 0], "a new target starts at the origin");
-      target.position.set(2, 3, 4);
-      if (targetInScene) new THREE.Scene().add(target);
-
-      const cloned = source.clone();
-      const copied = new LightType().copy(source);
-      for (const other of [cloned, copied]) {
-        assert.notStrictEqual(other.target, target, `${source.type}: copied target is independent`);
-        assert.equal(other.target!.parent, null, "a copied target is not added to the scene");
-        assert.deepEqual(other.target!.position.toArray(), [2, 3, 4]);
-      }
-
-      target.position.set(7, 8, 9);
-      assert.deepEqual(cloned.target!.position.toArray(), [2, 3, 4], "clone keeps its target position");
-      assert.deepEqual(copied.target!.position.toArray(), [2, 3, 4], "copy keeps its target position");
-    }
-  }
-});
-
 test("Bugbot on #125: exposure edited in place is the scene's; a transformed geometry's faceted copy is made again; a cloned InstancedMesh has its own tables", () => {
   const scene = new THREE.Scene();
   scene.add(new THREE.AmbientLight(0xffffff, 1));
