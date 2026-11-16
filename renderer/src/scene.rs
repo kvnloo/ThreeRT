@@ -776,7 +776,7 @@ fn bytes_key(kind: &str, bytes: &[u8]) -> String {
 fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image::RgbaImage>)> {
     match &t.source {
         world::TextureSource::File(uri) => {
-            let path = assets.join(uri);
+            let path = crate::files::asset_path(assets, uri);
             let key = file_key(&path);
             Ok((key.clone(), cached_image(&key, || crate::files::image(&path).with_context(|| format!("texture {uri}")))?))
         }
@@ -793,7 +793,7 @@ fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image
 
 /// A model file (cached per file version).
 pub fn model_gltf(uri: &str, assets: &Path) -> Result<Arc<skin::Model>> {
-    let path = assets.join(uri);
+    let path = crate::files::asset_path(assets, uri);
     cached_gltf(&file_key(&path), || skin::Model::new(import_gltf(&path).with_context(|| format!("asset {uri}"))?))
 }
 
@@ -1820,8 +1820,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         }
     }
     stats.insert("unique_triangles", (tris.len() + pool_tris.len()) as f64);
-    // Cutout materials: their triangles take the any-hit path in traversal. Glass lets shadow rays through
-    // (unattenuated: no caustics, like UE's raster shadows of translucency).
+    // Cutout materials: their triangles take the any-hit path in traversal. Glass casts no shadow of its own: what a
+    // shadow ray keeps past it is the kernel's (`glass_tr`; in full with `A_GLASS_SHADOWS`).
     for (f, a) in tri_flags.iter_mut().zip(&attrs) {
         let m = &materials[a.uv[3].to_bits() as usize];
         if m.uv2[3] > 0.0 {
