@@ -1,0 +1,31 @@
+name: stats-headless
+
+on:
+  pull_request:
+    paths:
+      - renderer/src/main.rs
+      - tests/stats-headless.test.ts
+      - tests/fixtures/stats-voxel.game.ts
+      - .github/workflows/stats-headless.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stats-headless:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: node tools/build-scenes.ts cornell-box instancing sun-room
+      - run: node tools/bundle-game.ts tests/fixtures/stats-voxel.game.ts
+      - run: cargo build --release --locked --manifest-path renderer/Cargo.toml --bin threert-render
+      - run: node --test tests/stats-headless.test.ts

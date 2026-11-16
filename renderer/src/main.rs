@@ -10,6 +10,9 @@
 //!   threert-render serve [--presets DIR]      # JSON-lines jobs on stdin, keeps the GPU device and game runtimes warm
 //!   threert-render play | live <bundle.js>    # native window / headless real-time (view.rs, live/)
 //!   threert-render setup <bundle.js>          # setup cost in the embedded runtime
+//!   threert-render stats <bundle.js> [--assets DIR] [--room id] [--seed n]
+//!                         # scene characterisation without a GPU: objects, geometries,
+//!                         # materials, textures, triangles, emitters
 //!   threert-render edit-check <bundle.js> --events '[{"type":..,"payload":..}]'
 //!   threert-render info                       # print adapter info
 
@@ -78,6 +81,16 @@ struct Hosts {
     hosts: HashMap<String, (ScriptHost, serde_json::Value)>,
 }
 
+/// Realize native voxel levels after script setup, before either rendering or headless stats.
+fn realize_voxel_level(host: &ScriptHost, assets: &Path) -> Result<()> {
+    let realized = host.voxels.borrow_mut().realize(&mut host.world.borrow_mut(), &mut host.physics.borrow_mut(), assets)?;
+    if let Some(r) = realized {
+        eprintln!("voxels: {r}");
+        host.world.borrow_mut().take_changes();
+    }
+    Ok(())
+}
+
 impl Hosts {
     /// The runtime with the job's scene: setup on first use, then the job's state (or the initial one) applied.
     fn scene(&mut self, job: &GameJob) -> Result<(&ScriptHost, f64)> {
@@ -100,11 +113,7 @@ impl Hosts {
             host.setup(&job.room, job.seed)?;
             // A native voxel level the scene code asked for (`voxelLevel`), loaded now that the asset root is known: the
             // offline reference of the live view's level (ROADMAP § 6 step 4). Its changes are the setup's, dropped.
-            let realized = host.voxels.borrow_mut().realize(&mut host.world.borrow_mut(), &mut host.physics.borrow_mut(), &job.assets)?;
-            if let Some(r) = realized {
-                eprintln!("voxels: {r}");
-                host.world.borrow_mut().take_changes();
-            }
+            realize_voxel_level(&host, &job.assets)?;
             let (initial, _) = host.state()?;
             self.hosts.insert(key.clone(), (host, initial));
         }
@@ -236,6 +245,26 @@ fn main() -> Result<()> {
             let setup_ms = host.setup(&flag("--room").unwrap_or_else(|| "local".into()), flag("--seed").map(|v| v.parse()).transpose()?)?;
             let w = host.world.borrow();
             println!("{}", serde_json::json!({ "engine": "quickjs", "bundle_load_ms": load_ms, "setup_ms": setup_ms, "objects": w.objects.len(), "geometries": w.geometries.len(), "materials": w.materials.len(), "textures": w.textures.len(), "info": host.info }));
+        }
+        "stats" => {
+            // Scene characterisation without a GPU: the world is built in the embedded runtime, then the CPU
+            // scene build + prepare count the geometry and the emitters (the same `prepare_as` the render and
+            // live paths run, with the hardware-traversal flags). No adapter, no device, no upload.
+            let t0 = Instant::now();
+            let host = ScriptHost::new(&std::fs::read_to_string(args.get(2).ok_or_else(|| anyhow!("game bundle required"))?)?)?;
+            let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let assets = PathBuf::from(flag("--assets").unwrap_or_else(|| ".".into()));
+            let setup_ms = host.setup(&flag("--room").unwrap_or_else(|| "local".into()), flag("--seed").map(|v| v.parse()).transpose()?)?;
+            // Reuse the normal renderer's pending voxel realization before counting geometry and emitters.
+            realize_voxel_level(&host, &assets)?;
+            let w = host.world.borrow();
+            let tb = Instant::now();
+            let mut sc = scene::build(&w, &assets, &presets, None)?;
+            let prep = threert_render::prepare_as(true, false, &mut sc, &mut vec![]);
+            let prepare_ms = tb.elapsed().as_secs_f64() * 1000.0;
+            // Same counts the render stats report (scene.rs `stats`): flat + instanced triangles.
+            let triangles = sc.stats.get("triangles").map_or(sc.tris.len() as u64, |t| *t as u64);
+            println!("{}", serde_json::json!({ "engine": "quickjs", "bundle_load_ms": load_ms, "setup_ms": setup_ms, "prepare_ms": prepare_ms, "objects": w.objects.len(), "geometries": w.geometries.len(), "materials": w.materials.len(), "textures": w.textures.len(), "triangles": triangles, "flat_triangles": sc.tris.len(), "instances": sc.instances.len(), "instanced_triangles": sc.stats.get("instanced_triangles").copied().unwrap_or(0.0) as u64, "emitters": prep.emitter_tris.len(), "info": host.info }));
         }
         "edit-check" => {
             // threert-render edit-check <bundle.js> [--assets DIR] --events '[{"type":..,"payload":..}, ..]'
