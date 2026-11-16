@@ -280,6 +280,32 @@ export class Euler {
     this._onChange();
     return this;
   }
+  /** Copy all four components while notifying once (three.js Euler.copy). */
+  copy(euler: Euler): this {
+    return this.set(euler._x, euler._y, euler._z, euler._order);
+  }
+  clone(): Euler {
+    return new (this.constructor as typeof Euler)(this._x, this._y, this._z, this._order);
+  }
+  equals(euler: Euler): boolean {
+    return this._x === euler._x && this._y === euler._y && this._z === euler._z && this._order === euler._order;
+  }
+  /** Like three.js, an omitted fourth array element leaves the existing order unchanged. */
+  fromArray(array: ArrayLike<number | EulerOrder>): this {
+    return this.set(
+      array[0] as number, array[1] as number, array[2] as number,
+      array[3] === undefined ? this._order : array[3] as EulerOrder,
+    );
+  }
+  toArray(): [number, number, number, EulerOrder];
+  toArray(array: Array<number | EulerOrder>, offset?: number): Array<number | EulerOrder>;
+  toArray(array: Array<number | EulerOrder> = [], offset = 0): Array<number | EulerOrder> {
+    array[offset] = this._x;
+    array[offset + 1] = this._y;
+    array[offset + 2] = this._z;
+    array[offset + 3] = this._order;
+    return array;
+  }
   /** Derives the angles from the unscaled rotation in a column-major matrix (three.js r187). */
   setFromRotationMatrix(m: Matrix4, order: EulerOrder = this._order, notify = true): this {
     const te = m.elements;

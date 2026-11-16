@@ -190,6 +190,62 @@ test("Euler: both gimbal-lock signs recompose across all six rotation orders", (
   }
 });
 
+test("Euler: copy, clone and equals preserve order with exactly one notification", () => {
+  const source = new THREE.Euler(Math.PI / 2, Math.PI / 2, 0, "YXZ");
+  const target = new THREE.Euler(-1, -2, -3, "XYZ");
+  let changes = 0;
+  target._onChange = () => { changes++; };
+  assert.equal(target.copy(source), target, "copy returns the target");
+  assert.equal(changes, 1, "copy notifies exactly once");
+  assert.deepEqual(target.toArray(), [Math.PI / 2, Math.PI / 2, 0, "YXZ"]);
+  assert.ok(target.equals(source), "same angles and order compare equal");
+  assert.equal(target.equals(new THREE.Euler(Math.PI / 2, Math.PI / 2, 0, "XYZ")), false,
+    "same angles in a different order are not equal");
+
+  const clone = target.clone();
+  assert.ok(clone !== target && clone.equals(target), "clone has independent identity and identical components");
+  clone.order = "ZXY";
+  assert.equal(target.order, "YXZ", "editing the clone cannot edit its source");
+  assert.equal(changes, 1, "the clone does not inherit its source's change listener");
+  assert.equal(clone.equals(target), false);
+
+  class CustomEuler extends THREE.Euler {}
+  assert.ok(new CustomEuler(1, 2, 3, "YZX").clone() instanceof CustomEuler,
+    "like three.js, clone preserves the Euler subclass");
+
+  const object = new THREE.Object3D();
+  object.rotation.copy(source);
+  assert.equal(object.rotation.order, "YXZ");
+  const expected = [0.5, 0.5, -0.5, 0.5];
+  assert.ok(object.quaternion.toArray().every((value, i) => Math.abs(value - expected[i]) < 1e-12),
+    "copy notifies Object3D to recompose its YXZ quaternion");
+});
+
+test("Euler: fromArray optional order and toArray offset match three.js", () => {
+  const euler = new THREE.Euler(9, 8, 7, "ZXY");
+  let changes = 0;
+  euler._onChange = () => { changes++; };
+  assert.equal(euler.fromArray([0.1, -0.2, 0.3]), euler);
+  assert.deepEqual(euler.toArray(), [0.1, -0.2, 0.3, "ZXY"],
+    "three numbers retain the existing order");
+  assert.equal(changes, 1, "three-component import notifies once");
+
+  assert.equal(euler.fromArray([Math.PI / 2, Math.PI / 2, 0, "YXZ"]), euler);
+  assert.equal(changes, 2, "four-component import also notifies once");
+  const output = [99, 99, 99, 99, 99, 99];
+  assert.equal(euler.toArray(output, 1), output, "toArray returns the supplied output array");
+  assert.deepEqual(output, [99, Math.PI / 2, Math.PI / 2, 0, "YXZ", 99],
+    "only the four slots after the offset are written");
+  assert.equal(changes, 2, "serialization is read-only");
+
+  const object = new THREE.Object3D();
+  object.rotation.fromArray(euler.toArray());
+  assert.equal(object.rotation.order, "YXZ");
+  const expected = [0.5, 0.5, -0.5, 0.5];
+  assert.ok(object.quaternion.toArray().every((value, i) => Math.abs(value - expected[i]) < 1e-12),
+    "import notifies Object3D and produces the YXZ orientation");
+});
+
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
