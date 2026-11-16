@@ -126,23 +126,6 @@ test("Object3D: clone (geometry shared, own id), attach (world transform kept), 
   assert.ok(o.getWorldDirection(new THREE.Vector3()).distanceTo(new THREE.Vector3(1, 0, 0)) < 1e-9);
 });
 
-test("Object3D.setRotationFromMatrix: replaces the rotation and ignores translation, as three.js does", () => {
-  const object = new THREE.Object3D();
-  object.position.set(2, 3, 4);
-  object.rotateX(Math.PI / 3);
-  const matrix = new THREE.Matrix4().makeRotationZ(Math.PI / 2).setPosition(10, 20, 30);
-
-  object.setRotationFromMatrix(matrix);
-  assert.ok(new THREE.Vector3(1, 0, 0).applyQuaternion(object.quaternion).distanceTo(new THREE.Vector3(0, 1, 0)) < 1e-9,
-    "Z +90 degrees replaces the previous X rotation");
-  assert.ok(Math.abs(object.rotation.z - Math.PI / 2) < 1e-9, "Euler rotation stays synchronized");
-  assert.deepEqual(object.position.toArray(), [2, 3, 4], "matrix translation does not move the object");
-
-  object.translateX(2);
-  assert.ok(object.position.distanceTo(new THREE.Vector3(2, 5, 4)) < 1e-9,
-    "subsequent local movement uses the extracted rotation");
-});
-
 test("Raycaster: the nearest hit first, front faces of single-sided materials, instanceId, near / far", () => {
   const scene = new THREE.Scene();
   const near = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshStandardMaterial());
@@ -243,4 +226,21 @@ test("Bugbot on #125 (2): setAutoExposure() with its defaults is set; a cloned c
   const { calls } = bind(scene, a);
   const cam = ofType(calls, "object").map((c) => c[2] as ObjectDesc).find((d) => d.kind === "camera") as { camera: { exposure: { mode: string } } };
   assert.equal(cam.camera.exposure.mode, "auto");
+});
+
+test("Object3D.setRotationFromMatrix: replaces the rotation and ignores translation, as three.js does", () => {
+  const object = new THREE.Object3D();
+  object.position.set(2, 3, 4);
+  object.rotateX(Math.PI / 3);
+  const matrix = new THREE.Matrix4().makeRotationZ(Math.PI / 2).setPosition(10, 20, 30);
+
+  object.setRotationFromMatrix(matrix);
+  assert.ok(new THREE.Vector3(1, 0, 0).applyQuaternion(object.quaternion).distanceTo(new THREE.Vector3(0, 1, 0)) < 1e-9,
+    "Z +90 degrees replaces the previous X rotation");
+  assert.ok(Math.abs(object.rotation.z - Math.PI / 2) < 1e-9, "Euler rotation stays synchronized");
+  assert.deepEqual(object.position.toArray(), [2, 3, 4], "matrix translation does not move the object");
+
+  object.translateX(2);
+  assert.ok(object.position.distanceTo(new THREE.Vector3(2, 5, 4)) < 1e-9,
+    "subsequent local movement uses the extracted rotation");
 });
