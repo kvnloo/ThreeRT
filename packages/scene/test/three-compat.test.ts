@@ -98,6 +98,29 @@ test("vertex colours: the geometry's `color` attribute (RGB, RGBA, normalized by
   assert.deepEqual(compatNotes().slice(before).filter((n) => n.startsWith("unsupported:")), []);
 });
 
+test("Object3D.dispatchEvent: target is cleared after listeners run, as three.js does", () => {
+  const first = new THREE.Object3D();
+  const second = new THREE.Object3D();
+  const event: { type: string; target?: THREE.Object3D } = { type: "ping" };
+  const called: string[] = [];
+  first.addEventListener("ping", (e) => {
+    assert.equal(e.target, first, "listener sees the dispatcher as its target");
+    assert.equal(e, event, "the original event object is passed through");
+    called.push("first");
+  });
+  second.addEventListener("ping", (e) => {
+    assert.equal(e.target, second, "a reused event targets its current dispatcher");
+    assert.equal(e, event);
+    called.push("second");
+  });
+
+  first.dispatchEvent(event);
+  assert.equal(event.target, null, "target is null after the first dispatch");
+  second.dispatchEvent(event);
+  assert.equal(event.target, null, "target is null after the second dispatch");
+  assert.deepEqual(called, ["first", "second"]);
+});
+
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
