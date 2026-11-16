@@ -2401,6 +2401,196 @@ access (it fails on a wrong entry: tried). The kernels' code is the same: render
 changed in four layouts, bench-window's shots as main's, the trace equal (Bistro 8.65 / 8.64 ms, lamp-rooms 3.71 /
 3.72), `tools/web-hello.ts` in Chrome passes.
 
+**The live renderer's shortcuts, named (2026-11-15, after it).** An inventory of where a live path gathers other
+light than an offline one found 16 places: the live architecture (the radiance cache, the clamps, the bounce limit,
+media marched and composited, depth of field as post), and seven shortcuts taken for speed over the months, each a
+`LIVE` check somewhere in the kernel: glass and media on shadow rays, cutouts on later rays and on emitters' shadow
+rays, the hardware shadow query, far emitters, white noise. The seven are bits of one pipeline constant now
+(`APPROX`; docs/RUNTIME.md "How live differs from offline", with what each was measured at), live taking all and
+offline none as before, and a live view can run without them (`THREERT_APPROX=0`): Bistro held still then reads ΔE
+1.67 for 1.82. No picture changes (render-identity 0 of 194 in four layouts, bench-window's shots as main's) and
+the trace is equal (Bistro 8.52 / 8.52 ms). Next: a test for each that holds the live picture without it to the offline one,
+their bias and cost measured again, and the defaults decided from that.
+
+**Each shortcut measured; two removed (2026-11-15, after it).** A pair of tests holds each approximation: the live
+view as shipped reads its bias, without the bit it reads the offline value (light under tinted glass 4.3 x, behind
+a medium e x, the sky under a clear cutout card 18 %, an emitter behind one black, panels 150 m away 3 %). Each was
+timed with its bit off, the loop guard on, in Bistro, Kabukichō, Zero Day, a glass scene, the fire scene, the
+Bistro slice, the 3 x 3 district and Tokyo (docs/RUNTIME.md's table). Two did not pay and are gone: the
+single-query shadow ray past cutouts (Bistro 10.13 ms with it, 10.09 without where its foliage is nearest; it lost
+hits on Metal) and the switch for white noise (variance only: what live does, not a bit). Two more looked removable
+on a small scene and were not on a large one: exact media shadows cost the fire scene 0.10 ms and the Bistro slice
+0.84 (9 %); the far-emitter cut saves the district 0.15 ms and Tokyo from the air half its trace (4.7 ms for 9.2).
+Both stay. Against main: the trace Bistro 8.57 / 8.50 ms, lamp-rooms 3.71 / 3.73, Zero Day 9.58 / 9.52, Kabukichō
+17.10 / 16.95 guarded, Tokyo at night 4.68 / 4.77 guarded (the query's saving there); render-identity in four
+layouts changes only the five tests that name bits (renumbered); bench-window's shots as main's, Kabukichō and
+Tokyo too. Next: a camera hit's light through a cutout loses the BSDF ray's share of its MIS weight (the 18 %);
+then the cutout bits' defaults.
+
+**A light sample through a cutout keeps its light (2026-11-16, after it).** Under `A_CUTOUT_PATHS` a camera hit's
+shadow rays test cutouts and the ray it sends on does not, but the sample's MIS weight still shared the light with
+that ray: under a card cut out everywhere a uniform sky gave a Lambert plane 18 % of its light. The sample now
+takes the share the BSDF ray cannot bring (`light_mis`; a specular sample off a smooth surface still tests cutouts
+and keeps its share): 50 for 50. None of our shots shows it (Bistro at night, the slice, Kabukichō, Tokyo: as
+main's); the trace is equal (Bistro 8.70 / 8.70 ms, the slice 9.29 / 9.32, Zero Day 9.68 / 9.61; guarded, Tokyo
+4.79 / 4.84 and Kabukichō 17.02 / 16.95); render-identity changes that one test. What is left of the bit is in the
+radiance cache: its rays take cards as solid for their own light samples too, so what a cutout lights sends nothing
+on (`sky/cutout-bounce`: a quarter of the sky offline, black live). Found on the way, not explained: with no card at
+all the live view reads that bounce 16 % low (0.21 for 0.25).
+
+**A shadow ray's light is a weight (2026-11-16, after it).** What a shadow ray kept past glass and media was drawn
+as one pass / stop decision, the glass's colour handed on beside it to the callers that asked: the sun's light in
+fog and the lights of volume points did not, and took the glass's largest channel for all three (`fog/scatter-glass`:
+0.915 for 0.365, offline too). The shadow rays' functions now return the transmittance and every caller multiplies
+by it (`shadow_tr`, `emitter_tr`, `any_tr`); where it can only be 0 or 1 the product folds away, and the kernel is
+as it was (Bistro 8.62 / 8.62 ms, a glass scene 4.96 / 4.96, the slice 9.11 / 9.11, the fire scene 1.89 / 1.88;
+guarded, Tokyo 4.81 / 4.80 and Kabukichō 16.97 / 16.75). `shadow/glass-tint-live-exact` reads 9.13 for 9.17 (8.87
+with the decision: its tolerance 5 % -> 3 %). render-identity changes the eight tests whose shadow rays cross
+tinting glass or media, in noise; bench-window's shots as main's (Kabukichō's flicker 0.68-0.72 over three seeds in
+both builds). The cost of exact glass shadows is the walk over the glass, which this leaves as it is.
+
+**The radiance cache held to numbers (2026-11-16, after it).** A live test of one bounce off a lit floor read
+0.21 for 0.25: the first number anyone had asked of the cache. Read against how the other caches of its kind are
+built (SHaRC, GI-1.0, Lumen, NRC), five faults:
+
+- A lookup that found no voxel read black past a view's first 30 frames (a shortcut, taken for speed, that was in
+  no list): 16 % of that bounce at 160 x 90, 2 % at 1280 x 720, 0.2 % of a Bistro frame. Every training sample is
+  now added two and four levels coarser as well, and a cold lookup reads those; with none it traces, always. The
+  shortcut is gone: with the coarser levels it cost time (Bistro 9.05 ms with it, 8.87 without).
+- A floor on a face of the voxel grid (y = 0) had its hits rounded to either side, two keys sharing its samples:
+  the key is taken just in front of the surface.
+- Where a path ended on a cold voxel its light samples kept their MIS share alone, 18 % of a uniform sky: they
+  stand alone there (`nee_alone`). A view's first frame read 4.0 for 7.05.
+- The lookup's reflectance had no coat: a surface that reflects by its coat alone reflected nothing.
+- A surface seen in a reflection took the sky's samples afresh against the white-lobe ones the cache had left
+  out, which do not add up on a glossy surface (a white metal ground in a mirror: 0.80 of a uniform sky, now 1.00).
+  The sky's light there is the cache's.
+
+Measured and not taken: ending a path in the cache only past a segment of a voxel or so, as the others do. It makes
+a slit narrower than a voxel right (`cache/slit-live`: 14 % bright without) and cost Bistro's trace 15 to 22 %:
+the pixels that go on hold their SIMD groups. Tracing an absent voxel and inserting it: 7 %, for what the coarser
+levels do for 1. A table four times the size: what the trace gains (0.13 ms) the cache's own pass spends. Taking a
+reflection hit's lights as light samples alone, which is the estimator without a bias: fireflies on Kabukichō's
+wet street (flicker + 22 %); they keep their weights.
+
+Against main: the trace Bistro 8.50 / 8.55 ms held still and 4.48 / 4.58 along its camera path, lamp-rooms 3.69 /
+3.75, the fire scene 1.88 / 1.92; guarded, Kabukichō 16.53 / 16.22 and Tokyo 5.85 / 5.50 by day, 4.79 / 4.74 at
+night (a surface in a reflection sends the sky no shadow ray). bench-window: Bistro ΔE 1.82 -> 1.81, lamp-rooms
+0.63 / p99 1.99 -> 0.63 / 1.85, in motion 0.80 -> 0.74, settled after a turn 0.67 -> 0.73 (the one shot that is
+worse: 0.6 % more light where it was 1.3 % bright already); Kabukichō, Tokyo at night and at 14:00 as main's.
+render-identity: the live tests that read the cache change, offline ones by a float's last place at most (the
+sky's light sample became a function). Next for the cache: its training as a pass of its own, as SHaRC's is
+(training that does not thin out with the resolution, deeper paths, a smaller kernel), and with it the table's
+size; a pass for the few pixels that go on, which is what the segment test waits for.
+
+**One ray query in the hardware trace (2026-11-16, after it).** The two cutout shortcuts made Zero Day's and
+Kabukichō's trace slower, not faster (0.4 to 0.8 ms), and nothing explained it. The cause: `trace` is inlined at
+each of its calls, and it held three ray queries, one for rays that take cutouts as opaque (the shortcuts'), one
+for a shadow ray's first hit, one in the loop of ordered steps; each one written costs every ray, taken or not.
+They are one query in one loop now (a shadow ray's first step takes any hit; a scene without cutouts keeps its
+plain query), with the same hits: render-identity 0 changed of 229, bench-window's shots as main's. The trace:
+Zero Day 9.41 -> 8.41 ms (-10.6 %), Bistro 8.57 -> 8.05 (-6.1 %) and 4.58 -> 4.36 along its camera path, the Bistro
+slice 9.00 -> 8.29, a glass scene 4.97 -> 4.60, Kabukichō 16.23 -> 14.61 guarded (-10 %); scenes without cutouts
+(lamp-rooms, the fire scene, Tokyo) as they were. The shortcuts now save Zero Day 0.3 ms where they cost it 0.4.
+
+**A second pass for the pixels that go on (2026-11-16, after it).** Where a live path ends in the cache most pixels
+read a warm voxel and are done; some have more to trace: a training path (1 tile in 8), a cold voxel's estimate, a
+reflection hit's lights (a third of Zero Day's pixels). Traced in `main` they held their SIMD groups, and their code
+cost every pixel (`main` without it: Bistro 8.06 -> 6.54 ms). They leave a 96-byte record now, and the kernel's
+`finish` pass traces the records after each sample, one invocation each, and adds the light to the pixel as the
+epilogue splits it. The estimator is the same: bench-window's shots as main's (Bistro 1.81, lamp-rooms 0.63, the
+slice 5.40, Kabukichō 4.66); render-identity: no offline picture differs, 13 live ones of 229 at single pixels with
+the image's mean within 4e-5 (which slot a voxel takes follows the order of inserts), and the build repeats itself
+to the byte where main did not (its lookups raced its own training). The trace: Bistro 8.16 -> 7.29 ms (-10.7 %)
+and 4.36 -> 3.98 along its camera path, Zero Day 8.52 -> 7.75 (-9.0 %), lamp-rooms 3.79 -> 3.24 (-14.5 %), the
+Bistro slice 8.32 -> 7.31 (-12.1 %); guarded, Tokyo 4.74 -> 4.28 (-9.7 %) and Kabukichō 14.60 -> 13.64 (-6.6 %:
+the pass costs 2.7 ms there, the wet street's material function run again for each record). The layout as written
+only; the merged one ends its paths in `main` as before. The records' buffer follows the traced size (50 MB at
+960 x 540). It is the kernel's 23rd binding, and the translucency pass, at Metal's 29 a stage already, binds
+group 1 without it: the next buffer needs a layout for each pass of what it reads. (Kabukichō's profile, for
+whoever reads it next: the particles' BLAS slot is 0.45 ms when the frame fits a display interval and 1.0 to 1.7
+with a spread of 3 when it is between one and two, in main's build too: it times a wait.) Next here: the segment
+test, whose pixels can go to the pass; a record that carries the surface where its material function is dear.
+
+**Glass as a rough dielectric (2026-11-16, after it).** Frosted glass was a delta event whatever its roughness: the
+ray refracted through a sampled microfacet with the weight of smooth glass, so the lobe had no value and no
+density, lights were never sampled through it, and a ray totally reflected inside took the glass's tint (a grey
+sheet seen past the critical angle read 0.5 of the sky). It is Walter et al. 2007's interface now (docs/RUNTIME.md
+"Glass"): reflection or refraction at a visible microfacet by the exact Fresnel reflectance, both with a value and
+a density; lights sampled on both sides, their shadow rays from the side they light; a delta lobe below roughness
+0.05 only; the energy single scattering loses returned from a table (Turquin 2019). Held by eleven `glass/*` tests
+against the BSDF's integral (lib.rs `glass_energy_tests`): one interface in a white sky 0.957 for 0.9573 entering,
+0.738 for 0.739 and 0.648 for 0.647 leaving, 0.999 and 0.992 with compensation, a lamp through frosted glass 4.01
+for 4.04, a frosted sphere in a furnace 0.999. Pictures without glass are as they were (render-identity: 196 of
+239 to the byte, the rest glass and water; Bistro's offline render to the byte, Kabukichō's still 4.66). The glass
+scene's offline render moved by ΔE 0.36 and its live frame keeps its distance to it (1.16 -> 1.18). The trace:
+the glass scene 3.95 -> 4.40 ms (+11 %), of which 0.36 ms is the lights now sampled through frosted glass;
+Bistro, Zero Day, lamp-rooms, Kabukichō, Tokyo as they were. bench-window kept one offline reference a shot
+whatever renderer made it: a build that changes the offline picture was read against the old one; the reference
+is keyed by the renderer's binary now, and the tool has a glass shot. Not here: thin walls (a pane is a solid's
+face), absorption by distance, the shadow rays' share (a Schlick albedo still, on a straight ray). Two things the
+kernel's shape decided: a shadow ray's origin on the side it leaves from is every surface's rule, but written into
+every kernel it cost Bistro's trace 4 %, so only kernels with glass have it; and the energy table's vec4 indexed
+by a variable cost the glass scene 1.5 %, a select chain nothing.
+
+**What is not the scene's no longer rebuilds it (2026-11-16, after it).** One flag, `Changes::structural`, sends an
+edit to a rebuild of the whole GPU scene, and it was set for things no part of the scene is built from: the scene
+camera's field of view, its depth of field, its exposure's mode, near and far (read by nothing), a camera that is
+not the scene's, fog appearing or turning volumetric, a background appearing, the preset and its overrides, and an
+offline render's size and clock. Bistro: a change of lens rebuilt for 884 and 724 ms; now the frame is as any other
+(15 to 17 ms). Each is applied where it lives: the lens by the view (as a camera's move), depth of field and
+exposure by the post passes and the kernel's clamp, fog and a background by the kernel's variant with them, the
+preset by the few parameters taken from it. A GPU test (`live::inplace_tests`) takes twelve such edits in place on
+one view and holds each to a view built from the edited world: no rebuild, the kernel's parameters the same
+whole, the same state after them, the same picture.
+Found by it: the emitter cull's view cone is made from the lens and was made again only when the camera moved or
+turned, so a lens changed in place kept the old one (it follows the lens now); and after an edit to the light (fog
+gone), the radiance cache and the frames' histories keep the old light for hundreds of frames (5 of 255 steps off
+after 264), here as after a rebuild; the test compares with the histories cleared. Still a rebuild: another sky, and the output's size (a view cannot be resized). The first of the
+scene model's steps: the proxy table next.
+
+**Another sky in place (2026-11-16, after it).** A sky's kind or parameters rebuilt the scene too. The build's sky
+is two functions now, the sky's data from the world (`scene::sky_data`) and its bake (`bake_sky`), and the live view
+calls them for an edit: the environment map and its CDF are written in place when they keep their size, else a new
+texture and the CDF's section grown, the scene bound again (`Gpu::put_env`); the parameters that say how the sky is
+read follow; the atmosphere's sun takes its colour from the bake, and a light that is the sun no longer is a light
+of its own colour again. The same test holds six sky edits (one colour, a gradient, an atmosphere with its sun,
+the same as a dynamic sky, one colour again, none) to a view built from the edited world. What the frame that
+takes one pays is the bake: 0.1 ms for a colour, 6 for a gradient, 47 for an atmosphere (a rebuild paid that and
+the scene's 0.5 to 0.9 s). No picture changed (render-identity; the live volume tests' own spread is wider than
+two runs show: five runs a side, none differ).
+
+**The view's state and the environment beside the scene's data (2026-11-16, after it).** The live view kept the
+scene camera's lens, depth of field and exposure, the preset, and the sky's state in the struct a rebuild replaces
+with the scene's data, the fog and the background in the tables beside materials and lights, and wrote each from
+two places, the load and an edit, which a test held equal (and found apart once: the emitter cull's cone). They
+are two objects of the view now (`live/state.rs`): `ViewState` and `Environment`, each derived whole from the world
+by one function, at load and on an edit, and the kernel's parameters each of them says are written by one function
+that the build calls too (`Params::set_preset`, `EnvSettings::write`, `SkyBaked::write`). Two change flags that
+came to mean the same (the camera's exposure, its depth of field) are one. No behaviour is meant to change, and
+one does: after a rebuild that changed the cloud cover, the next commit no longer bakes the sky again.
+What other engines do was read first: a scene container without camera, size or post state, size-dependent
+buffers and histories owned by the view, and the environment an object of its own are common to all read; which
+side the environment hangs on is not (here the scene's, as the scene DSL has it). Still against that: the
+per-pixel accumulation buffer is made with the scene's data. Resize moves it to the view.
+
+**The view at another size (2026-11-16, scene step A3).** A view's size was fixed when it opened: the window could
+not be resized, and the per-pixel samples were made with the scene's data. The view owns every buffer that follows
+its size now (`live/targets.rs`: the samples, the passes' own and their bind groups, the output, the kernel's
+four), and `LiveCore::resize` makes those again and nothing else: the scene's data, its acceleration structures
+and the radiance cache stay, the frames' histories start again. Bistro, to 1920 × 1080 or 2560 × 1440: 0.5 ms on
+the CPU, and the next frame waits for the GPU about half a frame longer, once (a rebuild there is 0.7–0.9 s). The
+window (`play`) is resizable and follows its size and its display's density (`view.rs` `fit`), and takes each
+answer of the surface as wgpu documents it (`acquire`): before, a window the system resized (moved to a display
+of another scale) reported `surface: Outdated` on every frame from then on (#101). A covered or minimised window
+has no present to pace its loop: it configured its surface and printed an error on every turn and took a core
+(96 %); it says so once now and waits for the next frame's time (3–4 %), the game's frame running as ever. The
+headless runner takes `{"cmd":"resize"}`. A test holds a resized view to one built at that size
+(state, picture; the scene's buffers and the cache the same handles) and fails with each of four steps of
+`resize` left out; on Bistro a view resized and back is the view only reset (dE 0.18, SSIM 0.9995 at the same
+frames). Left: the browser host's view is still fixed; the merged layout keeps the cache in one buffer with the
+size's buffers, so a resize there empties it; a drag makes every buffer again at each step.
+
 ## 2. Temporal fixes
 
 Targets (2026-11-08): bench-temporal, bench-ghosting and their UE MRQ references move to Bistro night (§ 0 step 7); the
@@ -2940,6 +3130,7 @@ dynamic-resolution floor, 60 Hz camera input.
    - The mannequin plaza's car now has clearcoated paint and a glass cabin with seats inside.
    - Not yet:
      - Thin-walled glass: a single-plane pane refracts as if solid.
+     - (Rough glass as a BSDF with a value and a density: done 2026-11-16, § 1.)
      - Tinted shadows.
      - Light through windows in the radiance cache: it treats glass as a surface, not a window.
      - glTF KHR_materials_transmission / clearcoat.

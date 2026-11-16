@@ -19,6 +19,10 @@ pub struct Gpu {
     pub uniform_tables: bool,
     /// The kernel's switches this device was opened with (`KernelSwitches`): they are in `source`.
     pub switches: KernelSwitches,
+    /// The approximations a live view's kernel takes (`A_*`): the options' (`GpuOptions::approx`) unless a view asked
+    /// for others (`set_approx`).
+    pub approx: u32,
+    approx_default: u32,
     /// Compiled pipelines kept between runs (`GpuOptions::pipeline_cache`), where the backend has such a cache.
     pipeline_cache: Option<crate::pipeline_cache::PipelineCache>,
     /// Kernel source (hardware or software traversal spliced in); scenes with material functions get their own module.
@@ -33,7 +37,7 @@ pub struct Gpu {
     pipeline_layout: wgpu::PipelineLayout,
     /// Kernel variants by (feature mask, material-function code hash, LIVE): `FEAT` compiles out the features a scene
     /// does not use (they cost registers even when idle); `LIVE` = one fresh sample per dispatch for the viewport.
-    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), wgpu::ComputePipeline>>,
+    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), wgpu::ComputePipeline>>,
     layout: wgpu::BindGroupLayout,
     /// Group 1, the live viewport's: primary visibility (texture_2d<u32>), the radiance cache (`CacheBuffers`) and
     /// what the live passes read of a trace (`KernelBufs`). Offline renders bind `no_vis` (1x1 texture `no_vis_view`,
@@ -54,9 +58,13 @@ pub struct Gpu {
     /// pipelines (`translucent`, `volume_train`) by the kernel's variant key.
     tl_layout: Option<wgpu::BindGroupLayout>,
     tl_pipeline_layout: Option<wgpu::PipelineLayout>,
-    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), TranslucentPipelines>>,
-    /// The live media passes (pathtrace.wgsl `media_train`, `media_composite`) by kernel variant and entry point.
-    media_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str), wgpu::ComputePipeline>>,
+    /// Its group 1: `vis_layout` without `finish`'s records, which the pass does not read (with them its three groups
+    /// are one buffer past Metal's 29 a stage), and `no_vis` made for it.
+    pub tl_vis_layout: Option<wgpu::BindGroupLayout>,
+    no_vis_tl: Option<wgpu::BindGroup>,
+    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), TranslucentPipelines>>,
+    /// The kernel's passes beside `main` (`kernel_pass`) by kernel variant and entry point.
+    kernel_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str, u32), wgpu::ComputePipeline>>,
     /// The procedural blobs of the last upload (`upload_procs`).
     proc_cache: std::sync::Mutex<Option<ProcCache>>,
     /// The last upload's procedural BLASes by geometry hash (read-only once built; another upload may share them), with
@@ -219,7 +227,7 @@ const ACCELERATION_STRUCTURE: wgpu::BindingType = wgpu::BindingType::Acceleratio
 /// (what the kernel writes), group 2 (the translucency pass's; hardware traversal). A test holds them to what every
 /// variant of the kernel's source declares (`the_kernels_layouts_are_its_declarations`).
 pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupLayoutEntry>; 3] {
-    use crate::merged::{GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
+    use crate::merged::{DEFERRED_BINDING, GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
     let LayoutShape { hwrt, merged, uniform_tables, guard } = shape;
     let (read, write) = (storage_buffer(true), storage_buffer(false));
     // Group 0: the parameters; triangles and their attributes; the tables' heap, the words' heap; the dynamic
@@ -253,14 +261,15 @@ pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupL
     }
     // Group 1: the raster pass's visibility; then, merged, the one buffer (`heap::Live`, the loop guard's count in
     // it); as written, the radiance cache's three, the light tiles' lists, the specular rays, the motion vectors, the
-    // direct light, and the loop guard's count where a kernel of this device may have the guard (one without it does
-    // not name the binding).
+    // direct light, the pixels left for `finish`, and the loop guard's count where a kernel of this device may have
+    // the guard (one without it does not name the binding).
     let mut live = vec![layout_entry(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false })];
     if merged {
         live.push(layout_entry(LIVE_BINDING, write));
     } else {
         live.extend([1, 2, 3, 5, 6, 7].map(|b| layout_entry(b, write)));
         live.push(layout_entry(LISTS_BINDING, read));
+        live.push(layout_entry(DEFERRED_BINDING, write));
         if guard {
             live.push(layout_entry(GUARD_BINDING, write));
         }
@@ -343,10 +352,11 @@ pub struct Uploaded {
     /// The uniform tables (`Gpu::uniform_tables`): the uniform buffers the kernel reads four tables from (merged.rs
     /// `UNIFORM_TABLES`' order; `Gpu::sync_tables` copies their sections there each frame).
     pub uniform: Option<[wgpu::Buffer; 4]>,
+    /// The trace's samples, a `Pixel` a pixel: the view's buffer (a live view's targets', an offline render's own:
+    /// `accum_buffer`). A handle of it here, for the scene's bind group, where the kernel's layout has it;
+    /// `Gpu::set_accum` gives it another (a view of another size).
     pub accum: wgpu::Buffer,
     pub params: wgpu::Buffer,
-    pub width: u32,
-    pub height: u32,
     /// Kernel specialisation for this scene (`Gpu::pipeline`).
     pub kernel: Kernel,
     /// Triangle vertices / shading attributes (posed models rewrite their ranges).
@@ -378,7 +388,7 @@ pub struct Uploaded {
     pub words: Heap<Stream>,
     pub cdf_words: usize,
     pub region_words: usize,
-    /// The environment map (`write_env` replaces it in place when a dynamic sky's sun moves).
+    /// The environment map (`put_env` replaces it: a dynamic sky's sun moved, another sky).
     pub env_tex: wgpu::Texture,
     /// Translucent particles' acceleration structures and pass resources (hardware RT).
     pub translucent: Option<Translucent>,
@@ -439,8 +449,6 @@ pub struct Translucent {
     pub params: wgpu::Buffer,
     pub points: wgpu::Buffer,
     pub count: wgpu::Buffer,
-    /// Live below full resolution: (colour, transmittance) per traced pixel (translucent.wgsl `tlow`).
-    pub low: wgpu::Buffer,
 }
 
 impl Uploaded {
@@ -1108,11 +1116,14 @@ pub struct GpuOptions {
     /// A directory to keep compiled pipelines in between runs (pipeline_cache.rs). None: nothing is kept.
     pub pipeline_cache: Option<std::path::PathBuf>,
     pub kernel: KernelSwitches,
+    /// The live renderer's approximations (`A_*`). None: all of them (`A_LIVE`). 0: a live view whose kernel is the
+    /// offline one's estimator, slower, for holding its picture to the offline render's.
+    pub approx: Option<u32>,
 }
 
 impl GpuOptions {
-    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, and the kernel's switches
-    /// (`KernelSwitches::from_env`).
+    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, THREERT_APPROX=<bits of `A_*`>, and the
+    /// kernel's switches (`KernelSwitches::from_env`).
     pub fn from_env() -> GpuOptions {
         Self::from_vars(&|name| std::env::var(name).ok(), cfg!(target_os = "android"))
     }
@@ -1123,6 +1134,7 @@ impl GpuOptions {
             uniform_tables: var("THREERT_UNIFORM_TABLES").map(|v| v == "1"),
             pipeline_cache: var("THREERT_PIPELINE_CACHE").filter(|d| !d.is_empty()).map(std::path::PathBuf::from),
             kernel: KernelSwitches::from_vars(var, android),
+            approx: var("THREERT_APPROX").and_then(|v| v.trim().parse().ok()),
         }
     }
 
@@ -1202,6 +1214,12 @@ pub fn tlas_rows(w: glam::Mat4) -> [f32; 12] {
 
 /// Entries of the live radiance cache (pathtrace.wgsl CACHE_SIZE).
 pub const CACHE_SIZE: u64 = 1 << 18;
+/// The kernel's `finish` pass (pathtrace.wgsl): a record's bytes (DEFERRED_VECS vec4s) after the 16 of their count,
+/// and the invocations of a dispatch row (DEFERRED_ROW).
+pub const DEFERRED_BYTES: u64 = 96;
+pub const DEFERRED_ROW: u32 = 16384;
+/// The bytes of a traced pixel's samples (records.wgsl `Pixel`), in a view's buffer of them (`Gpu::accum_buffer`).
+pub const SAMPLE_BYTES: u64 = 80;
 
 /// A buffer, or a range of one: in the merged layout (merged.rs) several of the engine's buffers are ranges of the one
 /// buffer a binding holds.
@@ -1263,6 +1281,9 @@ pub struct KernelBufs {
     pub motion: Buf,
     pub direct: Buf,
     pub lists: Buf,
+    /// The pixels a sample's trace leaves for `finish` (their count, then `DEFERRED_BYTES` each): the layout as
+    /// written only. Of one record until a live view makes it for its traced size (`deferred_buffer`).
+    pub deferred: Option<Buf>,
     /// The loop guard's count (`guard_loops`: its first word, the invocations a loop of which was stopped): with
     /// the guard, and always in the merged layout.
     pub guard: Option<Buf>,
@@ -1271,20 +1292,35 @@ pub struct KernelBufs {
 }
 
 impl KernelBufs {
+    /// Each in a buffer of its own: the live passes' four of these bytes, made (and `deferred` of one record: its view
+    /// makes it for what it traces), with this radiance cache and loop guard's count.
+    fn separate(d: &wgpu::Device, cache: CacheBuffers, guard: Option<Buf>, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
+        let sb = |label: &str, size: u64| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
+        KernelBufs { cache, refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), deferred: Some(deferred_buffer(d, 1)), guard, merged: None }
+    }
+
+    /// These for a view of another size: the four that follow the size made again, the radiance cache and the loop
+    /// guard's count kept. The merged layout's are one buffer: all of it made again, the cache (as long) empty.
+    pub fn resized(&self, d: &wgpu::Device, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
+        match self.merged {
+            Some(_) => KernelBufs::new(d, true, true, self.cache.val.size / 32, refl, motion, direct, lists),
+            None => KernelBufs::separate(d, self.cache.clone(), self.guard.clone(), refl, motion, direct, lists),
+        }
+    }
+
     /// For a cache of `entries` and the live passes' four of these bytes.
     /// `guard`: the layout as written has the guard's count (`Gpu::guard_room`).
     pub fn new(d: &wgpu::Device, merged: bool, guard: bool, entries: u64, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
         if !merged {
-            let sb = |label: &str, size: u64| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
-            let guard = guard.then(|| sb("loop guard", crate::merged::GUARD_WORDS as u64 * 4));
-            return KernelBufs { cache: CacheBuffers::new(d, entries), refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), guard, merged: None };
+            let guard = guard.then(|| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard"), size: crate::merged::GUARD_WORDS as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false })));
+            return KernelBufs::separate(d, CacheBuffers::new(d, entries), guard, refl, motion, direct, lists);
         }
         // (The cache's keys and sums are as long as the kernel's struct says, whatever `entries`: `live_sizes`. A
         // section's range is the bytes asked for: a pass that binds it sees an array of that length.)
         let bytes = live_sizes(entries, refl, motion, direct, lists);
         let heap = Heap::<Live>::new(d, &bytes);
         let b = |s: Live| Buf { buffer: heap.buffer.clone(), offset: heap.at(s), size: bytes[s.index()] };
-        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), guard: Some(b(Live::Guard)), merged: Some(heap) }
+        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), deferred: None, guard: Some(b(Live::Guard)), merged: Some(heap) }
     }
 
     /// Where the kernel finds the vec4 sections in the merged layout (`Params::live_first`, `live_len`): written with
@@ -1297,6 +1333,11 @@ impl KernelBufs {
     }
 }
 
+/// `finish`'s buffer for `records` pixels: their count (16 bytes, cleared before each sample), then the records.
+pub fn deferred_buffer(d: &wgpu::Device, records: u64) -> Buf {
+    Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some("deferred"), size: 16 + records.max(1) * DEFERRED_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+}
+
 /// The bytes of the merged layout's group-1 buffer's sections (`heap::Live`'s order) for a cache whose values are
 /// `entries` long and the live passes' four of these bytes. The cache's keys and sums and the loop guard's count are
 /// members of the kernel's struct, of the kernel's lengths (pathtrace.wgsl `MergedLive`).
@@ -1306,7 +1347,8 @@ pub(crate) fn live_sizes(entries: u64, refl: u64, motion: u64, direct: u64, list
 
 /// Group-1 bind group of the kernel: a primary-visibility texture, the radiance cache and the
 /// reflection resolve's inputs (`KernelBufs`); in the merged layout, the texture and the one buffer.
-pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs) -> wgpu::BindGroup {
+/// `deferred`: with `finish`'s records (`vis_layout`; the translucency pass's `tl_vis_layout` is without).
+pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs, deferred: bool) -> wgpu::BindGroup {
     fn e(binding: u32, b: &Buf) -> wgpu::BindGroupEntry<'_> {
         wgpu::BindGroupEntry { binding, resource: b.binding() }
     }
@@ -1315,6 +1357,7 @@ pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &w
         Some(heap) => d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &[tex, wgpu::BindGroupEntry { binding: crate::merged::LIVE_BINDING, resource: heap.buffer.as_entire_binding() }] }),
         None => {
             let mut entries = vec![tex, e(1, &b.cache.keys), e(2, &b.cache.acc), e(3, &b.cache.val), e(crate::merged::LISTS_BINDING, &b.lists), e(5, &b.refl), e(6, &b.motion), e(7, &b.direct)];
+            entries.extend(b.deferred.as_ref().filter(|_| deferred).map(|r| e(crate::merged::DEFERRED_BINDING, r)));
             entries.extend(b.guard.as_ref().map(|g| e(crate::merged::GUARD_BINDING, g)));
             d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &entries })
         }
@@ -1344,9 +1387,21 @@ pub struct Kernel {
     /// The scene's geometry functions and their dispatch (pathtrace.wgsl `geometry_function`), spliced like `functions`.
     pub geometry_functions: String,
     pub hash: u64,
+    /// The approximations its live pipelines are compiled with (`A_*`; an offline pipeline has none): the device's
+    /// (`Gpu::approx`) unless a view sets others.
+    pub approx: u32,
 }
 
 impl Kernel {
+    /// A pipeline's constants: `LIVE`, `FEAT`, `APPROX`.
+    fn constants(&self, live: bool) -> [(&'static str, f64); 3] {
+        [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", self.features as f64), ("APPROX", self.approx_of(live) as f64)]
+    }
+
+    fn approx_of(&self, live: bool) -> u32 {
+        if live { self.approx } else { 0 }
+    }
+
     pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
         let mut functions = String::new();
         if !scene.shaders.is_empty() {
@@ -1435,9 +1490,19 @@ impl Kernel {
         functions.hash(&mut h);
         volume_functions.hash(&mut h);
         geometry_functions.hash(&mut h);
-        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish() }
+        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish(), approx: A_LIVE }
     }
 }
+
+// The live renderer's approximations (`override APPROX` in pathtrace.wgsl, which says what each is; docs/RUNTIME.md
+// "How live differs from offline").
+pub const A_GLASS_SHADOWS: u32 = 1;
+pub const A_MEDIA_SHADOWS: u32 = 2;
+pub const A_CUTOUT_PATHS: u32 = 4;
+pub const A_CUTOUT_EMITTERS: u32 = 8;
+pub const A_FAR_EMITTERS: u32 = 16;
+/// All of them: what a live view takes unless it asks otherwise (`GpuOptions::approx`).
+pub const A_LIVE: u32 = 31;
 
 // Kernel features (`override FEAT` in pathtrace.wgsl).
 pub const F_MASKED: u32 = 1;
@@ -1510,7 +1575,28 @@ pub fn huge(groups: [usize; GROUPS], instanced: bool) -> bool {
 
 /// Features a scene needs; `THREERT_FEATURES` (bit mask) restricts them for profiling.
 pub fn features(scene: &Scene, groups: [usize; GROUPS]) -> u32 {
-    features_of(&scene.materials, scene.fog.as_ref(), !scene.textures.is_empty(), !scene.shaders.is_empty(), groups, instance_features(scene)) | if scene.aerial[0] > 0.0 { F_AERIAL } else { 0 }
+    features_of(&scene.materials, scene.environment.features(), !scene.textures.is_empty(), !scene.shaders.is_empty(), groups, instance_features(scene))
+}
+
+impl Params {
+    /// What the kernel takes from the render preset and the camera's exposure: the bounce limit, the depth Russian
+    /// roulette starts at, the firefly clamp on indirect paths (relative to the exposure), energy compensation.
+    pub fn set_preset(&mut self, native: &crate::desc::NativePreset, exposure: &crate::desc::Exposure) {
+        self.counts[2] = native.max_bounces;
+        self.counts[3] = native.russian_roulette_depth;
+        self.misc[0] = native.firefly_clamp(exposure);
+        self.misc[2] = native.energy_compensation;
+    }
+}
+
+/// Kernel features of the environment, which edits change: fog (F_FOG, with lit scattering F_VOLUME), a background
+/// (F_BACKGROUND), the sky's aerial perspective (F_AERIAL; `aerial`: `Params::aerial`).
+pub fn environment_features(fog: Option<&crate::desc::Fog>, background: bool, aerial: [f32; 4]) -> u32 {
+    let mut f = if background { F_BACKGROUND } else { 0 } | if aerial[0] > 0.0 { F_AERIAL } else { 0 };
+    if let Some(fog) = fog.filter(|fog| fog.density > 0.0) {
+        f |= F_FOG | if fog.volumetric.as_ref().is_some_and(|v| v.scattering > 0.0) { F_VOLUME } else { 0 };
+    }
+    f
 }
 
 /// Kernel features of the scene's structure, which parameter edits do not change: F_INST and F_MASKED for the
@@ -1520,28 +1606,21 @@ pub fn instance_features(scene: &Scene) -> u32 {
     // (F_GRID also for a volume function that calls `vgrid` on a node without a grid: it reads zeros.)
     let grid = !scene.grids.is_empty() || (!scene.media.is_empty() && scene.volume_fns.iter().any(|(_, code, helpers)| code.contains("vgrid(") || helpers.contains("vgrid(")));
     let media = if scene.media.is_empty() { 0 } else { F_MEDIA } | if scene.media.iter().any(|m| m.a[2] != 0) { F_HMEDIA } else { 0 } | if grid { F_GRID } else { 0 };
-    let particles = if scene.particles.iter().any(|p| !p.translucent) || !scene.gpu_particles.is_empty() { F_PEMIT } else { 0 } | if scene.procs.is_empty() { 0 } else { F_PROC } | if scene.tinted { F_TINT } else { 0 } | if scene.background.is_some() { F_BACKGROUND } else { 0 } | if scene.gpu_vcolors.is_empty() { 0 } else { F_VCOLOR } | if scene.lights.iter().filter(|l| l.pos[3] != 0.0 && l.ext[3] >= 0.5).count() > RIS_EXACT { F_LISTS } else { 0 };
+    let particles = if scene.particles.iter().any(|p| !p.translucent) || !scene.gpu_particles.is_empty() { F_PEMIT } else { 0 } | if scene.procs.is_empty() { 0 } else { F_PROC } | if scene.tinted { F_TINT } else { 0 } | if scene.gpu_vcolors.is_empty() { 0 } else { F_VCOLOR } | if scene.lights.iter().filter(|l| l.pos[3] != 0.0 && l.ext[3] >= 0.5).count() > RIS_EXACT { F_LISTS } else { 0 };
     if scene.gpu_instances.is_empty() {
         return media | particles;
     }
     media | particles | F_INST | if scene.meshes.iter().any(|m| m.opaque < m.count) { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
 }
 
-/// `features` from the parts parameter edits change (materials, fog), and the instanced meshes' (`instance_features`).
-pub fn features_of(ms: &[crate::scene::GpuMaterial], fog: Option<&crate::desc::Fog>, textures: bool, functions: bool, groups: [usize; GROUPS], instances: u32) -> u32 {
+/// `features` from the parts parameter edits change (the materials; `environment`: `environment_features`), and the
+/// scene's structure (`instances`: `instance_features`).
+pub fn features_of(ms: &[crate::scene::GpuMaterial], environment: u32, textures: bool, functions: bool, groups: [usize; GROUPS], instances: u32) -> u32 {
     // `instances` carries the structural features (instance_features): instancing is its F_INST bit.
     let instanced = instances & F_INST != 0;
-    let mut f = instances;
+    let mut f = instances | environment;
     if groups[1] + groups[3] + groups[5] + groups[7] > 0 {
         f |= F_MASKED;
-    }
-    if let Some(fog) = fog {
-        if fog.density > 0.0 {
-            f |= F_FOG;
-            if fog.volumetric.as_ref().is_some_and(|v| v.scattering > 0.0) {
-                f |= F_VOLUME;
-            }
-        }
     }
     if textures {
         f |= F_TEX;
@@ -1678,6 +1757,7 @@ impl Gpu {
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));
         let switches = options.kernel;
+        let approx = options.approx.unwrap_or(A_LIVE) & A_LIVE;
         let src = kernel_template();
         // Bounds checks are not needed: all indices come from our own BVH / scene builder.
         let module = unsafe {
@@ -1712,16 +1792,19 @@ impl Gpu {
             ],
         });
         let no_vis_bufs = KernelBufs::new(&device, merged, guard_room(hwrt), 1, 64, 64, 64, 64);
-        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs);
+        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs, true);
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout), Some(&vis_layout)], immediate_size: 0 });
-        let (tl_layout, tl_pipeline_layout) = if hwrt {
+        let (tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl) = if hwrt {
             let l = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("translucent"), entries: &tl_entries });
-            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vis_layout), Some(&l)], immediate_size: 0 });
-            (Some(l), Some(tpl))
+            let tl_vis: Vec<_> = vis_entries.iter().filter(|e| merged || e.binding != crate::merged::DEFERRED_BINDING).copied().collect();
+            let vl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("vis, translucent"), entries: &tl_vis });
+            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vl), Some(&l)], immediate_size: 0 });
+            let nv = vis_bind_group(&device, &vl, &no_vis_view, &no_vis_bufs, false);
+            (Some(l), Some(tpl), Some(vl), Some(nv))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
-        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_pipelines: Default::default(), media_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
+        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
     }
 
     /// Whether this device's kernel buffers have the loop guard's count (`guard_room`; always in the merged layout).
@@ -1743,14 +1826,19 @@ impl Gpu {
         }
     }
 
+    /// The approximations of the live views made on this device from now on (`A_*`; None: the options').
+    pub fn set_approx(&mut self, approx: Option<u32>) {
+        self.approx = approx.unwrap_or(self.approx_default) & A_LIVE;
+    }
+
     /// The path-tracing kernel specialised for a scene (feature mask + material functions), compiled on first use.
     pub fn pipeline(&self, k: &Kernel, live: bool) -> wgpu::ComputePipeline {
         let mut cache = self.pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
                     layout: Some(&self.pipeline_layout),
@@ -1801,15 +1889,15 @@ impl Gpu {
             .clone()
     }
 
-    /// A live media pass of a scene's kernel variant: `media_train` (the volume voxels) or `media_composite` (camera
-    /// rays through media, after the trace).
-    pub fn media_pipeline(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
-        let mut cache = self.media_passes.lock().unwrap();
+    /// A live pass of a scene's kernel variant beside `main`: `finish` (the pixels a sample's trace left), `media_train`
+    /// (the volume voxels) or `media_composite` (camera rays through media, after the trace).
+    pub fn kernel_pass(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
+        let mut cache = self.kernel_passes.lock().unwrap();
         cache
-            .entry((k.features, k.hash, entry))
+            .entry((k.features, k.hash, entry, k.approx))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", 1.0), ("FEAT", k.features as f64)];
+                let constants = k.constants(true);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: Some(&self.pipeline_layout),
@@ -1828,10 +1916,10 @@ impl Gpu {
     pub fn translucent_pipelines(&self, k: &Kernel, live: bool) -> TranslucentPipelines {
         let mut cache = self.tl_pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let make = |entry: &str| {
                     self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some(entry),
@@ -1850,15 +1938,39 @@ impl Gpu {
     }
 
     /// The translucency pass's bind group (group 2) drawing into `target` (live: the composed image; offline: sums);
-    pub fn translucent_bind_group(&self, t: &Translucent, target: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// `low`: (colour, transmittance) per traced pixel, where a live view draws below full resolution
+    /// (`translucent_low`; translucent.wgsl `tlow`).
+    pub fn translucent_bind_group(&self, t: &Translucent, target: &wgpu::Buffer, low: &wgpu::Buffer) -> wgpu::BindGroup {
         fn e(b: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry { binding: b, resource: buf.as_entire_binding() }
         }
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("translucent"),
             layout: self.tl_layout.as_ref().unwrap(),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: t.tlas.as_binding() }, e(1, &t.params), e(2, target), e(3, &t.points), e(4, &t.count), e(5, &t.low)],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: t.tlas.as_binding() }, e(1, &t.params), e(2, target), e(3, &t.points), e(4, &t.count), e(5, low)],
         })
+    }
+
+    /// A view's buffer of the trace's samples (`Uploaded::accum`): a `Pixel` a pixel, the largest buffer a view holds
+    /// (`view_fits`).
+    pub fn accum_buffer(&self, w: u32, h: u32) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("accum"), size: w as u64 * h as u64 * SAMPLE_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+    }
+
+    /// Whether this device holds a view of `w` x `h` (its samples in one buffer).
+    pub fn view_fits(&self, w: u32, h: u32) -> bool {
+        self.buffer_fits(w as u64 * h as u64 * SAMPLE_BYTES)
+    }
+
+    /// A view's buffer for translucent particles drawn below full resolution (`translucent_bind_group`'s `low`).
+    pub fn translucent_low(&self, w: u32, h: u32) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent low"), size: (w as u64 * h as u64).max(1) * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
+    }
+
+    /// Another buffer for the trace's samples (a view of another size): the scene bound again with it.
+    pub fn set_accum(&self, up: &mut Uploaded, accum: &wgpu::Buffer) {
+        up.accum = accum.clone();
+        self.rebind_scene(up);
     }
 
     /// The radiance cache's per-frame resolve (pathtrace.wgsl `cache_resolve`; kernel bind groups).
@@ -1919,7 +2031,7 @@ impl Gpu {
     /// Uploads a prepared scene (geometry, materials, textures, environment, acceleration structures) and returns the
     /// bind group used by both the offline and the live kernels. `accum` holds one 80-byte Pixel per output pixel.
     #[allow(clippy::too_many_arguments)]
-    pub fn upload(&self, scene: &Scene, w: u32, h: u32, tri_verts: &[[f32; 4]], groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], timings: &mut Vec<(String, f64)>) -> Result<Uploaded> {
+    pub fn upload(&self, scene: &Scene, accum: &wgpu::Buffer, tri_verts: &[[f32; 4]], groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], timings: &mut Vec<(String, f64)>) -> Result<Uploaded> {
         let d = &self.device;
         let t0 = Instant::now();
         // (The vertices too: the kernel's tree over no triangle is a leaf of triangle 0, which these zeros make a
@@ -2017,8 +2129,7 @@ impl Gpu {
             GridsGpu { atlas, pipeline, grids, step: std::cell::Cell::new(0) }
         });
         let grid_view = grids.as_ref().map_or_else(|| self.no_grid_view.clone(), |g| g.atlas.create_view(&Default::default()));
-        let accum_size = (w as u64) * (h as u64) * 80;
-        let b_accum = d.create_buffer(&wgpu::BufferDescriptor { label: Some("accum"), size: accum_size, usage: st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let b_accum = accum.clone();
         let b_params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("params"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let (tex_view, tex_info) = self.texture_pages(scene, timings);
@@ -2037,27 +2148,12 @@ impl Gpu {
             (Table::Instances, bytemuck::cast_slice(if records.is_empty() { &none[..] } else { &records[..] }), room.records * std::mem::size_of::<crate::scene::GpuInstance>()),
             (Table::Media, bytemuck::cast_slice(&scene.media), 0),
             (Table::Energy, bytemuck::cast_slice(energy), 0),
+            (Table::GlassEnergy, bytemuck::cast_slice(crate::glass_energy_lut()), 0),
         ];
         assert!(parts.iter().enumerate().all(|(k, p)| p.0.index() == k), "the tables in `Table`'s order");
         let heap = Heap::filled(d, &parts.map(|p| (p.1.len() + p.2) as u64), |put| parts.iter().for_each(|p| put(p.0, 0, p.1)));
 
-        let env_tex = d.create_texture(&wgpu::TextureDescriptor {
-            label: Some("env"),
-            size: wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let half: Vec<u16> = env.texels.iter().flat_map(|t| t.iter().map(|v| half::f16::from_f32(v.min(65000.0)).to_bits())).collect();
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &env_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&half),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(env.width * 8), rows_per_image: Some(env.height) },
-            wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
-        );
+        let env_tex = self.env_texture(env);
         let env_view = env_tex.create_view(&Default::default());
         let sampler = d.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -2264,7 +2360,7 @@ impl Gpu {
         });
         let bg_parts = BindParts { nodes: b_nodes, tex_view, env_view, sampler, grid_view };
         let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, verts: &b_verts, attrs: &b_attrs, heap: &heap, words: &words, prev_verts: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
-        let kernel = Kernel::new(scene, groups);
+        let kernel = Kernel { approx: self.approx, ..Kernel::new(scene, groups) };
         // Translucent particles (hardware RT): their own BLAS + TLAS, rebuilt after the particle pass.
         let translucent = match &accel {
             Some(_) if !scene.trans_tris.is_empty() => {
@@ -2280,8 +2376,7 @@ impl Gpu {
                 let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
                 let points = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume points"), size: VOLUME_TRAIN_CAP as u64 * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let count = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume point count"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let low = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent low"), size: (w as u64 * h as u64).max(1) * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-                let t = Translucent { blas, tlas, size, verts, first: scene.trans_first, params, points, count, low };
+                let t = Translucent { blas, tlas, size, verts, first: scene.trans_first, params, points, count };
                 // Built once now (collapsed quads): bind groups may use the TLAS before the first particle pass.
                 let mut enc = d.create_command_encoder(&Default::default());
                 t.build(&mut enc);
@@ -2374,7 +2469,7 @@ impl Gpu {
         timings.push(("upload_ms".into(), t0.elapsed().as_secs_f64() * 1000.0));
         // (The scene's own pipelines, made above: particles, grid programs.)
         self.save_pipeline_cache();
-        Ok(Uploaded { bg, bg_parts, heap, uniform, accum: b_accum, params: b_params, width: w, height: h, kernel, verts: b_verts, attrs: b_attrs, prev_verts: b_prev, dynamic_first, accel, units: scene.units.clone(), particles, gpu_particles, grids, translucent, vcolors: !scene.gpu_vcolors.is_empty(), media_nodes: scene.media_nodes.clone(), media_hidden: std::cell::RefCell::new(scene.media.iter().map(|m| m.a[1] == crate::scene::MEDIUM_HIDDEN).collect()), room, words, cdf_words: env_cdf.len(), region_words, env_tex })
+        Ok(Uploaded { bg, bg_parts, heap, uniform, accum: b_accum, params: b_params, kernel, verts: b_verts, attrs: b_attrs, prev_verts: b_prev, dynamic_first, accel, units: scene.units.clone(), particles, gpu_particles, grids, translucent, vcolors: !scene.gpu_vcolors.is_empty(), media_nodes: scene.media_nodes.clone(), media_hidden: std::cell::RefCell::new(scene.media.iter().map(|m| m.a[1] == crate::scene::MEDIUM_HIDDEN).collect()), room, words, cdf_words: env_cdf.len(), region_words, env_tex })
     }
 
     /// Bytes Metal allocates for an AABB BLAS over `count` boxes in `boxes` (its own size query through wgpu-hal; None
@@ -2783,21 +2878,62 @@ impl Gpu {
         }
     }
 
-    /// A volume node moved or changed its customData: its medium's world -> local rows / `custom` (None: unchanged).
-    /// Replaces the environment map and its sampling CDF in place (a dynamic sky's new bake). Both keep their sizes.
-    pub fn write_env(&self, up: &Uploaded, env: &EnvMap, cdf: &[f32]) {
-        let size = up.env_tex.size();
-        if (env.width, env.height) != (size.width, size.height) || cdf.len() != up.cdf_words {
-            return;
-        }
+    /// An environment map's texture, with its texels.
+    fn env_texture(&self, env: &EnvMap) -> wgpu::Texture {
+        let t = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("env"),
+            size: wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.write_env_texels(&t, env);
+        t
+    }
+
+    fn write_env_texels(&self, t: &wgpu::Texture, env: &EnvMap) {
         let half: Vec<u16> = env.texels.iter().flat_map(|t| t.iter().map(|v| half::f16::from_f32(v.min(65000.0)).to_bits())).collect();
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &up.env_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&half),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(env.width * 8), rows_per_image: Some(env.height) },
-            size,
+            wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
         );
+    }
+
+    /// Whether a buffer of `bytes` can be made and bound (the device's buffer and storage binding limits).
+    pub fn buffer_fits(&self, bytes: u64) -> bool {
+        let l = self.device.limits();
+        bytes <= (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size)
+    }
+
+    /// A sky's environment map and its sampling CDF (a dynamic sky's new bake, another sky): written in place where
+    /// they are as large as the ones they replace, else a new texture, the CDF's section grown where it has to, and
+    /// the scene bound again. False, with nothing changed, when the grown buffer would pass the device's limits (a
+    /// build lays the scene's words out again, with less room for edits: the caller rebuilds).
+    pub fn put_env(&self, up: &mut Uploaded, env: &EnvMap, cdf: &[f32]) -> bool {
+        let size = up.env_tex.size();
+        if (env.width, env.height) == (size.width, size.height) && cdf.len() == up.cdf_words {
+            self.write_env_texels(&up.env_tex, env);
+            up.words.write(&self.queue, Stream::EnvCdf, 0, bytemuck::cast_slice(cdf));
+            return true;
+        }
+        let bytes = cdf.len() as u64 * 4;
+        if bytes > up.words.cap(Stream::EnvCdf) {
+            if !self.buffer_fits(up.words.size_with(Stream::EnvCdf, bytes)) {
+                return false;
+            }
+            up.words.grow(&self.device, &self.queue, Stream::EnvCdf, bytes);
+        }
+        up.env_tex = self.env_texture(env);
+        up.bg_parts.env_view = up.env_tex.create_view(&Default::default());
         up.words.write(&self.queue, Stream::EnvCdf, 0, bytemuck::cast_slice(cdf));
+        up.cdf_words = cdf.len();
+        self.rebind_scene(up);
+        true
     }
 
     /// A volume node shown or hidden by its own `visible`, in place: its media keep their place in the table with
@@ -3120,14 +3256,14 @@ impl Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     /// Offline translucency: the pass (translucent.wgsl) `spp` times at random points in each pixel, each with a fresh
     /// lighting estimate per hit; the mean (colour, transmittance) per pixel. Empty without translucent particles.
-    fn render_translucent(&self, up: &Uploaded, base: Params, spp: u32) -> Result<Vec<[f32; 4]>> {
+    fn render_translucent(&self, up: &Uploaded, base: Params, spp: u32, (w, h): (u32, u32)) -> Result<Vec<[f32; 4]>> {
         let Some(t) = &up.translucent else { return Ok(vec![]) };
         let d = &self.device;
-        let (w, h) = (up.width, up.height);
         let pipeline = self.translucent_pipelines(&up.kernel, false).draw;
         let size = w as u64 * h as u64 * 16;
         let sums = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent sums"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let tbg = self.translucent_bind_group(t, &sums);
+        // (Drawn at full resolution: the reduced image's buffer is bound and not read.)
+        let tbg = self.translucent_bind_group(t, &sums, &self.translucent_low(1, 1));
         let tp = TranslucentParams { size: [w, h, t.first, 0], view: [w, h, 0, 0], misc: [0.0; 4] };
         self.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
         let n = spp.max(1);
@@ -3142,7 +3278,7 @@ impl Gpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("translucent"), timestamp_writes: None });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &up.bg, &[]);
-                pass.set_bind_group(1, &self.no_vis, &[]);
+                pass.set_bind_group(1, self.no_vis_tl.as_ref().unwrap(), &[]);
                 pass.set_bind_group(2, &tbg, &[]);
                 pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
             }
@@ -3171,7 +3307,7 @@ impl Gpu {
     pub fn render(&self, scene: &Scene, tri_verts: &[[f32; 4]], groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], base: Params, spp: u32, timings: &mut Vec<(String, f64)>) -> Result<Frame> {
         let d = &self.device;
         let (w, h) = (scene.width, scene.height);
-        let up = self.upload(scene, w, h, tri_verts, groups, nodes, emitters, light_tree, env, env_cdf, energy, timings)?;
+        let up = self.upload(scene, &self.accum_buffer(w, h), tri_verts, groups, nodes, emitters, light_tree, env, env_cdf, energy, timings)?;
         let pipeline = self.pipeline(&up.kernel, false);
         // Particles: placed once, at the scene time and camera.
         if up.particles.is_some() {
@@ -3251,7 +3387,7 @@ impl Gpu {
             }
         }
         let t_tl = Instant::now();
-        let overlay = self.render_translucent(&up, base, spp)?;
+        let overlay = self.render_translucent(&up, base, spp, (w, h))?;
         if up.translucent.is_some() {
             timings.push(("translucent_ms".into(), t_tl.elapsed().as_secs_f64() * 1000.0));
         }
@@ -3340,6 +3476,20 @@ mod tests {
             seen |= bit;
         }
         let wgsl = include_str!("../shaders/pathtrace.wgsl");
+        // The live approximations: one bit each, the shader's the same, `A_LIVE` all of them.
+        let approx = [("A_GLASS_SHADOWS", A_GLASS_SHADOWS), ("A_MEDIA_SHADOWS", A_MEDIA_SHADOWS), ("A_CUTOUT_PATHS", A_CUTOUT_PATHS), ("A_CUTOUT_EMITTERS", A_CUTOUT_EMITTERS), ("A_FAR_EMITTERS", A_FAR_EMITTERS)];
+        assert_eq!(approx.iter().fold(0, |all, a| { assert!(a.1.is_power_of_two() && all & a.1 == 0, "{} = {}", a.0, a.1); all | a.1 }), A_LIVE);
+        let declared: Vec<&str> = wgsl.lines().filter(|l| l.starts_with("const A_")).collect();
+        assert_eq!(declared.len(), approx.len());
+        for (name, bit) in approx {
+            assert!(declared.iter().any(|l| l.starts_with(&format!("const {name}: u32 = {bit}u;"))), "{name}: pathtrace.wgsl and gpu.rs differ");
+        }
+        // (The render tests' names for them: tests/render/lib.ts `APPROX`.)
+        let lib = include_str!("../../tests/render/lib.ts");
+        for (name, bit) in [("glassShadows", A_GLASS_SHADOWS), ("mediaShadows", A_MEDIA_SHADOWS), ("cutoutPaths", A_CUTOUT_PATHS), ("cutoutEmitters", A_CUTOUT_EMITTERS), ("farEmitters", A_FAR_EMITTERS)] {
+            assert!(lib.contains(&format!("{name}: {bit},")), "{name}: tests/render/lib.ts and gpu.rs differ");
+        }
+        assert!(lib.contains(&format!("all: {A_LIVE},")));
         assert!(wgsl.contains(&format!("const RIS_EXACT: u32 = {RIS_EXACT}u;")), "RIS_EXACT: pathtrace.wgsl and gpu.rs differ");
         for line in wgsl.lines().filter(|l| l.starts_with("const F_")) {
             let name = &line[6..line.find(':').unwrap()];
@@ -3557,7 +3707,7 @@ mod tests {
             let plain = v(hwrt, KernelSwitches::default());
             let strict = v(hwrt, KernelSwitches { strict: true, ..Default::default() });
             let queries = strict.matches("rayQueryInitialize(").count();
-            assert_eq!(queries, if hwrt { 3 } else { 0 });
+            assert_eq!(queries, if hwrt { 2 } else { 0 });
             assert_eq!(strict.matches("ray_bad(o, d, tmax").count(), queries, "every ray query is guarded");
             assert_eq!(strict.matches("fn ray_bad(").count(), hwrt as usize);
             assert!(!strict.contains("env_cdf_at(y - 1u)") && !strict.contains("env_cdf_at(base + x - 1u)") && plain.contains("env_cdf_at(y - 1u)"));
@@ -3567,7 +3717,7 @@ mod tests {
             let sun = v(hwrt, KernelSwitches { last_sun: true, ..Default::default() });
             assert_eq!((sun.matches("radiance += dz;").count(), sun.matches("fn sun_light(").count(), sun.matches("sun_light(s, lobes(").count()), (1, 1, 1));
             assert!(!plain.contains("sun_light"));
-            assert_eq!(lit.matches("env_on = take_env && has_env;").count(), 1);
+            assert_eq!(lit.matches("env_on = take_env && has_env && !lights_only;").count(), 1);
             assert_eq!(lit.contains("let steps = 4u;"), hwrt);
             assert_eq!(v(hwrt, KernelSwitches { cutout_lite: 2, ..Default::default() }) == plain, !hwrt);
         }
@@ -3672,9 +3822,9 @@ mod tests {
     fn structural_features_are_not_instancing() {
         const M: usize = 1 << 23;
         let groups = [M + 5, 3, 0, 0, 0, 0, 0, 0];
-        assert_eq!(features_of(&[], None, false, false, groups, F_PEMIT) & F_HUGE, 0);
-        assert_eq!(features_of(&[], None, false, false, groups, F_MEDIA) & F_HUGE, 0);
-        assert_ne!(features_of(&[], None, false, false, groups, F_INST) & F_HUGE, 0);
+        assert_eq!(features_of(&[], 0, false, false, groups, F_PEMIT) & F_HUGE, 0);
+        assert_eq!(features_of(&[], 0, false, false, groups, F_MEDIA) & F_HUGE, 0);
+        assert_ne!(features_of(&[], 0, false, false, groups, F_INST) & F_HUGE, 0);
     }
 
     #[test]
