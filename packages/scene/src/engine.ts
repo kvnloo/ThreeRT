@@ -566,10 +566,13 @@ export class SceneBinding {
       this.engine.visible(b.id, o.visible);
       stats.updated++;
     }
-    if (o.power !== b.power) {
-      if (!(o.power >= 0) || !Number.isFinite(o.power)) throw new TypeError(`${b.name}: power must be a finite number >= 0`);
-      b.power = o.power;
-      this.engine.power(b.id, o.power);
+    // On physical lights, three.js power is lumens, not the engine's object-emission multiplier.
+    // Light intensity carries those edits via lightValues; keep the engine multiplier neutral.
+    const renderPower = o instanceof PointLight || o instanceof SpotLight || o instanceof RectAreaLight ? 1 : o.power;
+    if (renderPower !== b.power) {
+      if (!(renderPower >= 0) || !Number.isFinite(renderPower)) throw new TypeError(`${b.name}: power must be a finite number >= 0`);
+      b.power = renderPower;
+      this.engine.power(b.id, renderPower);
       stats.updated++;
     }
     const custom = o.customData.join(",");

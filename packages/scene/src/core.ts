@@ -1923,6 +1923,13 @@ export class PointLight extends Light {
     this.distance = distance;
     this.decay = decay;
   }
+  /** Photometric luminous power in lumens: candela × 4π, as in three.js r187. */
+  override get power(): number {
+    return this.intensity * 4 * Math.PI;
+  }
+  override set power(lumens: number) {
+    this.intensity = lumens / (4 * Math.PI);
+  }
 }
 
 export class SpotLight extends TargetedLight {
@@ -1939,6 +1946,13 @@ export class SpotLight extends TargetedLight {
     this.angle = angle;
     this.penumbra = penumbra;
     this.decay = decay;
+  }
+  /** Photometric luminous power in lumens: candela × π, as in three.js r187. */
+  override get power(): number {
+    return this.intensity * Math.PI;
+  }
+  override set power(lumens: number) {
+    this.intensity = lumens / Math.PI;
   }
 }
 
@@ -1958,6 +1972,13 @@ export class RectAreaLight extends Light {
     super(color, intensity);
     this.width = width;
     this.height = height;
+  }
+  /** Photometric luminous power in lumens: nits × area × π, as in three.js r187. */
+  override get power(): number {
+    return this.intensity * this.width * this.height * Math.PI;
+  }
+  override set power(lumens: number) {
+    this.intensity = lumens / (this.width * this.height * Math.PI);
   }
 }
 
