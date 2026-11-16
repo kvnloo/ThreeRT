@@ -3,7 +3,7 @@
 //! colour / intensity, material parameters, wetness / rain / fog, camera); `LiveCore::commit` uploads them.
 
 use crate::desc;
-use crate::scene::{self, CameraData, GpuLight, GpuMaterial, Retained};
+use crate::scene::{self, GpuLight, GpuMaterial, Retained};
 use crate::world::{Changes, Kind, World};
 use crate::EmitterTri;
 use anyhow::{anyhow, Result};
@@ -22,14 +22,11 @@ pub struct Dirty {
     /// Power edits held back (`Tables::defer_powers`): the live view's emitter worker rebuilds the CDF and the tree's
     /// powers for them, and they land together.
     pub deferred: bool,
-    /// Wetness / rain / fog kernel parameters.
-    pub environment: bool,
-    pub camera: bool,
 }
 
 impl Dirty {
     pub fn any(&self) -> bool {
-        self.materials || self.lights || self.objects || self.emitters || self.deferred || self.environment || self.camera
+        self.materials || self.lights || self.objects || self.emitters || self.deferred
     }
 }
 
@@ -43,22 +40,12 @@ pub struct Tables {
     pub light_tree: Option<crate::ltree::LightTree>,
     /// Materials that have emitter triangles (others cannot start emitting without a rebuild).
     pub(crate) emissive: HashSet<u32>,
-    pub wetness: f32,
-    pub rain: f32,
-    /// Cloud cover (0..1): a change re-bakes the sky and dims the sun (live/edits.rs `move_sun`).
-    pub cloud_cover: f32,
-    pub fog: Option<desc::Fog>,
-    /// three.js `scene.background` (`Params::background`).
-    pub background: Option<[f32; 3]>,
     /// A material that starts emitting gets emitter entries in place (the live view sets these up, `prepare`'s
     /// `mat_runs` / `fixed_mats`): it is queued in `started_emitting` for live/edits.rs `add_material_emitters`, unless its
     /// triangles include pool or dynamic ones (fixed: a rebuild flattens them). Off: such a material rebuilds.
     pub emit_in_place: bool,
     pub fixed_mats: HashSet<u32>,
     pub started_emitting: Vec<u32>,
-    /// `scene::aerial_params` of the sky.
-    pub aerial: [f32; 4],
-    pub camera: Option<CameraData>,
     /// Object -> its entries in `lights`.
     pub light_index: HashMap<u32, Vec<usize>>,
     /// vec4s an object in `objects` (`scene::object_stride`).
@@ -84,16 +71,9 @@ impl Tables {
             emissive: emitter_tris.iter().map(|e| e.mat).collect(),
             emitter_tris,
             light_tree,
-            wetness: sc.wetness,
-            rain: sc.rain,
-            cloud_cover: sc.cloud_cover,
-            fog: sc.fog.clone(),
-            background: sc.background.map(|b| b.to_array()),
             emit_in_place: false,
             fixed_mats: HashSet::new(),
             started_emitting: vec![],
-            aerial: sc.aerial,
-            camera: None,
             light_index,
             stride: sc.object_stride(),
             defer_powers: false,
@@ -169,25 +149,25 @@ impl Tables {
             self.materials[mi as usize] = gm;
             d.materials = true;
         }
-        if c.environment {
-            self.wetness = w.environment.wetness.clamp(0.0, 1.0);
-            self.rain = w.environment.rain.clamp(0.0, 1.0);
-            self.cloud_cover = w.environment.cloud_cover.clamp(0.0, 1.0);
-            self.fog = w.environment.fog.clone();
-            self.background = w.environment.background;
-            self.aerial = scene::aerial_params(&w.environment.sky);
-            d.environment = true;
-        }
-        if c.camera {
-            let Some(cid) = w.settings.camera else { return Ok(None) };
-            let Some(Kind::Camera(cam)) = w.objects.get(&cid).map(|o| &o.kind) else { return Ok(None) };
-            self.camera = Some(scene::camera_data(w.world_matrix(cid), cam));
-            d.camera = true;
-        }
         Ok(Some(d))
     }
 
-    fn update_light(&mut self, w: &World, id: u32, d: &mut Dirty) {
+    /// The atmosphere's sun: its light's entries as the world has it now (its direction, its size), with the colour the
+    /// atmosphere leaves it (`colour`: illuminance through the atmosphere). Whether any entry was written.
+    pub fn set_sun_light(&mut self, w: &World, id: u32, colour: glam::Vec3) -> bool {
+        let (Some(idx), Some(o)) = (self.light_index.get(&id), w.objects.get(&id)) else { return false };
+        let Kind::Light(l) = &o.kind else { return false };
+        // (The sun: hidden with a rebuild, `World::set_visible`.)
+        let Some(mut gl) = scene::gpu_light(l, w.world_matrix(id), o.power) else { return false };
+        gl.color = [colour.x, colour.y, colour.z, 0.0];
+        for &i in idx {
+            self.lights[i] = gl;
+        }
+        !idx.is_empty()
+    }
+
+    /// A light's entries as its description and place say (not the atmosphere's sun: `retained.sun`).
+    pub fn update_light(&mut self, w: &World, id: u32, d: &mut Dirty) {
         if self.retained.sun == Some(id) {
             return; // colour comes from the sky bake
         }
