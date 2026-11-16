@@ -19,6 +19,10 @@ pub struct Gpu {
     pub uniform_tables: bool,
     /// The kernel's switches this device was opened with (`KernelSwitches`): they are in `source`.
     pub switches: KernelSwitches,
+    /// The approximations a live view's kernel takes (`A_*`): the options' (`GpuOptions::approx`) unless a view asked
+    /// for others (`set_approx`).
+    pub approx: u32,
+    approx_default: u32,
     /// Compiled pipelines kept between runs (`GpuOptions::pipeline_cache`), where the backend has such a cache.
     pipeline_cache: Option<crate::pipeline_cache::PipelineCache>,
     /// Kernel source (hardware or software traversal spliced in); scenes with material functions get their own module.
@@ -33,7 +37,7 @@ pub struct Gpu {
     pipeline_layout: wgpu::PipelineLayout,
     /// Kernel variants by (feature mask, material-function code hash, LIVE): `FEAT` compiles out the features a scene
     /// does not use (they cost registers even when idle); `LIVE` = one fresh sample per dispatch for the viewport.
-    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), wgpu::ComputePipeline>>,
+    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), wgpu::ComputePipeline>>,
     layout: wgpu::BindGroupLayout,
     /// Group 1, the live viewport's: primary visibility (texture_2d<u32>), the radiance cache (`CacheBuffers`) and
     /// what the live passes read of a trace (`KernelBufs`). Offline renders bind `no_vis` (1x1 texture `no_vis_view`,
@@ -54,9 +58,13 @@ pub struct Gpu {
     /// pipelines (`translucent`, `volume_train`) by the kernel's variant key.
     tl_layout: Option<wgpu::BindGroupLayout>,
     tl_pipeline_layout: Option<wgpu::PipelineLayout>,
-    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), TranslucentPipelines>>,
-    /// The live media passes (pathtrace.wgsl `media_train`, `media_composite`) by kernel variant and entry point.
-    media_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str), wgpu::ComputePipeline>>,
+    /// Its group 1: `vis_layout` without `finish`'s records, which the pass does not read (with them its three groups
+    /// are one buffer past Metal's 29 a stage), and `no_vis` made for it.
+    pub tl_vis_layout: Option<wgpu::BindGroupLayout>,
+    no_vis_tl: Option<wgpu::BindGroup>,
+    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), TranslucentPipelines>>,
+    /// The kernel's passes beside `main` (`kernel_pass`) by kernel variant and entry point.
+    kernel_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str, u32), wgpu::ComputePipeline>>,
     /// The procedural blobs of the last upload (`upload_procs`).
     proc_cache: std::sync::Mutex<Option<ProcCache>>,
     /// The last upload's procedural BLASes by geometry hash (read-only once built; another upload may share them), with
@@ -219,7 +227,7 @@ const ACCELERATION_STRUCTURE: wgpu::BindingType = wgpu::BindingType::Acceleratio
 /// (what the kernel writes), group 2 (the translucency pass's; hardware traversal). A test holds them to what every
 /// variant of the kernel's source declares (`the_kernels_layouts_are_its_declarations`).
 pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupLayoutEntry>; 3] {
-    use crate::merged::{GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
+    use crate::merged::{DEFERRED_BINDING, GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
     let LayoutShape { hwrt, merged, uniform_tables, guard } = shape;
     let (read, write) = (storage_buffer(true), storage_buffer(false));
     // Group 0: the parameters; triangles and their attributes; the tables' heap, the words' heap; the dynamic
@@ -253,14 +261,15 @@ pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupL
     }
     // Group 1: the raster pass's visibility; then, merged, the one buffer (`heap::Live`, the loop guard's count in
     // it); as written, the radiance cache's three, the light tiles' lists, the specular rays, the motion vectors, the
-    // direct light, and the loop guard's count where a kernel of this device may have the guard (one without it does
-    // not name the binding).
+    // direct light, the pixels left for `finish`, and the loop guard's count where a kernel of this device may have
+    // the guard (one without it does not name the binding).
     let mut live = vec![layout_entry(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false })];
     if merged {
         live.push(layout_entry(LIVE_BINDING, write));
     } else {
         live.extend([1, 2, 3, 5, 6, 7].map(|b| layout_entry(b, write)));
         live.push(layout_entry(LISTS_BINDING, read));
+        live.push(layout_entry(DEFERRED_BINDING, write));
         if guard {
             live.push(layout_entry(GUARD_BINDING, write));
         }
@@ -1108,11 +1117,14 @@ pub struct GpuOptions {
     /// A directory to keep compiled pipelines in between runs (pipeline_cache.rs). None: nothing is kept.
     pub pipeline_cache: Option<std::path::PathBuf>,
     pub kernel: KernelSwitches,
+    /// The live renderer's approximations (`A_*`). None: all of them (`A_LIVE`). 0: a live view whose kernel is the
+    /// offline one's estimator, slower, for holding its picture to the offline render's.
+    pub approx: Option<u32>,
 }
 
 impl GpuOptions {
-    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, and the kernel's switches
-    /// (`KernelSwitches::from_env`).
+    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, THREERT_APPROX=<bits of `A_*`>, and the
+    /// kernel's switches (`KernelSwitches::from_env`).
     pub fn from_env() -> GpuOptions {
         Self::from_vars(&|name| std::env::var(name).ok(), cfg!(target_os = "android"))
     }
@@ -1123,6 +1135,7 @@ impl GpuOptions {
             uniform_tables: var("THREERT_UNIFORM_TABLES").map(|v| v == "1"),
             pipeline_cache: var("THREERT_PIPELINE_CACHE").filter(|d| !d.is_empty()).map(std::path::PathBuf::from),
             kernel: KernelSwitches::from_vars(var, android),
+            approx: var("THREERT_APPROX").and_then(|v| v.trim().parse().ok()),
         }
     }
 
@@ -1202,6 +1215,10 @@ pub fn tlas_rows(w: glam::Mat4) -> [f32; 12] {
 
 /// Entries of the live radiance cache (pathtrace.wgsl CACHE_SIZE).
 pub const CACHE_SIZE: u64 = 1 << 18;
+/// The kernel's `finish` pass (pathtrace.wgsl): a record's bytes (DEFERRED_VECS vec4s) after the 16 of their count,
+/// and the invocations of a dispatch row (DEFERRED_ROW).
+pub const DEFERRED_BYTES: u64 = 96;
+pub const DEFERRED_ROW: u32 = 16384;
 
 /// A buffer, or a range of one: in the merged layout (merged.rs) several of the engine's buffers are ranges of the one
 /// buffer a binding holds.
@@ -1263,6 +1280,9 @@ pub struct KernelBufs {
     pub motion: Buf,
     pub direct: Buf,
     pub lists: Buf,
+    /// The pixels a sample's trace leaves for `finish` (their count, then `DEFERRED_BYTES` each): the layout as
+    /// written only. Of one record until a live view makes it for its traced size (`deferred_buffer`).
+    pub deferred: Option<Buf>,
     /// The loop guard's count (`guard_loops`: its first word, the invocations a loop of which was stopped): with
     /// the guard, and always in the merged layout.
     pub guard: Option<Buf>,
@@ -1277,14 +1297,14 @@ impl KernelBufs {
         if !merged {
             let sb = |label: &str, size: u64| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
             let guard = guard.then(|| sb("loop guard", crate::merged::GUARD_WORDS as u64 * 4));
-            return KernelBufs { cache: CacheBuffers::new(d, entries), refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), guard, merged: None };
+            return KernelBufs { cache: CacheBuffers::new(d, entries), refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), deferred: Some(deferred_buffer(d, 1)), guard, merged: None };
         }
         // (The cache's keys and sums are as long as the kernel's struct says, whatever `entries`: `live_sizes`. A
         // section's range is the bytes asked for: a pass that binds it sees an array of that length.)
         let bytes = live_sizes(entries, refl, motion, direct, lists);
         let heap = Heap::<Live>::new(d, &bytes);
         let b = |s: Live| Buf { buffer: heap.buffer.clone(), offset: heap.at(s), size: bytes[s.index()] };
-        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), guard: Some(b(Live::Guard)), merged: Some(heap) }
+        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), deferred: None, guard: Some(b(Live::Guard)), merged: Some(heap) }
     }
 
     /// Where the kernel finds the vec4 sections in the merged layout (`Params::live_first`, `live_len`): written with
@@ -1297,6 +1317,11 @@ impl KernelBufs {
     }
 }
 
+/// `finish`'s buffer for `records` pixels: their count (16 bytes, cleared before each sample), then the records.
+pub fn deferred_buffer(d: &wgpu::Device, records: u64) -> Buf {
+    Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some("deferred"), size: 16 + records.max(1) * DEFERRED_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+}
+
 /// The bytes of the merged layout's group-1 buffer's sections (`heap::Live`'s order) for a cache whose values are
 /// `entries` long and the live passes' four of these bytes. The cache's keys and sums and the loop guard's count are
 /// members of the kernel's struct, of the kernel's lengths (pathtrace.wgsl `MergedLive`).
@@ -1306,7 +1331,8 @@ pub(crate) fn live_sizes(entries: u64, refl: u64, motion: u64, direct: u64, list
 
 /// Group-1 bind group of the kernel: a primary-visibility texture, the radiance cache and the
 /// reflection resolve's inputs (`KernelBufs`); in the merged layout, the texture and the one buffer.
-pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs) -> wgpu::BindGroup {
+/// `deferred`: with `finish`'s records (`vis_layout`; the translucency pass's `tl_vis_layout` is without).
+pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs, deferred: bool) -> wgpu::BindGroup {
     fn e(binding: u32, b: &Buf) -> wgpu::BindGroupEntry<'_> {
         wgpu::BindGroupEntry { binding, resource: b.binding() }
     }
@@ -1315,6 +1341,7 @@ pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &w
         Some(heap) => d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &[tex, wgpu::BindGroupEntry { binding: crate::merged::LIVE_BINDING, resource: heap.buffer.as_entire_binding() }] }),
         None => {
             let mut entries = vec![tex, e(1, &b.cache.keys), e(2, &b.cache.acc), e(3, &b.cache.val), e(crate::merged::LISTS_BINDING, &b.lists), e(5, &b.refl), e(6, &b.motion), e(7, &b.direct)];
+            entries.extend(b.deferred.as_ref().filter(|_| deferred).map(|r| e(crate::merged::DEFERRED_BINDING, r)));
             entries.extend(b.guard.as_ref().map(|g| e(crate::merged::GUARD_BINDING, g)));
             d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &entries })
         }
@@ -1344,9 +1371,21 @@ pub struct Kernel {
     /// The scene's geometry functions and their dispatch (pathtrace.wgsl `geometry_function`), spliced like `functions`.
     pub geometry_functions: String,
     pub hash: u64,
+    /// The approximations its live pipelines are compiled with (`A_*`; an offline pipeline has none): the device's
+    /// (`Gpu::approx`) unless a view sets others.
+    pub approx: u32,
 }
 
 impl Kernel {
+    /// A pipeline's constants: `LIVE`, `FEAT`, `APPROX`.
+    fn constants(&self, live: bool) -> [(&'static str, f64); 3] {
+        [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", self.features as f64), ("APPROX", self.approx_of(live) as f64)]
+    }
+
+    fn approx_of(&self, live: bool) -> u32 {
+        if live { self.approx } else { 0 }
+    }
+
     pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
         let mut functions = String::new();
         if !scene.shaders.is_empty() {
@@ -1435,9 +1474,19 @@ impl Kernel {
         functions.hash(&mut h);
         volume_functions.hash(&mut h);
         geometry_functions.hash(&mut h);
-        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish() }
+        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish(), approx: A_LIVE }
     }
 }
+
+// The live renderer's approximations (`override APPROX` in pathtrace.wgsl, which says what each is; docs/RUNTIME.md
+// "How live differs from offline").
+pub const A_GLASS_SHADOWS: u32 = 1;
+pub const A_MEDIA_SHADOWS: u32 = 2;
+pub const A_CUTOUT_PATHS: u32 = 4;
+pub const A_CUTOUT_EMITTERS: u32 = 8;
+pub const A_FAR_EMITTERS: u32 = 16;
+/// All of them: what a live view takes unless it asks otherwise (`GpuOptions::approx`).
+pub const A_LIVE: u32 = 31;
 
 // Kernel features (`override FEAT` in pathtrace.wgsl).
 pub const F_MASKED: u32 = 1;
@@ -1678,6 +1727,7 @@ impl Gpu {
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));
         let switches = options.kernel;
+        let approx = options.approx.unwrap_or(A_LIVE) & A_LIVE;
         let src = kernel_template();
         // Bounds checks are not needed: all indices come from our own BVH / scene builder.
         let module = unsafe {
@@ -1712,16 +1762,19 @@ impl Gpu {
             ],
         });
         let no_vis_bufs = KernelBufs::new(&device, merged, guard_room(hwrt), 1, 64, 64, 64, 64);
-        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs);
+        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs, true);
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout), Some(&vis_layout)], immediate_size: 0 });
-        let (tl_layout, tl_pipeline_layout) = if hwrt {
+        let (tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl) = if hwrt {
             let l = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("translucent"), entries: &tl_entries });
-            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vis_layout), Some(&l)], immediate_size: 0 });
-            (Some(l), Some(tpl))
+            let tl_vis: Vec<_> = vis_entries.iter().filter(|e| merged || e.binding != crate::merged::DEFERRED_BINDING).copied().collect();
+            let vl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("vis, translucent"), entries: &tl_vis });
+            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vl), Some(&l)], immediate_size: 0 });
+            let nv = vis_bind_group(&device, &vl, &no_vis_view, &no_vis_bufs, false);
+            (Some(l), Some(tpl), Some(vl), Some(nv))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
-        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_pipelines: Default::default(), media_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
+        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
     }
 
     /// Whether this device's kernel buffers have the loop guard's count (`guard_room`; always in the merged layout).
@@ -1743,14 +1796,19 @@ impl Gpu {
         }
     }
 
+    /// The approximations of the live views made on this device from now on (`A_*`; None: the options').
+    pub fn set_approx(&mut self, approx: Option<u32>) {
+        self.approx = approx.unwrap_or(self.approx_default) & A_LIVE;
+    }
+
     /// The path-tracing kernel specialised for a scene (feature mask + material functions), compiled on first use.
     pub fn pipeline(&self, k: &Kernel, live: bool) -> wgpu::ComputePipeline {
         let mut cache = self.pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
                     layout: Some(&self.pipeline_layout),
@@ -1801,15 +1859,15 @@ impl Gpu {
             .clone()
     }
 
-    /// A live media pass of a scene's kernel variant: `media_train` (the volume voxels) or `media_composite` (camera
-    /// rays through media, after the trace).
-    pub fn media_pipeline(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
-        let mut cache = self.media_passes.lock().unwrap();
+    /// A live pass of a scene's kernel variant beside `main`: `finish` (the pixels a sample's trace left), `media_train`
+    /// (the volume voxels) or `media_composite` (camera rays through media, after the trace).
+    pub fn kernel_pass(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
+        let mut cache = self.kernel_passes.lock().unwrap();
         cache
-            .entry((k.features, k.hash, entry))
+            .entry((k.features, k.hash, entry, k.approx))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", 1.0), ("FEAT", k.features as f64)];
+                let constants = k.constants(true);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: Some(&self.pipeline_layout),
@@ -1828,10 +1886,10 @@ impl Gpu {
     pub fn translucent_pipelines(&self, k: &Kernel, live: bool) -> TranslucentPipelines {
         let mut cache = self.tl_pipelines.lock().unwrap();
         cache
-            .entry((k.features, k.hash, live))
+            .entry((k.features, k.hash, live, k.approx_of(live)))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = k.constants(live);
                 let make = |entry: &str| {
                     self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some(entry),
@@ -2264,7 +2322,7 @@ impl Gpu {
         });
         let bg_parts = BindParts { nodes: b_nodes, tex_view, env_view, sampler, grid_view };
         let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, verts: &b_verts, attrs: &b_attrs, heap: &heap, words: &words, prev_verts: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
-        let kernel = Kernel::new(scene, groups);
+        let kernel = Kernel { approx: self.approx, ..Kernel::new(scene, groups) };
         // Translucent particles (hardware RT): their own BLAS + TLAS, rebuilt after the particle pass.
         let translucent = match &accel {
             Some(_) if !scene.trans_tris.is_empty() => {
@@ -3142,7 +3200,7 @@ impl Gpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("translucent"), timestamp_writes: None });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &up.bg, &[]);
-                pass.set_bind_group(1, &self.no_vis, &[]);
+                pass.set_bind_group(1, self.no_vis_tl.as_ref().unwrap(), &[]);
                 pass.set_bind_group(2, &tbg, &[]);
                 pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
             }
@@ -3340,6 +3398,20 @@ mod tests {
             seen |= bit;
         }
         let wgsl = include_str!("../shaders/pathtrace.wgsl");
+        // The live approximations: one bit each, the shader's the same, `A_LIVE` all of them.
+        let approx = [("A_GLASS_SHADOWS", A_GLASS_SHADOWS), ("A_MEDIA_SHADOWS", A_MEDIA_SHADOWS), ("A_CUTOUT_PATHS", A_CUTOUT_PATHS), ("A_CUTOUT_EMITTERS", A_CUTOUT_EMITTERS), ("A_FAR_EMITTERS", A_FAR_EMITTERS)];
+        assert_eq!(approx.iter().fold(0, |all, a| { assert!(a.1.is_power_of_two() && all & a.1 == 0, "{} = {}", a.0, a.1); all | a.1 }), A_LIVE);
+        let declared: Vec<&str> = wgsl.lines().filter(|l| l.starts_with("const A_")).collect();
+        assert_eq!(declared.len(), approx.len());
+        for (name, bit) in approx {
+            assert!(declared.iter().any(|l| l.starts_with(&format!("const {name}: u32 = {bit}u;"))), "{name}: pathtrace.wgsl and gpu.rs differ");
+        }
+        // (The render tests' names for them: tests/render/lib.ts `APPROX`.)
+        let lib = include_str!("../../tests/render/lib.ts");
+        for (name, bit) in [("glassShadows", A_GLASS_SHADOWS), ("mediaShadows", A_MEDIA_SHADOWS), ("cutoutPaths", A_CUTOUT_PATHS), ("cutoutEmitters", A_CUTOUT_EMITTERS), ("farEmitters", A_FAR_EMITTERS)] {
+            assert!(lib.contains(&format!("{name}: {bit},")), "{name}: tests/render/lib.ts and gpu.rs differ");
+        }
+        assert!(lib.contains(&format!("all: {A_LIVE},")));
         assert!(wgsl.contains(&format!("const RIS_EXACT: u32 = {RIS_EXACT}u;")), "RIS_EXACT: pathtrace.wgsl and gpu.rs differ");
         for line in wgsl.lines().filter(|l| l.starts_with("const F_")) {
             let name = &line[6..line.find(':').unwrap()];
@@ -3557,7 +3629,7 @@ mod tests {
             let plain = v(hwrt, KernelSwitches::default());
             let strict = v(hwrt, KernelSwitches { strict: true, ..Default::default() });
             let queries = strict.matches("rayQueryInitialize(").count();
-            assert_eq!(queries, if hwrt { 3 } else { 0 });
+            assert_eq!(queries, if hwrt { 2 } else { 0 });
             assert_eq!(strict.matches("ray_bad(o, d, tmax").count(), queries, "every ray query is guarded");
             assert_eq!(strict.matches("fn ray_bad(").count(), hwrt as usize);
             assert!(!strict.contains("env_cdf_at(y - 1u)") && !strict.contains("env_cdf_at(base + x - 1u)") && plain.contains("env_cdf_at(y - 1u)"));
@@ -3567,7 +3639,7 @@ mod tests {
             let sun = v(hwrt, KernelSwitches { last_sun: true, ..Default::default() });
             assert_eq!((sun.matches("radiance += dz;").count(), sun.matches("fn sun_light(").count(), sun.matches("sun_light(s, lobes(").count()), (1, 1, 1));
             assert!(!plain.contains("sun_light"));
-            assert_eq!(lit.matches("env_on = take_env && has_env;").count(), 1);
+            assert_eq!(lit.matches("env_on = take_env && has_env && !lights_only;").count(), 1);
             assert_eq!(lit.contains("let steps = 4u;"), hwrt);
             assert_eq!(v(hwrt, KernelSwitches { cutout_lite: 2, ..Default::default() }) == plain, !hwrt);
         }
