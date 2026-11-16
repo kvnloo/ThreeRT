@@ -20,7 +20,7 @@ test("MeshStandardMaterial.dispose: notifies only its own listeners and keeps sh
   const copy = new THREE.MeshStandardMaterial().copy(material);
   clone.dispose();
   copy.dispose();
-  assert.deepEqual(received, [], "clone and copy do not inherit the original's listeners");
+  assert.equal(received.length, 0, "clone and copy do not inherit the original's listeners");
 
   material.dispose();
   assert.deepEqual(received.map((event) => event.type), ["dispose"], "duplicate registration fires once");
