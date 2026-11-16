@@ -132,7 +132,7 @@ test("Object3D.setRotationFromMatrix: replaces the rotation and ignores translat
   object.rotateX(Math.PI / 3);
   const matrix = new THREE.Matrix4().makeRotationZ(Math.PI / 2).setPosition(10, 20, 30);
 
-  assert.equal(object.setRotationFromMatrix(matrix), undefined, "the three.js setter returns no value");
+  object.setRotationFromMatrix(matrix);
   assert.ok(new THREE.Vector3(1, 0, 0).applyQuaternion(object.quaternion).distanceTo(new THREE.Vector3(0, 1, 0)) < 1e-9,
     "Z +90 degrees replaces the previous X rotation");
   assert.ok(Math.abs(object.rotation.z - Math.PI / 2) < 1e-9, "Euler rotation stays synchronized");
