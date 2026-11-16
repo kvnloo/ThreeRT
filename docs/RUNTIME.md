@@ -1341,6 +1341,49 @@ frame found (pathtrace.wgsl "Light tiles", live.wgsl `light_tiles`):
   a vertex the camera sees and 1 past it, spread over the list without repeats, beside the uniform candidates (8 and
   3), which then stand for the lights the list lacks. Each candidate is weighed by the lights it stands for: the estimate is the same sum whatever a list holds.
 
+## How live differs from offline
+
+One kernel renders both (`override LIVE`). Where a live path gathers other light than an offline one, it is one of
+two kinds.
+
+**Approximations**: shortcuts a live trace takes to stay in its frame. Each is a bit of the pipeline constant
+`APPROX` (pathtrace.wgsl `A_*`, gpu.rs), so a kernel without one has no code for it. Offline has none; a live view
+has all (`gpu::A_LIVE`) unless `THREERT_APPROX=<bits>` says otherwise (`0`: the offline estimator's rays in a live
+view, the way to hold a live picture to the offline one).
+
+| bit | what a live ray does | its bias (a test pair, `-live` / `-live-exact`) | exact costs the trace |
+|---|---|---|---|
+| 1 `A_GLASS_SHADOWS` | shadow rays to the analytic lights and the sky pass glass in full, untinted | light under tinted glass 4.3 x (`shadow/glass-tint`) | a glass scene +34 % (khronos-transmission 5.20 -> 6.97 ms) |
+| 2 `A_MEDIA_SHADOWS` | only homogeneous media dim shadow rays: smoke and fire cast no shadow | light behind optical depth 1: e x (`shadow/medium`) | the Bistro slice +0.84 ms (9 %), the fire scene +0.10 |
+| 4 `A_CUTOUT_PATHS` | cutouts are opaque to rays past a camera hit's own, off mirror paths | a camera hit's own light is whole (`sky/cutout-clear-live`: its samples take the share those rays cannot bring, `light_mis`); what a cutout lights sends nothing on (`sky/cutout-bounce`: black) | Bistro +1.63 ms of 8.54 |
+| 8 `A_CUTOUT_EMITTERS` | cutouts are opaque to emitters' shadow rays | an emitter behind a clear card: black (`shadow/cutout-emitter`) | Bistro +1.35 ms |
+| 16 `A_FAR_EMITTERS` | the light tree proposes no emitter beyond 120 m; without a tree, the emitter cull (60 m, 120 m in view) | panels 150 m up: 3 % of their light (`light/emitter-far`); Kabukichō's and Tokyo's shots unchanged | Tokyo from the air 4.7 -> 9.2 ms; the 3 x 3 district +0.15 |
+
+Measured 2026-11-15 and 16 with the loop guard on. Bistro held still, ΔE against the offline render: 1.82 as
+shipped, 1.66 without the two cutout bits (+3.5 ms; Zero Day, with few cutouts, +0.3).
+Two more were removed that day: a single-query shadow ray past cutouts (it saved nothing: Bistro 10.13 ms with it,
+10.09 without, Tokyo +0.05) and the switch for the sampler below.
+
+**The live architecture**, not switches: the path ends in the radiance cache at its first bounce that is not through
+glass; the cache term, its training (4 x) and each sample (256) are clamped beside the kernel's own clamp; at most
+4 bounces; a camera ray's media are marched and composited after the trace with isotropic in-scatter from the
+cache's voxels, and later segments meet homogeneous media alone; depth of field is a post pass; translucent
+particles are lit from the cache's voxels; past a camera hit's own decisions the sampler is a hash, not Sobol
+(variance only).
+
+The radiance cache is held to numbers by the `cache/*` tests (a bounce off a lit floor, the same off a coated one
+and with the floor on a voxel face, two bounces in a view's first frame, a lit ground seen in a mirror, a furnace
+box, a corner): within 2 % of the offline or analytic value. A lookup whose voxel has too few samples reads the
+levels beside it, then the ones two and four levels coarser, which every training sample is added to as well; with
+none of them it traces its light there. Two limits are known and held by tests so that they are seen to move:
+
+- `cache/slit-live`: light in a gap narrower than a voxel reads 14 % bright. A path ends in the cache however short
+  its last segment; other caches of this kind go on tracing below about a voxel and a half (SHaRC), which is right
+  here and cost Bistro's trace 15 to 22 % in this kernel.
+- The cache holds no directions: it takes a mirror for a diffuse reflector of what falls on it (the ground before a
+  sunlit mirror wall 5 % bright), and a surface seen in a reflection takes the sky's light from it, unshadowed
+  below a voxel's size.
+
 ## What the kernel trusts
 
 The kernel follows indices it reads from buffers and loops over counts it is given; it checks none of them (a
