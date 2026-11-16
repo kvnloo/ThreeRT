@@ -2241,6 +2241,9 @@ export class FogExp2 extends ExponentialHeightFog {
   constructor(color: ColorLike = 0xffffff, density = 0.00025) {
     super(density, 0, color);
   }
+  clone(): FogExp2 {
+    return new FogExp2(this.color, this.density);
+  }
 }
 
 export function vec3(v: Vector3 | Color): Vec3 {
