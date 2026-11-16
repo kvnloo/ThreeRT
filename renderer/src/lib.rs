@@ -28,6 +28,8 @@ pub mod sample;
 pub mod sky;
 pub mod tables;
 pub mod units;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod userfiles;
 #[cfg(test)]
 mod units_cost;
 pub mod texpack;
@@ -620,60 +622,18 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
 
     // Sky / environment.
     let t = Instant::now();
-    let (env, sky_color, has_env) = match &sc.sky {
-        scene::SkyData::Atmosphere { sun_dir, sun_lux, rayleigh, mie, g: mie_g, ground, sun_node, dynamic, glow } => {
-            // Scene edits that leave the sky inputs unchanged (materials, transforms, lights) reuse the last bake.
-            static LAST: std::sync::Mutex<Option<(Vec<u32>, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
-            let alt = sc.camera.position.y.max(0.0);
-            let (bw, bh) = if *dynamic { sky::DYNAMIC_SKY } else { (1024, 512) };
-            let key: Vec<u32> = [*rayleigh, *mie, *mie_g, ground.x, ground.y, ground.z, sun_dir.x, sun_dir.y, sun_dir.z, sun_lux.x, sun_lux.y, sun_lux.z, alt, glow.uniform.x, glow.uniform.y, glow.uniform.z, glow.horizon.x, glow.horizon.y, glow.horizon.z, glow.height, bw as f32, sc.cloud_cover].iter().map(|f| f.to_bits()).collect();
-            let mut last = LAST.lock().unwrap();
-            let bake = match last.as_ref() {
-                Some((k, b)) if *k == key => b.clone(),
-                _ => {
-                    let atm = sky::Atmosphere::earth(*rayleigh, *mie, *mie_g, *ground);
-                    let b = std::sync::Arc::new(if *dynamic || !glow.is_zero() || sc.cloud_cover > 0.0 {
-                        sky::bake_atmosphere_tables(&atm, &sky::SkyTables::new(&atm), *sun_dir, *sun_lux, alt, bw, bh, *glow, sc.cloud_cover)
-                    } else {
-                        sky::bake_atmosphere(&atm, *sun_dir, *sun_lux, alt, bw, bh)
-                    });
-                    *last = Some((key, b.clone()));
-                    b
-                }
-            };
-            drop(last);
-            if let Some(i) = sun_node {
-                let s = bake.sun_illuminance;
-                sc.lights[*i].color = [s.x, s.y, s.z, 0.0];
-            }
-            (gpu::EnvMap { width: bake.width, height: bake.height, texels: bake.texels.clone() }, Vec3::ZERO, true)
-        }
-        scene::SkyData::Gradient(gr) => {
-            static LAST: std::sync::Mutex<Option<(sky::Gradient, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
-            let mut last = LAST.lock().unwrap();
-            let bake = match last.as_ref() {
-                Some((k, b)) if k == gr => b.clone(),
-                _ => {
-                    let b = std::sync::Arc::new(sky::bake_gradient(gr, 1024, 512));
-                    *last = Some((gr.clone(), b.clone()));
-                    b
-                }
-            };
-            (gpu::EnvMap { width: bake.width, height: bake.height, texels: bake.texels.clone() }, Vec3::ZERO, true)
-        }
-        scene::SkyData::Color(c) => (gpu::EnvMap { width: 1, height: 1, texels: vec![[c.x, c.y, c.z, 1.0]] }, *c, false),
-        scene::SkyData::None => (gpu::EnvMap { width: 1, height: 1, texels: vec![[0.0; 4]] }, Vec3::ZERO, false),
-    };
-    let env_cdf = build_env_cdf(&env);
+    let baked = bake_sky(&sc.sky, sc.environment.cloud_cover, sc.camera.position.y.max(0.0));
+    // (The atmosphere's sun: its light's colour is what the bake leaves it.)
+    if let (Some(i), Some(c)) = (sc.retained.sun.and_then(|s| sc.retained.light_nodes.iter().position(|n| *n == s)), baked.sun) {
+        sc.lights[i].color = [c.x, c.y, c.z, 0.0];
+    }
+    let env_cdf = build_env_cdf(&baked.env);
     let procs = [0, sc.procs.len() as u32, sc.gpu_instances.len() as u32, 0];
     // Environment light sampling (one shadow ray per vertex) is skipped when the sky is negligible next to the emitters
-    // (night streets): escaping BSDF rays still pick it up, with full MIS weight. The emitters as if all on: a
-    // time-of-day room loaded by day decides at dusk as one loaded at night does (live/edits.rs `put_sky`).
-    let env_max = env.texels.iter().map(|t| 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]).fold(0.0f32, f32::max).max(0.2126 * sky_color.x + 0.7152 * sky_color.y + 0.0722 * sky_color.z);
+    // (night streets): escaping BSDF rays still pick it up, with full MIS weight (`SkyBaked::write`). The emitters as
+    // if all on: a time-of-day room loaded by day decides at dusk as one loaded at night does (live/edits.rs `put_sky`).
     let em_area: f32 = emitters[..emitter_tris.len()].iter().map(|e| e[3]).sum();
     let env_nee_floor = if emitter_tris.is_empty() { 0.0 } else { 0.01 * all_power / em_area.max(1e-6) };
-    // (A uniform sky is sampled regardless of `env_nee_on`: it reads no table.)
-    let env_nee = env_max >= env_nee_floor && (!has_env || env_nee_on());
     // The kernel's light order (`light_order`).
     let class = light_class;
     let order = light_order(&sc.lights);
@@ -685,8 +645,6 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
     let first_shadowed = sc.lights.iter().position(|l| class(l) == 2).unwrap_or(sc.lights.len()) as u32;
     timings.push(("sky_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
 
-    let preset = sc.preset.clone();
-    let fog = fog_params(sc.fog.as_ref());
     let cam = &sc.camera;
     let aspect = sc.width as f32 / sc.height as f32;
     let (lens_radius, focus) = match &cam.dof {
@@ -697,27 +655,24 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         }
         None => (0.0, 1.0),
     };
-    // Firefly clamp on indirect paths, expressed relative to the exposure so it is scene independent.
-    let ev_guess = match &cam.exposure {
-        desc::Exposure::Manual { ev100 } => *ev100,
-        desc::Exposure::Auto { max_ev100, .. } => *max_ev100,
-    };
     let params = gpu::Params {
         cam_pos: [cam.position.x, cam.position.y, cam.position.z, cam.tan_half_fov],
         cam_fwd: [cam.forward.x, cam.forward.y, cam.forward.z, aspect],
         cam_right: [cam.right.x, cam.right.y, cam.right.z, lens_radius],
         cam_up: [cam.up.x, cam.up.y, cam.up.z, focus],
         size: [sc.width, sc.height, 0, rng_seed()],
-        counts: [sc.lights.len() as u32, if total > 0.0 { emitter_tris.len() as u32 } else { 0 }, preset.native.max_bounces, preset.native.russian_roulette_depth],
-        env: [if has_env { 1.0 } else { 0.0 }, env.width as f32, env.height as f32, -1.0],
-        misc: [preset.native.clamp_indirect * 2f32.powf(ev_guess), total, preset.native.energy_compensation, 0.0],
-        sky_color: [sky_color.x, sky_color.y, sky_color.z, 0.0],
-        counts2: [n_dir, env_nee as u32, 0, first_shadowed],
-        time: [sc.time, sc.wetness, sc.rain, sc.media.len() as f32],
-        fog: fog[0],
-        fog_color: fog[1],
-        vol: fog[2],
-        vol2: fog[3],
+        // (The preset's and the exposure's: `Params::set_preset`; the sky's: `SkyBaked::write`; the environment's:
+        // `EnvSettings::write`. Below.)
+        counts: [sc.lights.len() as u32, if total > 0.0 { emitter_tris.len() as u32 } else { 0 }, 0, 0],
+        env: [0.0, 0.0, 0.0, -1.0],
+        misc: [0.0, total, 0.0, 0.0],
+        sky_color: [0.0; 4],
+        counts2: [n_dir, 0, 0, first_shadowed],
+        time: [sc.time, 0.0, 0.0, sc.media.len() as f32],
+        fog: [0.0; 4],
+        fog_color: [0.0; 4],
+        vol: [0.0; 4],
+        vol2: [0.0; 4],
         raster: [0.0; 4],
         cache: [0.0; 4],
         // (z, w: software traversal's units: the top tree's root and their count, as bits; trace_units.wgsl. y is
@@ -726,8 +681,8 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         group_first: [[0; 4]; 2],
         light_lod: [0.0; 4],
         emit_power: [total, 0.0, 0.0, 0.0],
-        aerial: sc.aerial,
-        background: sc.background.map_or([0.0; 4], |b| [b.x, b.y, b.z, 1.0]),
+        aerial: [0.0; 4],
+        background: [0.0; 4],
         lod_view: [0.0; 4],
         ltree: ltree_param,
         procs,
@@ -742,6 +697,10 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         live_len: [0; 4],
     };
     let mut params = params;
+    params.set_preset(&sc.preset.native, &cam.exposure);
+    baked.write(&mut params, env_nee_floor);
+    sc.environment.write(&mut params);
+    let env = baked.env;
     let mut first = 0u32;
     for (g, &count) in groups.iter().enumerate() {
         params.group_first[g / 4][g % 4] = first;
@@ -874,6 +833,79 @@ fn build_env_cdf(env: &gpu::EnvMap) -> Vec<f32> {
     marg
 }
 
+/// A sky as the kernel takes it: the environment map (1 x 1 for a uniform sky or none), a uniform sky's radiance,
+/// whether the map is one to sample, and the illuminance the atmosphere leaves its sun's light.
+pub struct SkyBaked {
+    pub env: gpu::EnvMap,
+    pub color: Vec3,
+    pub has_env: bool,
+    pub sun: Option<Vec3>,
+}
+
+/// Bakes a scene's sky (`cloud_cover`: an atmosphere's; `altitude`: the camera's, m). The last atmosphere and the last
+/// gradient are kept: edits that leave the sky's inputs as they were reuse the bake.
+pub fn bake_sky(sky: &scene::SkyData, cloud_cover: f32, altitude: f32) -> SkyBaked {
+    match sky {
+        scene::SkyData::Atmosphere { sun_dir, sun_lux, rayleigh, mie, g: mie_g, ground, dynamic, glow, .. } => {
+            static LAST: std::sync::Mutex<Option<(Vec<u32>, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
+            let alt = altitude;
+            let (bw, bh) = if *dynamic { sky::DYNAMIC_SKY } else { (1024, 512) };
+            let key: Vec<u32> = [*rayleigh, *mie, *mie_g, ground.x, ground.y, ground.z, sun_dir.x, sun_dir.y, sun_dir.z, sun_lux.x, sun_lux.y, sun_lux.z, alt, glow.uniform.x, glow.uniform.y, glow.uniform.z, glow.horizon.x, glow.horizon.y, glow.horizon.z, glow.height, bw as f32, cloud_cover].iter().map(|f| f.to_bits()).collect();
+            let mut last = LAST.lock().unwrap();
+            let bake = match last.as_ref() {
+                Some((k, b)) if *k == key => b.clone(),
+                _ => {
+                    let atm = sky::Atmosphere::earth(*rayleigh, *mie, *mie_g, *ground);
+                    let b = std::sync::Arc::new(if *dynamic || !glow.is_zero() || cloud_cover > 0.0 {
+                        sky::bake_atmosphere_tables(&atm, &sky::SkyTables::new(&atm), *sun_dir, *sun_lux, alt, bw, bh, *glow, cloud_cover)
+                    } else {
+                        sky::bake_atmosphere(&atm, *sun_dir, *sun_lux, alt, bw, bh)
+                    });
+                    *last = Some((key, b.clone()));
+                    b
+                }
+            };
+            SkyBaked { env: gpu::EnvMap { width: bake.width, height: bake.height, texels: bake.texels.clone() }, color: Vec3::ZERO, has_env: true, sun: Some(bake.sun_illuminance) }
+        }
+        scene::SkyData::Gradient(gr) => {
+            static LAST: std::sync::Mutex<Option<(sky::Gradient, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
+            let mut last = LAST.lock().unwrap();
+            let bake = match last.as_ref() {
+                Some((k, b)) if k == gr => b.clone(),
+                _ => {
+                    let b = std::sync::Arc::new(sky::bake_gradient(gr, 1024, 512));
+                    *last = Some((gr.clone(), b.clone()));
+                    b
+                }
+            };
+            SkyBaked { env: gpu::EnvMap { width: bake.width, height: bake.height, texels: bake.texels.clone() }, color: Vec3::ZERO, has_env: true, sun: None }
+        }
+        scene::SkyData::Color(c) => SkyBaked { env: gpu::EnvMap { width: 1, height: 1, texels: vec![[c.x, c.y, c.z, 1.0]] }, color: *c, has_env: false, sun: None },
+        scene::SkyData::None => SkyBaked { env: gpu::EnvMap { width: 1, height: 1, texels: vec![[0.0; 4]] }, color: Vec3::ZERO, has_env: false, sun: None },
+    }
+}
+
+impl SkyBaked {
+    /// The kernel's parameters for it: whether it is a map and its size, a uniform sky's colour, whether it is
+    /// light-sampled (`floor`: `Prepared::env_nee_floor`).
+    pub fn write(&self, p: &mut gpu::Params, floor: f32) {
+        p.env = [if self.has_env { 1.0 } else { 0.0 }, self.env.width as f32, self.env.height as f32, p.env[3]];
+        p.sky_color = [self.color.x, self.color.y, self.color.z, 0.0];
+        p.counts2[1] = sky_sampled(sky_brightest(&self.env, self.color), floor, self.has_env) as u32;
+    }
+}
+
+/// The brightest luminance a sky has (its map's texels, its uniform colour).
+pub fn sky_brightest(env: &gpu::EnvMap, color: Vec3) -> f32 {
+    env.texels.iter().map(|t| 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]).fold(0.0f32, f32::max).max(0.2126 * color.x + 0.7152 * color.y + 0.0722 * color.z)
+}
+
+/// Whether the sky is light-sampled (`Params::counts2[1]`): not when it is negligible next to the emitters (`floor`:
+/// `Prepared::env_nee_floor`), nor a baked sky with THREERT_ENV_NEE off. A uniform sky reads no table: always.
+pub fn sky_sampled(brightest: f32, floor: f32, has_env: bool) -> bool {
+    brightest >= floor && (!has_env || env_nee_on())
+}
+
 /// UE GGXEnergyLookup equivalent: E.x = integral of D*Vis*NoL (F = 1), E.y = same weighted by (1-VoH)^5.
 pub fn energy_lut() -> Vec<[f32; 4]> {
     let n = 32usize;
@@ -913,6 +945,241 @@ pub fn energy_lut() -> Vec<[f32; 4]> {
         }
     }
     vals.chunks(2).map(|c| [c[0][0], c[0][1], c[1][0], c[1][1]]).collect()
+}
+
+/// The glass energy table's nodes (pathtrace.wgsl GLASS_E_MU, _ROUGH, _IOR): cos(view) as its square root, roughness,
+/// the index of refraction as sqrt((ior - 1) / (ior + 1)) up to `GLASS_E_ZMAX` (ior 3); and the side (entering,
+/// leaving).
+pub const GLASS_E: [usize; 3] = [16, 16, 8];
+pub const GLASS_E_ZMAX: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// Unpolarised Fresnel reflectance of a dielectric interface: `c` the cosine on the incident side, `eta` = n_t / n_i;
+/// 1 at total internal reflection (Walter et al. 2007, eq. 22).
+fn fresnel_dielectric(c: f64, eta: f64) -> f64 {
+    let g2 = eta * eta - 1.0 + c * c;
+    if g2 <= 0.0 {
+        return 1.0;
+    }
+    let g = g2.sqrt();
+    let (a, b) = ((g - c) / (g + c), (c * (g + c) - 1.0) / (c * (g - c) + 1.0));
+    0.5 * a * a * (1.0 + b * b)
+}
+
+/// What a rough dielectric interface (GGX, single scattering: the kernel's `dielectric_*`) returns of a uniform white
+/// surround toward a direction at cosine `mu`: reflection + transmission, without the tint. `alpha` = roughness^2,
+/// `eta` = n(far side) / n(view side). By `n` x `n` stratified visible normals (Heitz 2018), whose estimator is
+/// bounded: G2 / G1, reflected or refracted by Fresnel at the normal.
+pub fn glass_energy(mu: f64, alpha: f64, eta: f64, n: usize) -> f64 {
+    let a2 = alpha * alpha;
+    let lambda = |c: f64| {
+        let c = c.abs().min(1.0);
+        0.5 * (-1.0 + (1.0 + a2 * (1.0 - c * c) / (c * c)).sqrt())
+    };
+    let v = [(1.0 - mu * mu).max(0.0).sqrt(), 0.0, mu];
+    let k = (alpha * alpha * v[0] * v[0] + v[2] * v[2]).sqrt();
+    let vh = [alpha * v[0] / k, 0.0, v[2] / k];
+    // (t1 = (0, 1, 0), t2 = vh x t1.)
+    let t2 = [-vh[2], 0.0, vh[0]];
+    let (lv, s) = (lambda(mu), 0.5 * (1.0 + vh[2]));
+    let mut sum = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let (r, phi) = (((i as f64 + 0.5) / n as f64).sqrt(), 2.0 * std::f64::consts::PI * (j as f64 + 0.5) / n as f64);
+            let p1 = r * phi.cos();
+            let p2 = (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt() + s * r * phi.sin();
+            let pz = (1.0 - p1 * p1 - p2 * p2).max(0.0).sqrt();
+            let nh = [p2 * t2[0] + pz * vh[0], p1, p2 * t2[2] + pz * vh[2]];
+            let m = [alpha * nh[0], alpha * nh[1], nh[2].max(0.0)];
+            let len = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+            let m = [m[0] / len, m[1] / len, m[2] / len];
+            let vm = v[0] * m[0] + v[2] * m[2];
+            let f = fresnel_dielectric(vm, eta);
+            // Reflection: the kernel's joint visibility (vis_smith_joint_approx x 4 nov nol) over G1(v).
+            let nol = 2.0 * vm * m[2] - v[2];
+            if nol > 0.0 {
+                let g2 = 2.0 * mu * nol / (nol * (mu * (1.0 - alpha) + alpha) + mu * (nol * (1.0 - alpha) + alpha)).max(1e-7);
+                sum += f * g2 * (1.0 + lv);
+            }
+            // Refraction (eq. 40): height-correlated Smith over G1(v).
+            let c2 = 1.0 - (1.0 - vm * vm) / (eta * eta);
+            if f < 1.0 && c2 > 0.0 {
+                let lz = (vm / eta - c2.sqrt()) * m[2] - v[2] / eta;
+                if lz < 0.0 {
+                    sum += (1.0 - f) * (1.0 + lv) / (1.0 + lv + lambda(lz));
+                }
+            }
+        }
+    }
+    sum / (n * n) as f64
+}
+
+/// `glass_energy` over the table's nodes, entering then leaving, four values a vec4 (`heap::Table::GlassEnergy`; once
+/// a process, 35 ms).
+pub fn glass_energy_lut() -> &'static [[f32; 4]] {
+    static LUT: std::sync::OnceLock<Vec<[f32; 4]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let [nm, nr, nz] = GLASS_E;
+        let mut vals = Vec::with_capacity(2 * nz * nr * nm);
+        for side in 0..2 {
+            for iz in 0..nz {
+                let z = (iz as f64 / (nz - 1) as f64 * GLASS_E_ZMAX).max(0.02);
+                let ior = (1.0 + z * z) / (1.0 - z * z);
+                for ir in 0..nr {
+                    let r = (ir as f64 / (nr - 1) as f64).max(0.02);
+                    for im in 0..nm {
+                        let y = im as f64 / (nm - 1) as f64;
+                        vals.push(glass_energy((y * y).max(1e-3), r * r, if side == 0 { ior } else { 1.0 / ior }, 24).clamp(0.05, 1.0) as f32);
+                    }
+                }
+            }
+        }
+        vals.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    })
+}
+
+#[cfg(test)]
+mod glass_energy_tests {
+    use super::*;
+
+    fn lambda(a2: f64, c: f64) -> f64 {
+        let c = c.abs().min(1.0);
+        0.5 * (-1.0 + (1.0 + a2 * (1.0 - c * c) / (c * c)).sqrt())
+    }
+
+    /// The kernel's `dielectric_t`: the interface's transmission x |n.l| (Walter et al. 2007 eq. 21 from the view
+    /// side; n = +y, v above, l below).
+    fn transmitted(v: [f64; 3], l: [f64; 3], a2: f64, eta: f64) -> f64 {
+        let h = [v[0] + eta * l[0], v[1] + eta * l[1], v[2] + eta * l[2]];
+        let k = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt() * h[1].signum();
+        let h = [h[0] / k, h[1] / k, h[2] / k];
+        let (voh, loh) = (v[0] * h[0] + v[1] * h[1] + v[2] * h[2], l[0] * h[0] + l[1] * h[1] + l[2] * h[2]);
+        if voh <= 0.0 || loh >= 0.0 {
+            return 0.0;
+        }
+        let d = (h[1] * a2 - h[1]) * h[1] + 1.0;
+        let den = voh + eta * loh;
+        (1.0 - fresnel_dielectric(voh, eta)) * a2 / (std::f64::consts::PI * d * d) * voh * eta * eta * -loh / (v[1] * den * den * (1.0 + lambda(a2, v[1]) + lambda(a2, l[1])))
+    }
+
+    /// (R, T) of one interface toward a view at cosine `mu`: the BSDF's value x cosine integrated over the directions
+    /// of each side (`n` x 2 `n` points). What the kernel's light samples sum; the table's estimator is its sampling.
+    fn interface(mu: f64, alpha: f64, eta: f64, n: usize) -> (f64, f64) {
+        let a2 = alpha * alpha;
+        let v = [(1.0 - mu * mu).sqrt(), mu, 0.0];
+        let (mut r, mut t) = (0.0, 0.0);
+        for i in 0..n {
+            let c = (i as f64 + 0.5) / n as f64;
+            let st = (1.0 - c * c).sqrt();
+            for j in 0..2 * n {
+                let phi = std::f64::consts::PI * (j as f64 + 0.5) / n as f64;
+                let (x, z) = (st * phi.cos(), st * phi.sin());
+                // Reflection: D x the kernel's joint visibility x Fresnel at the half vector.
+                let h = [v[0] + x, v[1] + c, z];
+                let k = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
+                let (noh, voh) = (h[1] / k, (v[0] * h[0] + v[1] * h[1]) / k);
+                let d = (noh * a2 - noh) * noh + 1.0;
+                let vis = 0.5 / (c * (mu * (1.0 - alpha) + alpha) + mu * (c * (1.0 - alpha) + alpha)).max(1e-7);
+                r += a2 / (std::f64::consts::PI * d * d) * vis * fresnel_dielectric(voh, eta) * c;
+                t += transmitted(v, [x, -c, z], a2, eta);
+            }
+        }
+        let k = std::f64::consts::PI / (n * n) as f64;
+        (r * k, t * k)
+    }
+
+    /// The table's estimator against the BSDF's integral; the numbers the `glass/rough-*` render tests expect; the
+    /// table's cost.
+    #[test]
+    fn the_glass_energy_is_the_interfaces() {
+        for (r, eta, mu) in [(0.3, 1.5, 0.7071), (0.3, 1.0 / 1.5, 0.7071), (0.6, 1.5, 0.4), (0.6, 1.0 / 1.5, 0.9), (1.0, 1.5, 0.9), (1.0, 1.0 / 1.5, 0.9), (0.5, 1.33, 0.2), (0.8, 1.0 / 1.33, 0.5)] {
+            let (e, (qr, qt)) = (glass_energy(mu, r * r, eta, 24), interface(mu, r * r, eta, 700));
+            assert!((e - qr - qt).abs() < 0.012 * (qr + qt), "roughness {r}, eta {eta:.3}, cos {mu}: {e:.4} for {:.4}", qr + qt);
+        }
+        // tests/render/glass-rough-enter.ts, -leave.ts, -leave-low.ts (roughness 0.6, ior 1.5).
+        let c45 = std::f64::consts::FRAC_1_SQRT_2;
+        for (eta, mu, want) in [(1.5, c45, 0.9573), (1.0 / 1.5, c45, 0.7390), (1.0 / 1.5, 0.4, 0.6474)] {
+            let ((qr, qt), e) = (interface(mu, 0.36, eta, 1000), glass_energy(mu, 0.36, eta, 192));
+            eprintln!("eta {eta:.3}, cos {mu:.4}: R {qr:.4} + T {qt:.4} = {:.4}; by visible normals {e:.4}", qr + qt);
+            assert!((qr + qt - want).abs() < 1e-3 && (e - want).abs() < 5e-4, "eta {eta:.3}, cos {mu}: R {qr:.4} + T {qt:.4}, {e:.4} for {want}");
+        }
+        let t = std::time::Instant::now();
+        let lut = glass_energy_lut();
+        assert_eq!(lut.len() * 4, 2 * GLASS_E[0] * GLASS_E[1] * GLASS_E[2]);
+        assert!(lut.iter().flatten().all(|e| (0.05..=1.0).contains(e)));
+        eprintln!("glass energy table: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    /// tests/render/glass-rough-lamp.ts and -wide.ts: what a square emitter of side `side`, 1 m under a sheet of
+    /// glass (roughness 0.6, ior 1.5) where the 45-degree view's refracted ray arrives, sends through the sheet, as
+    /// a fraction of its radiance: `transmitted` integrated over the emitter's area.
+    #[test]
+    fn the_lamp_through_frosted_glass() {
+        let (a2, eta) = (0.6f64.powi(4), 1.5f64);
+        let c45 = std::f64::consts::FRAC_1_SQRT_2;
+        let v = [0.0, c45, c45];
+        // The refracted ray's foot 1 m down (the test's lamp is centred there: z = -0.5345).
+        let st = c45 / eta;
+        let cz = -st / (1.0 - st * st).sqrt();
+        assert!((cz + 0.5345).abs() < 1e-4);
+        for (side, want) in [(0.3, 0.40415), (1.0, 0.83641)] {
+            let n = 600;
+            let mut sum = 0.0;
+            for i in 0..n {
+                let x = ((i as f64 + 0.5) / n as f64 - 0.5) * side;
+                for j in 0..n {
+                    let z = cz + ((j as f64 + 0.5) / n as f64 - 0.5) * side;
+                    let d2 = x * x + 1.0 + z * z;
+                    let d = d2.sqrt();
+                    sum += transmitted(v, [x / d, -1.0 / d, z / d], a2, eta) / (d * d2);
+                }
+            }
+            let got = sum * (side / n as f64).powi(2);
+            assert!((got - want).abs() < 2e-4, "a {side} m lamp: {got:.5} for {want}");
+        }
+    }
+
+    /// Whether the table's nodes are enough: the kernel's lookup (pathtrace.wgsl `glass_energy`, trilinear over the
+    /// nodes; copied here) against the estimator between them.
+    #[test]
+    fn the_glass_energy_table_interpolates() {
+        let lut = glass_energy_lut();
+        let at = |i: usize| lut[i / 4][i % 4] as f64;
+        let [nm, nr, nz] = GLASS_E;
+        let look = |mu: f64, r: f64, ior: f64, leaving: bool| {
+            let x = (mu.sqrt() * (nm - 1) as f64).clamp(0.0, (nm - 1) as f64);
+            let y = (r * (nr - 1) as f64).clamp(0.0, (nr - 1) as f64);
+            let z = (((ior - 1.0).max(0.0) / (ior + 1.0)).sqrt() * (nz - 1) as f64 / GLASS_E_ZMAX).clamp(0.0, (nz - 1) as f64);
+            let (x0, y0, z0) = (x as usize, y as usize, z as usize);
+            let (x1, y1, z1) = ((x0 + 1).min(nm - 1), (y0 + 1).min(nr - 1), (z0 + 1).min(nz - 1));
+            let (fx, fy, fz) = (x - x0 as f64, y - y0 as f64, z - z0 as f64);
+            let plane = |zi: usize| {
+                let b = (if leaving { nz } else { 0 } + zi) * nr * nm;
+                let row = |yi: usize| at(b + yi * nm + x0) * (1.0 - fx) + at(b + yi * nm + x1) * fx;
+                row(y0) * (1.0 - fy) + row(y1) * fy
+            };
+            plane(z0) * (1.0 - fz) + plane(z1) * fz
+        };
+        let (mut worst, mut sum, mut n) = ((0.0f64, String::new()), 0.0, 0);
+        for leaving in [false, true] {
+            for ior in [1.2, 1.33, 1.5, 1.8, 2.4] {
+                for ri in 0..12 {
+                    let r = 0.08 + ri as f64 * 0.08;
+                    for mi in 0..24 {
+                        let mu = 0.02 + mi as f64 * 0.0408;
+                        let (t, e) = (look(mu, r, ior, leaving), glass_energy(mu, r * r, if leaving { 1.0 / ior } else { ior }, 48));
+                        let d = (t - e).abs() / e;
+                        sum += d;
+                        n += 1;
+                        if d > worst.0 {
+                            worst = (d, format!("ior {ior} r {r:.2} mu {mu:.3} leaving {leaving}: table {t:.4}, direct {e:.4}"));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("glass energy table against the estimator: mean {:.4}, worst {:.4} ({})", sum / n as f64, worst.0, worst.1);
+        assert!(sum / (n as f64) < 0.01 && worst.0 < 0.05, "mean {:.4}, worst {:.4} ({})", sum / n as f64, worst.0, worst.1);
+    }
 }
 
 #[cfg(test)]
