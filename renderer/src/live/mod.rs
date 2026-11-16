@@ -52,6 +52,7 @@ mod layout;
 mod load;
 #[cfg(not(target_arch = "wasm32"))]
 mod session;
+mod state;
 mod targets;
 #[cfg(test)]
 pub(crate) use targets::live_source;
@@ -61,6 +62,7 @@ pub use session::{parse_cmd, parse_launch, parse_opts, run, save_bgra};
 use edits::*;
 use frame::*;
 use load::*;
+use state::*;
 use targets::*;
 
 pub struct LiveOpts {
@@ -83,6 +85,11 @@ pub struct LiveOpts {
     pub display_scale: f32,
     /// `--launch`: the `params` of the host channel's `launch` message (docs/RUNTIME.md "The host channel").
     pub launch: Option<serde_json::Value>,
+    /// `--caps files,store`: the families of requests the driver answers, listed in the `launch` message.
+    pub caps: Vec<String>,
+    /// `--store <dir>`: the game's store, where `user:` assets resolve (docs/RUNTIME.md "Files"). The driver answers
+    /// `store.*` itself; this is only where the engine reads what it wrote.
+    pub store: Option<PathBuf>,
 }
 
 /// Lowest dynamic-resolution scale (UE r.DynamicRes.MinScreenPercentage default) of a view whose pixels are the
@@ -140,37 +147,7 @@ struct LiveParams {
 /// uniform ones (`Params::ltile.w`; half past the camera hit). 2 read as 4, 8 and 16 on the lamp-rooms shots.
 pub(super) const LIST_CANDIDATES: u32 = 2;
 
-/// Auto / local exposure settings of the loaded scene (UE PostProcessVolume semantics).
-#[derive(Clone, Copy, Default)]
-struct ExposureSettings {
-    ae: [f32; 4],
-    ae2: [f32; 4],
-    speed: [f32; 2],
-    lx: [f32; 4],
-}
-
-impl ExposureSettings {
-    fn new(exp: &crate::desc::Exposure, pp: &crate::desc::PostPreset) -> Self {
-        let a = &pp.auto_exposure;
-        let le = &pp.local_exposure;
-        let (ae2, comp) = match exp {
-            crate::desc::Exposure::Manual { ev100 } => ([2f32.powf(-ev100), 0.0, 0.0, 0.0], 2f32.powf(-ev100)),
-            crate::desc::Exposure::Auto { compensation, min_ev100, max_ev100 } => {
-                let c = 2f32.powf(*compensation);
-                ([c, 0.18 * 2f32.powf(*min_ev100), 0.18 * 2f32.powf(*max_ev100), 1.0], c)
-            }
-        };
-        let _ = comp;
-        ExposureSettings {
-            ae: [a.low_percent.clamp(1.0, 99.0) / 100.0, a.high_percent.clamp(1.0, 99.0) / 100.0, a.histogram_log_min, a.histogram_log_max.max(a.histogram_log_min + 1.0)],
-            ae2,
-            speed: [a.speed_up.max(0.01), a.speed_down.max(0.01)],
-            lx: [le.highlight_contrast, le.shadow_contrast, le.blurred_luminance_blend, le.detail_strength],
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Camera {
     pub pos: Vec3,
     pub fwd: Vec3,
@@ -244,6 +221,9 @@ pub struct LiveCore {
     passes: Passes,
     pub targets: Targets,
     sc: LoadedScene,
+    /// How a frame is taken and shown, and the environment: beside the scene's data (state.rs).
+    view: ViewState,
+    env: Environment,
     presets: PathBuf,
     /// Asset root (models, file textures).
     assets: PathBuf,
@@ -332,6 +312,8 @@ pub struct LiveCore {
     cache: Option<RadianceCache>,
     /// Kernel group 1: primary visibility + radiance cache + what the live passes read of a trace.
     kernel_bg: wgpu::BindGroup,
+    /// The same for the translucency pass (`gpu::Gpu::tl_vis_layout`; hardware traversal).
+    tl_kernel_bg: Option<wgpu::BindGroup>,
     /// Span (relative to the dynamic tail) re-transformed by the last in-place update whose previous-frame vertices
     /// (`Uploaded::prev_verts`) still hold the frame before it: synced to the current ones next frame.
     prev_span: Option<(usize, usize)>,
@@ -339,8 +321,6 @@ pub struct LiveCore {
     reposed: bool,
     /// Dynamic triangles moved in this commit: the light tree's moving subtree is refit once at its end.
     emitters_moved: bool,
-    /// Frames since the last reset or camera cut (`COLD_FALLBACK_FRAMES`).
-    cold_frames: u32,
     /// Likewise for the deforming meshes of shared poses (`repose_groups`): the span they took (relative to the dynamic
     /// tail, past its end) and whether this frame re-skinned any.
     pose_span: Option<(usize, usize)>,
@@ -372,8 +352,6 @@ pub struct LiveCore {
     pub gpu_blas_ms: f32,
     /// CPU time the last `render` spent waiting for the oldest frame in flight (ms; frame log `wait`): GPU-bound frames.
     pub cpu_wait_ms: f32,
-    /// The cloud cover the sky and the sun light were made with (`move_sun`).
-    sky_cover: f32,
     /// The loop guard (gpu.rs `guard_loops`), if a kernel of this session may have it: the invocations it has stopped at
     /// its limit since the view was made, as last read back (a frame or two behind, without waiting). Above zero:
     /// frames with wrong pixels, a traversal that did not end on the scene's data. None without the guard.
@@ -382,14 +360,6 @@ pub struct LiveCore {
     guard_read: Option<(wgpu::Buffer, Arc<AtomicU32>)>,
 }
 
-/// THREERT_CACHE_FLAGS: experiment switches of the radiance cache (pathtrace.wgsl `cfl`), 0 = defaults: 1 = no cold
-/// fallback (cold voxels read as they are), 2 = no hit lighting (reflection hits use the cache's total), 4 = no
-/// training tiles, 8 = the exact light loop at reflection hits. THREERT_CACHE=0 turns the cache off.
-/// Frames after a reset or a camera cut during which pixels whose radiance-cache voxel is cold trace a fresh estimate
-/// (pathtrace.wgsl, cache flag 1 off). Later the cold voxels left are mostly where bounce rays land off screen,
-/// scattered, sparsely trained: their traces cost each SIMD group nearly a whole extra trace (Bistro's path 0.7-1.2
-/// ms, the crowd's square 2.3 ms) for ~1 % of the image (bench-crowd ΔE 13.1 -> 13.3).
-const COLD_FALLBACK_FRAMES: u32 = 30;
 
 /// Ceiling for one live lighting sample, in display units at the current exposure (live.wgsl `sample_clamp`): fireflies
 /// far above white. 64 until 2026-11-09, when it cut the light of small strong lights that the denoisers now keep: the
@@ -404,6 +374,9 @@ fn govern_by_clock() -> bool {
     *F.get_or_init(|| std::env::var("THREERT_GOVERN_CLOCK").map(|v| v == "1").unwrap_or(cfg!(target_os = "android")))
 }
 
+/// THREERT_CACHE_FLAGS: experiment switches of the radiance cache (pathtrace.wgsl `cfl`), 0 = defaults: 2 = no hit
+/// lighting (reflection hits use the cache's total), 4 = no training tiles, 8 = the exact light loop at reflection
+/// hits, 16 = no reflection resolve. THREERT_CACHE=0 turns the cache off.
 fn cache_flags() -> u32 {
     static F: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("THREERT_CACHE_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
@@ -517,8 +490,9 @@ impl LiveCore {
         let cache_on = !std::env::var("THREERT_CACHE").is_ok_and(|v| v == "0");
         // (Without the cache the kernel binds one of one entry.)
         let targets = Targets::new(&g, w, h, &vec![0u16; (LUT * LUT * LUT * 4) as usize], if cache_on { gpu::CACHE_SIZE } else { 1 });
-        let (sc, pp) = load_scene(&g, world, assets, presets, w, h, &targets, &passes)?;
-        let cam = sc.scene_camera;
+        let (sc, view, env) = load_scene(&g, world, assets, presets, w, h, &targets, &passes)?;
+        let cam = view.camera;
+        let pp = view.preset.post.clone();
         let (triangles, scene_name) = (sc.triangles, sc.name.clone());
         let profile = (g.timestamps && std::env::var("THREERT_PROFILE").is_ok()).then(|| {
             // trace, the post passes, cache resolve, then the particle pass, the BLAS rebuild, the translucency pass and
@@ -542,20 +516,21 @@ impl LiveCore {
         let timer = (g.timestamps && profile.is_none()).then(|| FrameTimer::new(&g.device));
         let raster = std::env::var("THREERT_RASTER").is_ok_and(|v| v == "1").then(|| Raster::new(&g, w, h));
         let cache = cache_on.then(|| RadianceCache { bufs: targets.kernel.cache.clone(), resolve: g.cache_resolve_pipeline() });
-        let kernel_bg = gpu::vis_bind_group(&g.device, &g.vis_layout, raster.as_ref().map_or(&g.no_vis_view, |r| &r.vis), &targets.kernel);
+        let vis = raster.as_ref().map_or(&g.no_vis_view, |r| &r.vis);
+        let kernel_bg = gpu::vis_bind_group(&g.device, &g.vis_layout, vis, &targets.kernel, true);
+        let tl_kernel_bg = g.tl_vis_layout.as_ref().map(|l| gpu::vis_bind_group(&g.device, l, vis, &targets.kernel, false));
         // (Read whenever a kernel of this session may have the guard: under software traversal a scene's first unit
         // brings it, `gpu::loop_guard_of`.)
         let guard_read = (gpu::loop_guard_of(!g.hwrt).is_some() && targets.kernel.guard.is_some())
             .then(|| (g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard read"), size: 4, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), Arc::new(AtomicU32::new(0))));
-        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, prev_span: None, reposed: false, emitters_moved: false, cold_frames: 0, pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, sky_cover: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
+        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, view, env, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
         core.spark_lights = core.sc.tables.emitter_tris.iter().any(|e| e.nominal);
-        core.sky_cover = core.sc.tables.cloud_cover;
         core.apply_post(&pp);
         Ok(core)
     }
 
     pub fn scene_camera(&self) -> Camera {
-        self.sc.scene_camera
+        self.view.camera
     }
 
     /// `guard_trips` for the frame log: None while the scene's kernel has no guard. Natively with nothing set that is
@@ -595,15 +570,16 @@ impl LiveCore {
     }
 
     pub fn rebuild(&mut self, world: &World) -> Result<()> {
-        let (s, pp) = load_scene(&self.g, world, &self.assets, &self.presets, self.w, self.h, &self.targets, &self.passes)?;
-        self.apply_post(&pp);
+        let (s, view, env) = load_scene(&self.g, world, &self.assets, &self.presets, self.w, self.h, &self.targets, &self.passes)?;
+        self.apply_post(&view.preset.post);
         self.triangles = s.triangles;
         self.scene_name = s.name.clone();
         // The scene's camera changed (a new lens rebuilds, and a move in the same commit comes with it): the view takes it.
         // Otherwise the view stays where it is.
-        if s.scene_camera != self.sc.scene_camera {
-            self.cam = s.scene_camera;
+        if view.camera != self.view.camera {
+            self.cam = view.camera;
         }
+        (self.view, self.env) = (view, env);
         // What the grid programs had simulated goes with the grids that are still the same.
         self.g.carry_grids(&self.sc.up, &s.up);
         self.sc = s;
@@ -656,7 +632,7 @@ impl LiveCore {
             c.bufs.clear(&mut e);
             self.g.queue.submit([e.finish()]);
         }
-        self.cam = self.sc.scene_camera;
+        self.cam = self.view.camera;
         self.prev_cam = self.cam;
         self.reset = true;
         Ok(())
@@ -704,9 +680,22 @@ impl LiveCore {
 
     pub fn set_camera(&mut self, mut c: Camera) {
         if c.tan_half_fov <= 0.0 {
-            c.tan_half_fov = self.sc.tan_half_fov;
+            c.tan_half_fov = self.view.camera.tan_half_fov;
         }
         self.cam = c;
+    }
+
+    /// Room in `finish`'s records for a sample of `pixels` traced pixels, any of which may leave one. The buffer follows
+    /// the traced size, not the output's (96 bytes a pixel: 354 MB for a 2560 x 1440 output, 50 traced at 0.375), and
+    /// is made a quarter larger than asked, so dynamic resolution's steps seldom make it again.
+    pub(super) fn ensure_deferred(&mut self, pixels: u64) {
+        let Some(d) = &self.targets.kernel.deferred else { return };
+        if self.cache.is_none() || d.size >= 16 + pixels * gpu::DEFERRED_BYTES {
+            return;
+        }
+        self.targets.kernel.deferred = Some(gpu::deferred_buffer(&self.g.device, (pixels + pixels / 4).min(self.w as u64 * self.h as u64)));
+        let vis = self.raster.as_ref().map_or(&self.g.no_vis_view, |r| &r.vis);
+        self.kernel_bg = gpu::vis_bind_group(&self.g.device, &self.g.vis_layout, vis, &self.targets.kernel, true);
     }
 
     /// Renders one frame with `spp` samples per pixel; returns the command buffers to submit after the samples.
@@ -840,8 +829,8 @@ impl LiveCore {
     #[cfg(not(target_arch = "wasm32"))]
     /// The exposure the last frame was shown at, EV100 (auto exposure: its adapted value).
     pub fn read_ev100(&self) -> Result<f32> {
-        if self.sc.exposure_settings.ae2[3] <= 0.5 {
-            return Ok(-self.sc.exposure.log2());
+        if self.view.exposure_settings.ae2[3] <= 0.5 {
+            return Ok(-self.view.exposure.log2());
         }
         let d = &self.g.device;
         let read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("ae read"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1042,6 +1031,9 @@ mod timer_tests {
         assert!((frame_gpu_ms(&t454, 3, 1.0).unwrap() - (3.0 * 7.849166 + 5.660166)).abs() < 1e-3);
     }
 }
+
+#[cfg(test)]
+mod inplace_tests;
 
 #[cfg(test)]
 mod instanced_tests {
