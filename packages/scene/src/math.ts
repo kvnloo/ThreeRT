@@ -527,22 +527,22 @@ export class Color {
   copy(c: Color): this {
     return this.setRGB(c.r, c.g, c.b);
   }
-  /** Hue, saturation, lightness in 0..1, sRGB-encoded as CSS / three.js (converted to linear). */
+  /** Hue, saturation and lightness in the linear working color space, as in three.js by default. */
   setHSL(h: number, s: number, l: number): this {
     h = ((h % 1) + 1) % 1;
     s = Math.min(Math.max(s, 0), 1);
     l = Math.min(Math.max(l, 0), 1);
-    if (s === 0) return this.setRGB(srgbToLinear(l), srgbToLinear(l), srgbToLinear(l));
+    if (s === 0) return this.setRGB(l, l, l);
     const p = l <= 0.5 ? l * (1 + s) : l + s - l * s, q = 2 * l - p;
     const hue = (t: number) => {
       t = ((t % 1) + 1) % 1;
       return t < 1 / 6 ? q + (p - q) * 6 * t : t < 1 / 2 ? p : t < 2 / 3 ? q + (p - q) * 6 * (2 / 3 - t) : q;
     };
-    return this.setRGB(srgbToLinear(hue(h + 1 / 3)), srgbToLinear(hue(h)), srgbToLinear(hue(h - 1 / 3)));
+    return this.setRGB(hue(h + 1 / 3), hue(h), hue(h - 1 / 3));
   }
-  /** Hue, saturation, lightness of the sRGB-encoded colour. */
+  /** Hue, saturation and lightness of the linear working-space color. */
   getHSL(target: { h: number; s: number; l: number } = { h: 0, s: 0, l: 0 }): { h: number; s: number; l: number } {
-    const [r, g, b] = [this.r, this.g, this.b].map((c) => Math.min(Math.max(linearToSrgb(c), 0), 1));
+    const [r, g, b] = [this.r, this.g, this.b];
     const max = Math.max(r, g, b), min = Math.min(r, g, b);
     const l = (min + max) / 2;
     if (min === max) return Object.assign(target, { h: 0, s: 0, l });
