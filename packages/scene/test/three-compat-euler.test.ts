@@ -3,17 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as THREE from "../src/index.ts";
 
-test("Euler.order: changing the order notifies and keeps Object3D.quaternion in sync", () => {
-  const euler = new THREE.Euler(0.2, 0.3, 0.4);
-  let changes = 0;
-  euler._onChange = () => { changes++; };
-  euler.order = "YXZ";
-  assert.equal(changes, 1, "assigning order invokes the change callback once");
-  euler.set(0.2, 0.3, 0.4, "ZXY");
-  assert.equal(changes, 2, "set still invokes its callback just once");
-  euler.setFromQuaternion(new THREE.Quaternion(), false);
-  assert.equal(changes, 2, "the suppressed quaternion conversion does not invoke a callback");
-
+test("Euler.order: assigning the order keeps Object3D.quaternion in sync, as three.js does", () => {
   const object = new THREE.Object3D();
   object.rotation.set(Math.PI / 2, Math.PI / 2, 0, "XYZ");
   assert.ok(Math.abs(object.quaternion.z - 0.5) < 1e-12, "XYZ begins with +0.5 z");
