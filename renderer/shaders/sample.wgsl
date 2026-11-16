@@ -130,7 +130,8 @@ const D_VOXEL: u32 = 15u;    // the radiance cache's volume points (`point_spher
 const D_CACHE: u32 = 16u;    // the cache's fixed-point dither
 
 // Live: Sobol only for the camera path's first vertex (not a loop's parts: `rng_sub` sets the top bit), a hash
-// elsewhere (as NVIDIA's RTXPT; all-Sobol cost 2 ms of Bistro's trace). Offline: Sobol everywhere (as Cycles).
+// elsewhere (as NVIDIA's RTXPT; variance only: all-Sobol is 0.14 ms more of Bistro's trace, 0.9 of Kabukichō's, for
+// flicker 0.443 -> 0.431). Offline: Sobol everywhere (as Cycles).
 fn rng_white(d: u32) -> bool { return LIVE && (cur_depth > 0u || RNG_PATH != 0u || d >= 0x80000000u); }
 fn white(d: u32, c: u32) -> f32 { return f32(hash_hp(rng_seed(d) ^ (RNG_INDEX * 0x9e3779b9u + c * 0x85ebca6bu)) >> 8u) * (1.0 / 16777216.0); }
 

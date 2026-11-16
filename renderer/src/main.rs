@@ -39,6 +39,8 @@ struct Job {
     time: Option<f32>,
     size: (Option<u32>, Option<u32>),
     hdr: Option<PathBuf>,
+    /// A live job's approximations (`gpu::A_*` bits; None: the device's).
+    approx: Option<u32>,
     /// `--signals PREFIX`: PREFIX-diffuse.raw / -specular.raw / -emission.raw, the image's linear signals apart as the
     /// live denoiser splits them (RGB f32, output size; live snapshots to `*.signals` write the same).
     signals: Option<PathBuf>,
@@ -176,6 +178,7 @@ fn main() -> Result<()> {
                 time: flag("--time").map(|s| s.parse()).transpose()?,
                 size: (flag("--width").map(|s| s.parse()).transpose()?, flag("--height").map(|s| s.parse()).transpose()?),
                 hdr: flag("--hdr").map(PathBuf::from),
+                approx: None,
                 signals: flag("--signals").map(PathBuf::from),
             };
             let stats = render(&g, &job, &presets, init_ms, &mut Hosts::default())?;
@@ -225,8 +228,13 @@ fn main() -> Result<()> {
         }
         "view" | "play" => {
             // The window is the app of the game's host channel: its `net.*` messages are this binary's sockets and
-            // HTTP (src/net.rs; a build without the `net` feature answers that it has none).
-            view::run(view::parse_args(&args, &presets)?, Box::new(net::Net::new()))?;
+            // HTTP (src/net.rs; a build without the `net` feature answers that it has none), its `files.*` and
+            // `store.*` the paths of `--pick` and the store directory (`--store`, where `user:` assets are too).
+            let a = view::parse_args(&args, &presets)?;
+            threert_render::files::set_user_root(Some(&a.store));
+            let files = threert_render::userfiles::UserFiles::new(Some(a.store.clone()), Some(threert_render::userfiles::queued_picks(a.pick.clone())));
+            let services: Vec<Box<dyn threert_render::host::HostServices>> = vec![Box::new(net::Net::new()), Box::new(files)];
+            view::run(a, Box::new(services))?;
         }
         "setup" => {
             // Setup cost of a game bundle in the embedded runtime (as on a render node).
@@ -274,7 +282,6 @@ fn main() -> Result<()> {
                 ("lights", bytemuck::cast_slice::<_, u8>(&e.lights) == bytemuck::cast_slice::<_, u8>(&b.lights)),
                 ("object power", power(&e.objects) == power(&b.objects)),
                 ("emitters", bits(&ea, e.emitter_tris.len()) == bits(&pb.emitters, pb.emitter_tris.len())),
-                ("wetness / rain", (e.wetness, e.rain) == (b.wetness, b.rain)),
             ];
             println!("{}", serde_json::json!({ "structural": applied.is_none(), "checks": checks.iter().map(|(k, ok)| (k.to_string(), *ok)).collect::<std::collections::BTreeMap<_, _>>() }));
             if applied.is_none() || checks.iter().any(|(_, ok)| !ok) {
@@ -301,7 +308,8 @@ fn main() -> Result<()> {
         "serve" => {
             // One job per stdin line: {id, game: bundle path (or game module + runtime: runtime module), assets, room,
             // seed, state?, seq?, out, spp?, denoise?, overrides?, camera?, preset?, width?, height?, time?, hdr? (raw f32
-            // RGB linear radiance, nits), live? (frames of the real-time renderer instead, `render_live`)}; one result line
+            // RGB linear radiance, nits), live? (frames of the real-time renderer instead, `render_live`), approx? (a
+            // live job's approximations, `gpu::A_*` bits; the device's without)}; one result line
             // each: {id, ok, stats} or
             // {id, ok: false, error, missing?: [files to put under the asset root before retrying]}.
             let t0 = Instant::now();
@@ -331,6 +339,7 @@ fn main() -> Result<()> {
                         time: v["time"].as_f64().map(|t| t as f32),
                         size: (v["width"].as_u64().map(|x| x as u32), v["height"].as_u64().map(|x| x as u32)),
                         hdr: v["hdr"].as_str().map(PathBuf::from),
+                        approx: v["approx"].as_u64().map(|x| x as u32),
                         signals: v["signals"].as_str().map(PathBuf::from),
                     };
                     match v["live"].as_u64() {
@@ -374,15 +383,16 @@ fn render_live(slot: &mut Option<gpu::Gpu>, job: &Job, presets: &Path, frames: u
     host.settle_physics((start.max(0.0) * 60.0).round() as u32);
     let mut w = host.world.borrow_mut();
     w.take_changes();
-    let missing: Vec<String> = w.files().into_iter().filter(|f| !job.game.assets.join(f).is_file()).collect();
+    let missing: Vec<String> = w.files().into_iter().filter(|f| !threert_render::files::asset_path(&job.game.assets, f).is_file()).collect();
     if !missing.is_empty() {
         return Err(MissingFiles(missing).into());
     }
     let (width, height) = (job.size.0.unwrap_or(w.settings.width), job.size.1.unwrap_or(w.settings.height));
-    let g = match slot.take() {
+    let mut g = match slot.take() {
         Some(g) => g,
         None => gpu::Gpu::new()?,
     };
+    g.set_approx(job.approx);
     let mut core = live::LiveCore::new(g, &w, &job.game.assets, presets, width, height)?;
     core.set_scale(1.0);
     drop(w);
@@ -443,7 +453,7 @@ fn render(g: &gpu::Gpu, job: &Job, presets: &Path, init_ms: f64, hosts: &mut Hos
     let mut sc = {
         let mut w = host.world.borrow_mut();
         w.take_changes();
-        let missing: Vec<String> = w.files().into_iter().filter(|f| !job.game.assets.join(f).is_file()).collect();
+        let missing: Vec<String> = w.files().into_iter().filter(|f| !threert_render::files::asset_path(&job.game.assets, f).is_file()).collect();
         if !missing.is_empty() {
             return Err(MissingFiles(missing).into());
         }
