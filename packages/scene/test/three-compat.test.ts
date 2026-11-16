@@ -119,6 +119,77 @@ test("Euler.order: changing the order notifies and keeps Object3D.quaternion in 
   assert.equal(object.rotation.order, "YXZ", "setting the order preserves the chosen order");
 });
 
+test("Euler: six-order rotation-matrix and quaternion conversions preserve orientation, order, and notifications", () => {
+  const orders = ["XYZ", "YXZ", "ZXY", "ZYX", "YZX", "XZY"] as const;
+  for (const order of orders) {
+    const original = new THREE.Euler(0.31, -0.42, 0.57, order);
+    const q = new THREE.Quaternion().setFromEuler(original);
+    const matrix = new THREE.Matrix4().makeRotationFromQuaternion(q);
+    const fromQuaternion = new THREE.Euler(0, 0, 0, order);
+    let changes = 0;
+    fromQuaternion._onChange = () => { changes++; };
+    assert.equal(fromQuaternion.setFromQuaternion(q), fromQuaternion, order);
+    assert.equal(fromQuaternion.order, order, "quaternion conversion retains the chosen order");
+    assert.equal(changes, 1, "conversion notifies exactly once");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(fromQuaternion).dot(q)) - 1) < 1e-12, order);
+
+    const fromMatrix = new THREE.Euler(0, 0, 0, "XYZ");
+    let matrixChanges = 0;
+    fromMatrix._onChange = () => { matrixChanges++; };
+    assert.equal(fromMatrix.setFromRotationMatrix(matrix, order, false), fromMatrix, order);
+    assert.equal(fromMatrix.order, order, "matrix conversion accepts an explicit order");
+    assert.equal(matrixChanges, 0, "suppressed conversion must not notify");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(fromMatrix).dot(q)) - 1) < 1e-12, order);
+    fromMatrix.setFromRotationMatrix(matrix, order);
+    assert.equal(matrixChanges, 1, "non-suppressed conversion notifies once");
+
+    const object = new THREE.Object3D();
+    object.rotation.set(0.13, -0.29, 0.41, order);
+    object.quaternion.copy(q);
+    assert.equal(object.rotation.order, order, "Object3D quaternion-to-Euler sync must not reset order");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(object.rotation).dot(q)) - 1) < 1e-12, order);
+  }
+
+  const target = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.2, -0.3, 0.4, "ZYX"));
+  const euler = new THREE.Euler();
+  let calls = 0;
+  euler._onChange = () => { calls++; };
+  euler.setFromQuaternion(target, "ZYX", false);
+  assert.equal(euler.order, "ZYX", "explicit order overrides the previous order");
+  assert.equal(calls, 0, "three.js-style update=false is silent");
+  euler.setFromQuaternion(target, "YZX");
+  assert.equal(euler.order, "YZX");
+  assert.equal(calls, 1);
+  euler.setFromQuaternion(target, false);
+  assert.equal(euler.order, "YZX", "legacy (quaternion, false) retains order");
+  assert.equal(calls, 1, "legacy suppression is silent");
+});
+
+test("Euler: both gimbal-lock signs recompose across all six rotation orders", () => {
+  const cases = [
+    ["XYZ", "y", "z"], ["YXZ", "x", "z"], ["ZXY", "x", "y"],
+    ["ZYX", "y", "x"], ["YZX", "z", "x"], ["XZY", "z", "y"],
+  ] as const;
+  for (const [order, middleAxis, zeroedAxis] of cases) {
+    for (const sign of [-1, 1]) {
+      const original = new THREE.Euler(0.23, -0.39, 0.51, order);
+      original[middleAxis] = sign * Math.PI / 2;
+      const q = new THREE.Quaternion().setFromEuler(original);
+      const matrix = new THREE.Matrix4().makeRotationFromQuaternion(q);
+      const fromMatrix = new THREE.Euler(0, 0, 0, order).setFromRotationMatrix(matrix);
+      const fromQuaternion = new THREE.Euler(0, 0, 0, order).setFromQuaternion(q);
+      for (const converted of [fromMatrix, fromQuaternion]) {
+        assert.equal(converted.order, order);
+        assert.ok(Math.abs(converted[middleAxis] - sign * Math.PI / 2) < 1e-7,
+          `${order} singular middle-axis angle (${sign})`);
+        assert.ok(Math.abs(converted[zeroedAxis]) < 1e-12, `${order} zeroes its redundant axis (${sign})`);
+        assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(converted).dot(q)) - 1) < 1e-12,
+          `${order} at ${sign} pi/2 preserves the original rotation`);
+      }
+    }
+  }
+});
+
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
