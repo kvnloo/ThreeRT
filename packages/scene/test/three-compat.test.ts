@@ -98,6 +98,47 @@ test("vertex colours: the geometry's `color` attribute (RGB, RGBA, normalized by
   assert.deepEqual(compatNotes().slice(before).filter((n) => n.startsWith("unsupported:")), []);
 });
 
+test("Layers: 32-bit membership and independent Object3D copies, as three.js r187", () => {
+  assert.equal(typeof THREE.Layers, "function", "the Layers constructor is exported");
+  const object = new THREE.Object3D();
+  assert.ok(object.layers instanceof THREE.Layers);
+  assert.equal(object.layers.mask, 1, "only layer 0 is on by default");
+  assert.equal(object.layers.isEnabled(0), true);
+  assert.equal(object.layers.isEnabled(31), false);
+
+  object.layers.set(31);
+  assert.equal(object.layers.mask, 2147483648, "set(31) stores an unsigned high bit");
+  object.layers.enable(2);
+  assert.equal(object.layers.mask, -2147483644, "enable uses a signed 32-bit OR");
+
+  const other = new THREE.Layers();
+  other.set(2);
+  assert.equal(object.layers.test(other), true);
+  object.layers.toggle(2);
+  assert.equal(object.layers.mask, -2147483648);
+  assert.equal(object.layers.test(other), false);
+  object.layers.disable(31);
+  assert.equal(object.layers.mask, 0);
+
+  object.layers.enableAll();
+  assert.equal(object.layers.mask, -1);
+  assert.equal(object.layers.isEnabled(31), true);
+  object.layers.disableAll();
+  assert.equal(object.layers.mask, 0);
+
+  object.layers.set(3);
+  const copy = new THREE.Object3D().copy(object, false);
+  const clone = object.clone(false);
+  assert.notEqual(copy.layers, object.layers, "copy owns its Layers instance");
+  assert.notEqual(clone.layers, object.layers, "clone owns its Layers instance");
+  assert.equal(copy.layers.mask, 8);
+  assert.equal(clone.layers.mask, 8);
+  clone.layers.enable(5);
+  assert.equal(clone.layers.mask, 40);
+  assert.equal(object.layers.mask, 8, "changing the clone must not change the source");
+  assert.equal(copy.layers.mask, 8);
+});
+
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);

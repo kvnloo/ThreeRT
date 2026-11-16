@@ -315,10 +315,40 @@ export interface SwayDesc {
   phase?: number;
 }
 
+/** Three.js' 32-bit layer membership mask; only layer 0 is enabled initially. */
+export class Layers {
+  mask = 1;
+
+  set(layer: number): void {
+    this.mask = (1 << layer | 0) >>> 0;
+  }
+  enable(layer: number): void {
+    this.mask |= 1 << layer | 0;
+  }
+  enableAll(): void {
+    this.mask = 0xffffffff | 0;
+  }
+  toggle(layer: number): void {
+    this.mask ^= 1 << layer | 0;
+  }
+  disable(layer: number): void {
+    this.mask &= ~(1 << layer | 0);
+  }
+  disableAll(): void {
+    this.mask = 0;
+  }
+  test(layers: Layers): boolean {
+    return (this.mask & layers.mask) !== 0;
+  }
+  isEnabled(layer: number): boolean {
+    return (this.mask & (1 << layer | 0)) !== 0;
+  }
+}
+
 let objectIds = 0;
 
 /** What `Object3D.copy` does not take over as it is (transforms are copied by value, children cloned). */
-const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners"]);
+const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "layers", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners"]);
 
 export class Object3D {
   readonly isObject3D = true;
@@ -333,6 +363,7 @@ export class Object3D {
   readonly rotation = new Euler();
   readonly scale: Vector3 = new TrackedVector3(this, 1, 1, 1);
   readonly up = new Vector3(0, 1, 0);
+  layers = new Layers();
   private _visible = true;
   private _power = 1;
   private _custom: [number, number, number, number] = [0, 0, 0, 0];
@@ -632,6 +663,7 @@ export class Object3D {
     this.up.copy(source.up);
     this.matrix.copy(source.matrix);
     this.matrixWorld.copy(source.matrixWorld);
+    this.layers.mask = source.layers.mask;
     this.userData = JSON.parse(JSON.stringify(source.userData));
     this.tags = [...source.tags];
     if (recursive) for (const c of source.children) this.add(c.clone());
