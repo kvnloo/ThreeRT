@@ -413,6 +413,8 @@ export class Object3D {
   }
   declare private _matrix: Matrix4 | undefined;
   matrixAutoUpdate = true;
+  /** Set false to retain a manually supplied matrixWorld during world-space updates, as in three.js. */
+  matrixWorldAutoUpdate = true;
   /** The world transform as a matrix (`updateWorldMatrix`), made when first asked for. */
   get matrixWorld(): Matrix4 {
     return (this._matrixWorld ??= new Matrix4());
@@ -652,8 +654,10 @@ export class Object3D {
   updateWorldMatrix(updateParents: boolean, updateChildren: boolean): void {
     if (updateParents && this.parent) this.parent.updateWorldMatrix(true, false);
     if (this.matrixAutoUpdate) this.updateMatrix();
-    if (this.parent) this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
-    else this.matrixWorld.copy(this.matrix);
+    if (this.matrixWorldAutoUpdate) {
+      if (this.parent) this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
+      else this.matrixWorld.copy(this.matrix);
+    }
     if (updateChildren) for (const c of this.children) c.updateWorldMatrix(false, true);
   }
 
