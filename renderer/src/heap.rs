@@ -47,10 +47,12 @@ pub enum Table {
     Media,
     /// The GGX energy table, 512 vec4s.
     Energy,
+    /// The glass energy table (lib.rs `glass_energy_lut`).
+    GlassEnergy,
 }
 
 impl Section for Table {
-    const COUNT: usize = 10;
+    const COUNT: usize = 11;
     const UNIT: u64 = 16;
     const LABEL: &'static str = "tables";
     fn index(self) -> usize {

@@ -46,7 +46,7 @@ runtime, and drives the engine directly, the way a UE game drives its actors:
 | Engine API | `packages/scene/src/engine.ts` (`Engine`), `renderer/src/script.rs` (`__engine` natives) | Handles (u32) for geometries (typed arrays), textures (asset path, encoded image or RGBA8 pixels), material-function code, materials, objects (group / mesh / model / light / camera) and their transform, visibility, power, light / camera parameters; the environment and render settings. Descriptors are JSON-shaped (`renderer/src/desc.rs`). |
 | Scene binding | `packages/scene/src/engine.ts` `SceneBinding` | Keeps the engine in step with a DSL scene. Objects report their own changes (core.ts change tracking: transforms, visibility, power, shadow flag, mesh geometry / material, add / remove), so a sync visits only what changed. Lights, cameras and materials are compared against what was last sent. |
 | World | `renderer/src/world.rs` | The engine's objects, resources, environment and settings, and what changed since the last commit: parameter changes (power, light / material parameters, environment, camera) or structural ones. Asset paths must stay inside the asset root (game code is untrusted on nodes). |
-| Live commit | `renderer/src/live/edits.rs` `LiveCore::commit`, `tables.rs` | Parameter changes rewrite GPU table entries in place (materials, lights, object power, emitter CDF, wetness / rain / fog, camera), and so does hiding or showing a volume, a light without a card or a particle system that is not light-sampled by its own `visible`. Anything structural rebuilds the GPU scene from the world, in memory; history survives, validated per pixel. |
+| Live commit | `renderer/src/live/edits.rs` `LiveCore::commit`, `tables.rs`, `live/state.rs` | Parameter changes rewrite GPU table entries in place (materials, lights, object power, emitter CDF), and so does hiding or showing a volume, a light without a card or a particle system that is not light-sampled by its own `visible`. What is not the scene's data is held beside it and derived whole from the world, by the same function at load and on an edit (`live/state.rs`): the view's state (`ViewState`: the scene camera's lens, depth of field and exposure, which camera is the scene's, the render preset) and the environment (`Environment`: wetness, rain, fog or a background, appearing or going with another variant of the kernel; its sky, baked and put in place by `apply_sky`). Anything structural rebuilds the GPU scene from the world, in memory; history survives, validated per pixel. The view's size is the view's: `LiveCore::resize` makes the buffers that follow it again (`live/targets.rs`) and leaves the scene's data and the radiance cache; the window (`play`) follows its size and its display's density, the headless runner takes `{"cmd":"resize"}`. |
 | Scene runtime | `renderer/src/script.rs` `ScriptHost` | QuickJS (rquickjs) with no I/O (no fs, network or timers; what needs the outside is asked of the app, "The host channel"). Loads a bundle (one script) or ES modules (`game.js` + `threert-runtime.js`, the cloud layout). Memory capped at 1 GiB. Time budgets: setup 120 s, event 1 s, frame 50 ms; the interrupt handler aborts overruns. Every entry ends by running the promise jobs it left, inside its budget ("Promises", below). The time the engine spends inside a voxel call (`voxelExplode`, `voxelEdit`, `voxelFrame`) is the engine's, not the script's: the deadline moves by it as measured, up to 250 ms an entry; past that it counts against the script, and a voxel call made after the deadline throws "interrupted" at once. A prelude adds `TextEncoder`, `structuredClone`, `atob` and `console`. |
 | Node host | `packages/gameplay/src/node-host.ts` | `globalThis.__threert`: `setup(room, seed)`, `event(type, payload, ts)` (local authority: execute + commit), `commit(writes, seq)` / `setState(state, seq)` (room authority), `state()`, `frame(dt, now)`, `hostMessages(list, ts)` (the app's messages), `sync()` (the engine follows the scene once more: after an entry's promise jobs), and the editor's `outline()`, `inspect(name)`, `edit(name, path, value)`. |
 | World handlers | `packages/gameplay/src/world.ts` | `on[type](world, ev)`: an event handled on this node, changing the scene at once. `WorldContext`: `scene`, `camera`, read-only `state`, `object(id)`, `time`, `now`, `random()`, `emit(type, payload)`. |
@@ -388,6 +388,7 @@ Messages a game posts:
 | `net.fetch` | `id`, `url`, `method?`, `headers?`, `body?` | one HTTP request (`GET` unless `method`); answers `net.fetched` |
 | `hud` | `hud` | draws the HUD it describes ("HUD", below). `hud.set` posts it; a game does not post it by hand |
 | `audio.*` | below | plays sound ("Sound", below), with the engine's `audio` module. `audio.play` and the rest post them |
+| `files.*`, `store.*` | below | reads what the player picked, keeps the game's files on the device ("Files", below); each request answered once |
 
 Messages an app sends:
 
@@ -397,7 +398,9 @@ Messages an app sends:
 | `net.messages` | `id`, `list: string[]` | the text messages that arrived on `id` since the last frame, in order: one batch a socket a frame |
 | `net.closed` | `id`, `code`, `reason` | the socket closed (the close frame's code; 1005 without one), or failed (1006, `reason` says why) |
 | `net.fetched` | `id`, `status`, `body`, `error?` | the response's status and body as text; `status` 0 and `error` when the request failed |
-| `launch` | `params: { room?, name?, ... }` | once, after setup: how the app opened the game. Kept as `host.launch` (`{}` before it comes, and for an app that sends none) |
+| `launch` | `params: { room?, name?, ... }`, `caps?: string[]` | once, after setup: how the app opened the game. Kept as `host.launch` (`{}` before it comes, and for an app that sends none); `caps`, the families of requests the app answers (`"files"`, `"store"`), as `host.caps` (`[]` before, and for an app that lists none) |
+| `files.picked`, `files.data`, `store.*` | below | the answers to `files.*` and `store.*` ("Files", below) |
+| `hud.choose` | `item`, `row` | the player clicked or tapped a row of a selectable HUD table ("HUD", below) |
 | `input` | below | once a frame, before the frame script, to a game that asked for input. The node host keeps it; it has no listeners |
 
 `id` is the game's own name for a socket or a request (a string); the app's answers carry it back. Messages are text:
@@ -405,7 +408,8 @@ a binary WebSocket frame is dropped. Which addresses a game may reach is the app
 
 **What an app does** (Rust: whoever holds the `GameSession`; `renderer/src/view.rs` is the example to read):
 
-1. After the scene is built: `session.host_messages(&mut core, &[host::launch_message(params)])`.
+1. After the scene is built: `session.host_messages(&mut core, &[host::launch_message(params)])`, or
+   `launch_message_with_caps(params, &services.caps())` for an app that answers `files.*` / `store.*`.
 2. Every frame, before `session.frame`: one `host_messages` with the frame's `input` message (if the game asked:
    `session.host.pointer()` is `Some("look")` or `Some("free")`) and what its services have for the game (a
    `net.messages` batch a socket, answers). An empty batch is no entry at all.
@@ -419,11 +423,11 @@ a binary WebSocket frame is dropped. Which addresses a game may reach is the app
 
 The apps in this repository:
 
-| app | input | `net.*` | `launch` | HUD | sound |
-| --- | --- | --- | --- | --- | --- |
-| `threert-render play` (`view.rs`) | keys by physical position, mouse buttons, wheel; the pointer captured for `"look"` (a click; Esc lets go, Esc again quits) | WebSockets and HTTP on a thread each (`src/net.rs`: tungstenite and ureq on rustls; text frames of at most 1 MiB, bodies of at most 4 MiB, 16 sockets, 32 requests at once), any address | `--launch '{"room":"K7Q4MZ"}'` | not drawn; `--hud-log` prints each description | played (`audio` feature) |
-| `threert-render live` (`live/session.rs`) | whatever the driver sends | none: the driver is the app | `--launch` | on stdout with every other post | on stdout: the driver's |
-| the three.js view (`tools/three/view.ts`, `host.ts`, `hud.ts`) | keyboard, mouse, the Pointer Lock API | `WebSocket`, `fetch` (the browser's rules: same-origin policy, CORS) | the page's query (`?room=K7Q4MZ&name=Ada`) | DOM over the canvas | Web Audio by the same rules (`audio.ts`) |
+| app | input | `net.*` | `launch` | HUD | sound | files, store |
+| --- | --- | --- | --- | --- | --- | --- |
+| `threert-render play` (`view.rs`) | keys by physical position, mouse buttons, wheel; the pointer captured for `"look"` (a click; Esc lets go, Esc again quits) | WebSockets and HTTP on a thread each (`src/net.rs`: tungstenite and ureq on rustls; text frames of at most 1 MiB, bodies of at most 4 MiB, 16 sockets, 32 requests at once), any address | `--launch '{"room":"K7Q4MZ"}'`; `caps: ["files", "store"]` | not drawn; `--hud-log` prints each description | played (`audio` feature) | `--pick` and `--store` (`src/userfiles.rs`) |
+| `threert-render live` (`live/session.rs`) | whatever the driver sends | none: the driver is the app | `--launch`, `--caps files,store` | on stdout with every other post | on stdout: the driver's | the driver's; `--store` is where `user:` assets are |
+| the three.js view (`tools/three/view.ts`, `host.ts`, `hud.ts`) | keyboard, mouse, the Pointer Lock API | `WebSocket`, `fetch` (the browser's rules: same-origin policy, CORS) | the page's query (`?room=K7Q4MZ&name=Ada`); no `caps` | DOM over the canvas | Web Audio by the same rules (`audio.ts`) | none |
 
 - `live` speaks the channel as JSON lines, so a game's use of it is testable without a window: on stdin
   `{"cmd":"host","messages":[{"t":"net.opened","id":"room"}, ...]}`, on stdout one line `{"host":[...]}` with what
@@ -437,7 +441,8 @@ The apps in this repository:
   natively, without the renderer and without wasm-bindgen), which `node tools/three/open.ts <game>` builds for a
   game whose source names the physics. Bodies move and `intersectPhysics` / `Shapecaster` answer as in the renderer.
   Without the module the view is the baseline it was: bodies stay where the scene put them.
-- Checked: `packages/gameplay/test/host.test.ts` (the channel, input, the HUD's change detection, in Node);
+- Checked: `packages/gameplay/test/host.test.ts` (the channel, input, the HUD's change detection, in Node),
+  `files.test.ts` (files, store, caps, base64, `sliced`);
   `renderer/src/host.rs` and `script.rs` tests (the queue's bounds, a batch's delivery, the input message);
   `node tools/host-echo.ts` (`games/host/echo.game.ts` in `live` with the script as the app, in `play` against a
   WebSocket and HTTP server on the machine, and in the three.js view in Chrome); `node tools/fps-arena.ts` and
@@ -544,13 +549,31 @@ hud.flash("damage", 1.2);        // the player was hit from 1.2 rad clockwise of
   | `text` | `text`, `label?`, `tone?`, `size?` (`small`, `normal`, `large`) | a figure or a line, with a small label over it |
   | `bar` | `value` (0..1), `label?`, `text?`, `tone?` | health, a reload, a round's time; `text` is a figure beside it |
   | `list` | `lines: (string \| { text, tone?, ttl?, id? })[]` | short lines, newest last. A line with `ttl` is shown that many seconds from when the app first got it (the same `id`, or the same text), then left out, whether or not the game still lists it |
-  | `table` | `columns`, `rows`, `title?`, `highlight?` | a scoreboard: listed while it is to be seen (`f.input.down("Tab")`); `highlight` is the row to set apart |
+  | `table` | `columns`, `rows`, `title?`, `highlight?`, `selectable?`, `id?` | a scoreboard: listed while it is to be seen (`f.input.down("Tab")`); `highlight` is the row to set apart. A `selectable` table is a menu (below); `id` names it, unique among the tables |
 - **`crosshair`:** `style` (`dot`, `cross`, `circle`), `gap` (0..1: how far it opens, a weapon's spread), `tone?`.
   **`message`:** `title`, `subtitle?`, `tone?`, at the picture's centre.
 - **`flash`** is the one event: `hud.flash(kind, angle?)` posts the HUD as last set with `flash: { kind, angle?, n }`,
   `n` one more each time. An app plays it when `n` changes: `hit` (a hit marker at the crosshair), `kill`, `damage`
   (the player was hit; `angle`, radians clockwise from straight ahead, is where from).
 - **Tones** say what a value means, for the app to colour: `default`, `good`, `warn`, `bad`, `accent`, `dim`.
+- **Menus: selectable tables.** A table with `selectable: true` is a menu the player can click (with the pointer
+  free) or tap. The app makes each row a target and, when one is chosen, sends `{ t: "hud.choose", item, row }`:
+  `item` is the table's `id` (a string), or its index in `items` when it has none (a number); `row` is the row's
+  index in `rows`. The game takes it with `host.on("hud.choose", (m, world) => ...)` like any message of the app, and
+  decides what it means; a choice changes nothing by itself (the game moves its `highlight`, opens what was chosen).
+  Keys and a gamepad drive the same menu through the game's own `highlight`, so a menu works on a keyboard, a
+  gamepad and a touch screen alike. With the pointer captured for look there is nothing to click: a game that wants
+  clicks shows its menu with the pointer free (`pointer: "free"`, or the player lets go with Esc), and an app on a
+  touch screen has no capture to begin with. `threert-render play` draws no HUD: with `--hud-log` it prints each
+  selectable table and the stdin line that chooses a row (`{"cmd":"host","messages":[{"t":"hud.choose","item":"maps",
+  "row":0}]}`); the three.js view makes the rows clickable (`tools/three/hud.ts`). Rust apps:
+  `host::hud_selectables(hud)` lists them, `host::hud_choose_message(item, row)` is the message.
+
+  ```ts
+  hud.set({ items: [{ type: "table", anchor: "center", id: "maps", title: "Maps", columns: ["Map", "Size"],
+    rows: maps.map((m) => [m.name, m.size]), highlight: current, selectable: true }] });
+  host.on("hud.choose", (m) => { if (m.item === "maps") open(maps[m.row]); });
+  ```
 - **Text is text.** An app shows a game's strings as they are, never as markup.
 - A scene built anew in the same runtime posts its first description whatever the last one was.
 
@@ -605,6 +628,156 @@ frame(f) {
   The three.js view plays it on Web Audio by the same numbers (`tools/three/audio.ts`, held to mix.rs by
   `tools/three/test/audio.test.ts`; its low pass is a biquad, the one difference), resumed on the page's first key or
   click as browsers require. The engine's library in a browser (wasm32) has no `audio` module.
+
+### Files
+
+A game may let its player bring content they own: OpenStrikeRT, for one, plays Counter-Strike 1.x maps from the
+player's own copy of that game, converted to RT maps. Such files never leave the player's device. The player picks
+them, the game reads and converts them inside its sandbox, keeps the result in the app's storage on that device, and
+shows it as an asset. Nothing is uploaded, published or sent to other players.
+
+```ts
+import { GLTFModel } from "@threert/scene";
+import { files, host, sliced, store } from "@threert/gameplay";
+
+host.on("launch", () => { canImport = files.available() && store.available(); });   // the app's caps
+
+async function importMaps() {                                        // from the frame script (a menu's button)
+  const picked = await files.pick({ mode: "folder", accept: [".bsp", ".wad"], title: "Your Counter-Strike folder" });
+  if (!picked) return;                                               // the player closed the picker
+  for (const e of picked.entries.filter((e) => e.path.endsWith(".bsp"))) {
+    const bsp = await files.read(picked.pick, e.path);               // Uint8Array, the whole file (or { offset, length })
+    jobs.push({ name: e.path, job: sliced(convert(bsp)) });          // convert: a generator, it yields often
+  }
+}
+function frame() {                                                   // the game's frame script
+  const r = jobs[0]?.job.step(8);                                    // 8 ms of conversion this frame
+  if (r?.done) { void store.write(`maps/${slug}/map.glb`, r.value as Uint8Array); jobs.shift(); }
+}
+scene.add(new GLTFModel(store.uri("maps/de_x/map.glb")));            // "user:maps/de_x/map.glb"
+```
+
+Two families of requests on the host channel (`packages/gameplay/src/files.ts` wraps them as promises). Binary data
+travels as base64 strings. `id` is the game's name for the request; every request gets exactly one answer with the
+same `id`.
+
+- **Capabilities.** An app that answers them lists them in the `launch` message: `{ t: "launch", params, caps:
+  ["files", "store"] }`. `host.caps` is that list: `[]` until launch, and for an app that sends none. A game must not
+  wait for an answer of a family the app did not list: `files.available()` / `store.available()` say whether it did,
+  and the package refuses a request of an unlisted family at once (a `HostRequestError` with `reason:
+  "unsupported"`), without posting it. `caps` comes after setup, so a game asks in its `launch` listener or later.
+
+**`files.*`: what the player picked (read only).**
+
+| game → app | app → game |
+| --- | --- |
+| `{ t: "files.pick", id, mode: "folder" \| "files", accept?: string[], title?: string }` | `{ t: "files.picked", id, ok: true, pick, name, entries: [{ path, size }] }` or `{ t: "files.picked", id, ok: false, reason }` |
+| `{ t: "files.read", id, pick, path, offset?, length? }` | `{ t: "files.data", id, ok: true, data, offset, size }` or `{ ..., ok: false, reason }` |
+
+- `accept`: lower-case extensions with the dot (`[".bsp", ".wad", ".rad"]`); a file matches without regard to case.
+  No `accept`: every file.
+- `mode: "folder"`: the player chooses a folder; `entries` are the matching files under it, recursively (at most 6
+  levels, at most 4,000 entries, hidden files and directories left out), `path` relative to the folder with `/`
+  separators. `mode: "files"`: the player chooses one or more files; `entries` are those, `path` = the file's name.
+- `pick` is an opaque string naming the grant; `name` is what to show (the folder's or the file's name). A grant
+  lasts for the game session (until the game is closed or reloaded).
+- `reason`: `"canceled"` (the player closed the picker), `"busy"` (a picker is already open), `"unsupported"`,
+  `"denied"`, or a sentence.
+- `files.read`: `path` must be one of the grant's entries (anything else: `ok: false, reason: "denied"`). Without
+  `offset` and `length`, `data` is the whole file in base64. With them (whole numbers of bytes; `offset` 0 by default,
+  `length` to the end by default) it is `length` bytes from `offset`, fewer where the file ends first; an `offset`
+  past the end is `reason: "out of range"` (at the end: no bytes). The answer's `offset` is where `data` starts and
+  `size` is always the whole file's size. At most 64 MiB at once (`reason: "too large"`): a larger file is read in
+  parts. Read only what is needed: a 38 MB texture archive for its directory and a few textures is a few small reads,
+  where the whole of it is 50 MB of base64 in one message and a frame of a tenth of a second.
+- `files.pick(o)` resolves to `{ pick, name, entries }`, or `null` when the player canceled; `files.read(pick, path,
+  { offset?, length? }?)` to the bytes. Any other `ok: false` rejects with a `HostRequestError` whose `reason` is the
+  app's.
+- **The pointer while the picker is open.** A picker is the app's own window or sheet over the game, and the game
+  cannot let go of the pointer itself: an app that has the pointer captured for look releases it when it opens a
+  picker (as when the window loses the keyboard: everything held is let go), and the player captures it again with a
+  click once the picker is closed.
+
+**`store.*`: the app's own storage for this game (read and write, persistent, local).**
+
+| game → app | app → game |
+| --- | --- |
+| `{ t: "store.write", id, path, data?: base64, text?: string }` | `{ t: "store.done", id, ok, reason? }` |
+| `{ t: "store.read", id, path, as: "text" \| "base64" }` | `{ t: "store.data", id, ok: true, text? / data?, size }` or `{ ..., ok: false, reason: "absent" \| ... }` |
+| `{ t: "store.list", id, prefix?: string }` | `{ t: "store.listed", id, ok: true, entries: [{ path, size }] }` |
+| `{ t: "store.remove", id, path }` | `{ t: "store.done", id, ok, reason? }`: a file, or a directory and everything in it |
+
+- `path`: relative, `/`-separated, segments of `[A-Za-z0-9._-]`, no `.` or `..` segment, no leading `/`, at most 200
+  characters. Directories are made as needed. The package checks a path before it posts anything (a `TypeError`);
+  the app checks it again (`ok: false`).
+- `store.write` takes `data` (bytes in base64) or `text` (written as UTF-8), a file of at most 64 MiB. Writes are
+  atomic: a temporary file beside the file, renamed over it, so a reader sees the old file or the new one.
+  `store.read` with `as: "text"` answers `reason: "not text"` for a file that is not UTF-8. `store.list` lists the
+  files (not directories) whose path starts with `prefix` (a plain string: `"maps/"` is everything under maps),
+  sorted by path. `store.remove` of nothing is `ok: true`.
+- One storage per game identity: a published app by its name (`openstrike`), a development project by its project
+  id. It survives app updates and new versions of the game, is never uploaded, and is removed with the game's data.
+- Quota: 1 GiB per game (a write past it: `ok: false, reason: "quota"`).
+- `store.write(path, bytes | text)`, `store.read(path)` (bytes, or `null` when absent), `store.readText(path)`,
+  `store.list(prefix?)`, `store.remove(path)`; `store.uri(path)` is `"user:" + path`.
+
+**Assets from the store: `user:` URIs.** A stored file is an asset of the scene under the URI `user:<path>`:
+`new GLTFModel("user:maps/de_dust2/map.glb")`, a texture's file, a procedural asset, a voxel level's objects, a sound
+(`audio.play("user:sounds/x.wav")`) likewise. The engine resolves `user:` against the store's directory the app gave
+it (`threert_render::files::set_user_root`, before the scene is built; `files::asset_path` is the one place every
+reader of a scene's files goes through), and a path after `user:` must be a store path, so nothing outside the store
+is reached. Without a user root a `user:` asset is missing, as a missing file is. `GameSession::files()` lists `user:`
+assets with the rest: an app that fetches a scene's files from elsewhere (a browser page, a client that downloads a
+package) leaves them out, they are on the device. The browser builds have no store: a `user:` asset is missing there.
+
+**Large messages.** A `store.write` carries a whole file: its post may be up to 96 MiB of JSON text (any other message
+stops at 1 MiB), and the queue holds at most 192 MiB. In the engine's runtime the package's base64 is native
+(`__host_base64_encode` / `__host_base64_decode`, in `script.rs`): a 64 MiB `files.data` reaches a listener and is
+decoded in about 130 ms of an entry's 1 s (measured on a Mac by `script.rs` `files_cross_the_host_channel_as_base64`). In Node it
+is `Buffer`'s, in a page `atob` / `btoa`.
+
+**Long work: `sliced(job)`.** A conversion takes longer than a frame. `sliced(iterator)` runs a generator's work a
+slice at a time: `job.step(ms)` calls `next()` until `ms` milliseconds have passed (at least once) or the job has
+ended, and returns `{ done, value }`: the last value yielded (its progress) while it runs, the value it returned once
+it is done (and from then on). A job that throws ends; its step throws. Steps are timed by the runtime's monotonic
+clock (`performance.now()`), not `Date.now()`, which is the event's fixed time inside listeners and handlers. A step
+stops only between two `yield`s: yield often.
+
+- **Requests are presentation**, as sound is: post them from the frame script and from host listeners (and the code
+  after their `await`s), never from a handler, which is replayed and verified. What the player picked and what the
+  game stored are this device's; nothing of it is state a room agrees on.
+
+**The apps.** `threert-render play` answers both families for development and tests (`src/userfiles.rs`: the work on
+a thread of its own, one request after another in the order they were posted, the answers taken once a frame):
+
+```sh
+threert-render play game.js --assets games/openstrike \
+  --store /tmp/openstrike-store \
+  --pick "$HOME/Games/cstrike,$HOME/Downloads/de_x.bsp"
+```
+
+- `--store <dir>`: the game's store (default `<assets>/.threert/store`), also the user root of `user:` assets.
+- `files.read` with `offset` / `length` reads only that part (`Grant::read_range`).
+- `--pick <dir|file>[,<dir|file>...]` answers `files.pick` requests in order with those paths instead of a dialog: a
+  folder for `mode: "folder"`; a file, or a folder standing for the files in it (not below), for `mode: "files"`.
+  After the last one each pick is `"canceled"`; with no `--pick` at all each is `"unsupported"`. The launch lists
+  `caps: ["files", "store"]` either way.
+- On stdout (`{"type":"host","messages":[...]}`) a `store.write`'s `data` / `text` is its length (`dataLength`).
+- `threert-render live` is driven by a program that is the app: `--caps files,store` lists what that program answers
+  (it answers on stdin with `{"cmd":"host","messages":[...]}`), and `--store <dir>` is where the engine reads `user:`
+  assets from.
+- An app that embeds the engine's library can take `threert_render::userfiles` as it is: `Store` (paths, quota,
+  atomic writes), `Grant` (a folder's or files' entries; reads inside it), `Requests` (the messages' answers, with a
+  `Picker` that asks the player) and `UserFiles` (all of it as `HostServices`, on its thread), and
+  `files::set_user_root` with the game's store directory.
+- Checked: `renderer/src/userfiles.rs` tests (paths refused: `..`, absolute, bad characters, too long; the quota;
+  atomic writes under a concurrent reader; `--pick` answers in order; `files.read` refused outside the grant, and in
+  parts (a file past 64 MiB read by ranges); hidden
+  files, depth and count bounds), `files.rs` (`user:` models and sounds from the store, never outside it, missing
+  without a root), `script.rs` (base64 natively, the size bounds, a 64 MiB file within a budget), `host.rs` (caps in
+  `launch`, services as one), `packages/gameplay/test/files.test.ts`; and `games/host/files.game.ts` in `play`
+  (picked a folder, read a model from it, converted it across frames, stored it, shown from the store; a second run
+  shows it from the store without asking).
 
 ## The runtime's shape: Rust owns the world, the script engine is a guest
 
@@ -1310,6 +1483,8 @@ The kernel's read-only scene data other than triangles is two storage buffers, e
   vertices; and a browser's kernel had seven tables as the sized arrays of a struct, a second copy of each made
   every frame, and was compiled again when a table doubled. The count of bindings is as it was: 22 buffers and
   acceleration structures a stage natively, 28 of Metal's 29 with the translucency pass (29 with the loop guard's).
+  (`finish`'s records are the kernel's 23rd; the translucency pass, which does not read them, binds group 1
+  without, and stays at 29.)
   (Hardware traversal no longer binds software traversal's trees, a placeholder there; the light tiles' lists took
   the binding.)
 
@@ -1340,6 +1515,78 @@ frame found (pathtrace.wgsl "Light tiles", live.wgsl `light_tiles`):
   motion, through that frame's camera; the nearest tile's when it was off screen). They take 2 candidates from it at
   a vertex the camera sees and 1 past it, spread over the list without repeats, beside the uniform candidates (8 and
   3), which then stand for the lights the list lacks. Each candidate is weighed by the lights it stands for: the estimate is the same sum whatever a list holds.
+
+## How live differs from offline
+
+One kernel renders both (`override LIVE`). Where a live path gathers other light than an offline one, it is one of
+two kinds.
+
+**Approximations**: shortcuts a live trace takes to stay in its frame. Each is a bit of the pipeline constant
+`APPROX` (pathtrace.wgsl `A_*`, gpu.rs), so a kernel without one has no code for it. Offline has none; a live view
+has all (`gpu::A_LIVE`) unless `THREERT_APPROX=<bits>` says otherwise (`0`: the offline estimator's rays in a live
+view, the way to hold a live picture to the offline one).
+
+| bit | what a live ray does | its bias (a test pair, `-live` / `-live-exact`) | exact costs the trace |
+|---|---|---|---|
+| 1 `A_GLASS_SHADOWS` | shadow rays to the analytic lights and the sky pass glass in full, untinted | light under tinted glass 4.3 x (`shadow/glass-tint`) | a glass scene +34 % (khronos-transmission 5.20 -> 6.97 ms) |
+| 2 `A_MEDIA_SHADOWS` | only homogeneous media dim shadow rays: smoke and fire cast no shadow | light behind optical depth 1: e x (`shadow/medium`) | the Bistro slice +0.84 ms (9 %), the fire scene +0.10 |
+| 4 `A_CUTOUT_PATHS` | cutouts are opaque to rays past a camera hit's own, off mirror paths | a camera hit's own light is whole (`sky/cutout-clear-live`: its samples take the share those rays cannot bring, `light_mis`); what a cutout lights sends nothing on (`sky/cutout-bounce`: black) | Bistro +1.63 ms of 8.54 |
+| 8 `A_CUTOUT_EMITTERS` | cutouts are opaque to emitters' shadow rays | an emitter behind a clear card: black (`shadow/cutout-emitter`) | Bistro +1.35 ms |
+| 16 `A_FAR_EMITTERS` | the light tree proposes no emitter beyond 120 m; without a tree, the emitter cull (60 m, 120 m in view) | panels 150 m up: 3 % of their light (`light/emitter-far`); Kabukichō's and Tokyo's shots unchanged | Tokyo from the air 4.7 -> 9.2 ms; the 3 x 3 district +0.15 |
+
+Measured 2026-11-15 and 16 with the loop guard on. Bistro held still, ΔE against the offline render: 1.82 as
+shipped, 1.66 without the two cutout bits (+3.5 ms; Zero Day, with few cutouts, +0.3).
+Two more were removed that day: a single-query shadow ray past cutouts (it saved nothing: Bistro 10.13 ms with it,
+10.09 without, Tokyo +0.05) and the switch for the sampler below.
+
+**The live architecture**, not switches: the path ends in the radiance cache at its first bounce that is not through
+glass; the cache term, its training (4 x) and each sample (256) are clamped beside the kernel's own clamp; at most
+4 bounces; a camera ray's media are marched and composited after the trace with isotropic in-scatter from the
+cache's voxels, and later segments meet homogeneous media alone; depth of field is a post pass; translucent
+particles are lit from the cache's voxels; past a camera hit's own decisions the sampler is a hash, not Sobol
+(variance only).
+
+Where a path ends in the cache, `main` takes only what a warm voxel holds. The pixels with more to trace there (a
+training path, a cold voxel's estimate, a reflection hit's lights) leave a record of 96 bytes, and a second pass
+of the kernel, `finish`, traces them after each sample and adds their light to the pixel, one invocation a record.
+They are few and scattered: traced in `main` they held their SIMD groups, and their code cost every pixel (the
+trace 9 to 15 % faster without, Kabukichō 7). The records' buffer follows the traced size. The layout as written
+only; the merged one ends its paths in `main`.
+
+The radiance cache is held to numbers by the `cache/*` tests (a bounce off a lit floor, the same off a coated one
+and with the floor on a voxel face, two bounces in a view's first frame, a lit ground seen in a mirror, a furnace
+box, a corner): within 2 % of the offline or analytic value. A lookup whose voxel has too few samples reads the
+levels beside it, then the ones two and four levels coarser, which every training sample is added to as well; with
+none of them it traces its light there. Two limits are known and held by tests so that they are seen to move:
+
+- `cache/slit-live`: light in a gap narrower than a voxel reads 14 % bright. A path ends in the cache however short
+  its last segment; other caches of this kind go on tracing below about a voxel and a half (SHaRC), which is right
+  here and cost Bistro's trace 15 to 22 % in this kernel.
+- The cache holds no directions: it takes a mirror for a diffuse reflector of what falls on it (the ground before a
+  sunlit mirror wall 5 % bright), and a surface seen in a reflection takes the sky's light from it, unshadowed
+  below a voxel's size.
+
+## Glass
+
+A transmissive material (`transmission`, `ior`, `roughness`) is a rough dielectric interface, Walter et al. 2007
+with GGX (pathtrace.wgsl "The dielectric"): light reflects off a microfacet or refracts through it by the exact
+Fresnel reflectance there. Reflection and transmission both have a value and a density, so lights are sampled
+through frosted glass, on both sides of it, and weighed against the BSDF's rays. Total internal reflection is
+reflection and is not tinted.
+
+- Below roughness 0.05 the transmission is a delta lobe: what lies behind a clear pane is seen straight (the path
+  loop's `through`: no clamp, the live specular signal). The reflection keeps its microfacet lobe.
+- Single scattering loses energy as the roughness grows (leaving glass of roughness 0.6 at 45 degrees: R + T =
+  0.74). With energy compensation the interface is scaled by 1 / (R + T) from a table (Turquin 2019, as Cycles:
+  16 x 16 x 8 x 2 values over the cosine, the roughness, the index and the side; lib.rs `glass_energy_lut`, a
+  section of the scene's tables).
+- Shadow rays cross glass straight, weighed by a share of their own (`glass_at`), as before.
+- Not yet: thin walls (a single sheet refracts as a solid's face), absorption by distance, the radiance scaling
+  by the indices' ratio squared (it cancels over a closed solid; Cycles and glTF's formula leave it out too).
+
+Held by `glass/*`: one interface in a white sky from either side against a quadrature over microfacet normals
+done apart, with compensation 1, a lamp seen through frosted glass against the BTDF's integral, a frosted sphere
+in a furnace.
 
 ## What the kernel trusts
 
@@ -1418,7 +1665,7 @@ on the device", and differs where it says so.
   | `tables` (4) and its views `materials` (12), `lights` (13), `emitters` (14) | megabytes in a lit scene | storage: the device drew right with materials, lights and emitters as storage buffers (bindings 4 to 6 then) |
   | `words` (5): the environment's CDF, the procedural geometry's data, vertex colours | megabytes | storage; the environment's light sampling is off on Android, below |
   | `tri_verts` (1), `attrs` (2), `nodes` (3), `prev_verts` (6) | per triangle | storage (megabytes) |
-  | `accum` (11), group 1 (radiance cache, the trace's outputs, the loop guard's count) | per pixel, per cache entry | written by the kernel: cannot be uniform |
+  | `accum` (11), group 1 (radiance cache, the trace's outputs, `finish`'s records, the loop guard's count) | per pixel, per cache entry | written by the kernel: cannot be uniform |
   | group 2, the translucency pass (`timg`, `vpts`, `vcount`, `tlow`) | per pixel | written by the pass |
   | the particle passes' `systems`, `spawns`, `grid`; the grid programs' `srcs` | small, read-only | storage: other shaders, of eleven bindings at most and no acceleration structure; not known to misread (the fix on the device left them alone) |
   | the live passes (`live.wgsl`: 25 storage buffers, `ae_bins` and `ae_state` among them; at most eight a pass) | per pixel; two tiny | storage: written by the passes; the device showed their output right |

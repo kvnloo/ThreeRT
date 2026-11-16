@@ -214,8 +214,9 @@ impl LiveCore {
     }
 
     /// Light LOD: the emitter CDF weighted by distance to the camera (`emitter_lod`) and the emitter cull with its view
-    /// cone (`EmitterCull`), rebuilt when the camera is 15 m from where it was last built or has turned LIGHT_LOD_TURN
-    /// from that direction (the kernel's emitter pdfs read the same reference from the parameters).
+    /// cone (`EmitterCull`), rebuilt when the camera is 15 m from where it was last built, has turned LIGHT_LOD_TURN
+    /// from that direction, or sees another cone (its lens, the view's shape): the kernel's emitter pdfs read the same
+    /// reference from the parameters.
     pub(super) fn update_light_lod(&mut self) {
         let d0 = LIGHT_LOD_D0;
         let (w, h) = (self.w, self.h);
@@ -227,15 +228,18 @@ impl LiveCore {
         let r = glam::Vec3::new(b.light_lod[0], b.light_lod[1], b.light_lod[2]);
         let dir = glam::Vec3::new(b.lod_view[0], b.lod_view[1], b.lod_view[2]);
         let turned = b.emit_power[2] > 0.0 && dir.dot(self.cam.fwd) < LIGHT_LOD_TURN.to_radians().cos();
-        if b.light_lod[3] > 0.0 && r.distance(self.cam.pos) < 15.0 && !turned {
+        // The frustum's half-diagonal: tan = tan(fov / 2) x sqrt(1 + aspect^2).
+        let half = (self.cam.tan_half_fov * (1.0 + (w as f32 / h as f32).powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
+        let cone = half.min(std::f32::consts::PI).cos();
+        if b.light_lod[3] > 0.0 && r.distance(self.cam.pos) < 15.0 && !turned && b.lod_view[3] == cone {
             return;
         }
         b.light_lod = [self.cam.pos.x, self.cam.pos.y, self.cam.pos.z, d0];
-        b.emit_power[1] = EMITTER_CULL;
-        b.emit_power[2] = EMITTER_CULL * EMITTER_CULL_VIEW;
-        // The frustum's half-diagonal: tan = tan(fov / 2) x sqrt(1 + aspect^2).
-        let half = (self.cam.tan_half_fov * (1.0 + (w as f32 / h as f32).powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
-        b.lod_view = [self.cam.fwd.x, self.cam.fwd.y, self.cam.fwd.z, half.min(std::f32::consts::PI).cos()];
+        // (A_FAR_EMITTERS: the cull is the scenes' without a light tree; without it every emitter is proposed.)
+        let cull = if self.sc.up.kernel.approx & gpu::A_FAR_EMITTERS != 0 { EMITTER_CULL } else { 0.0 };
+        b.emit_power[1] = cull;
+        b.emit_power[2] = cull * EMITTER_CULL_VIEW;
+        b.lod_view = [self.cam.fwd.x, self.cam.fwd.y, self.cam.fwd.z, cone];
         // Power edits held back for the emitter worker land first (its job in flight was built for the old reference:
         // dropped), so the CDF built here has the powers the objects hold and the reference the kernel reads.
         self.land_powers_now();
@@ -252,6 +256,10 @@ impl LiveCore {
         self.take_emitters();
         let (w, h) = (self.w, self.h);
         let (iw, ih) = self.internal_size();
+        self.ensure_deferred(iw as u64 * ih as u64);
+        if self.sc.up.translucent.is_some() {
+            self.targets.translucent_low(&self.g);
+        }
         let now = Instant::now();
         // Lockstep (benchmarks) renders at a fixed frame time, whatever the wall clock says.
         self.frame_dt = self.fixed_dt.unwrap_or_else(|| now.duration_since(self.last_frame).as_secs_f32());
@@ -260,7 +268,6 @@ impl LiveCore {
         self.update_light_lod();
         // A camera cut (a jump no camera makes in one frame: 2 m or 30 degrees) is not motion: no blur (UE: bCameraCut).
         let cut = (self.cam.pos - self.prev_cam.pos).length() > 2.0 || self.cam.fwd.dot(self.prev_cam.fwd) < 0.866;
-        self.cold_frames = if self.reset || cut { 0 } else { self.cold_frames.saturating_add(1) };
         // (Objects moved this frame: re-posed triangles or moved instances, e.g. walkers in a shared pose.)
         let blur = !self.motion_blur_off && self.blur.0 > 0.0 && (moved || self.reposed || self.pose_reposed || self.inst_moved) && !cut;
         // Camera motion is reprojected exactly (disocclusions are rejected per pixel), so history survives motion;
@@ -343,8 +350,10 @@ impl LiveCore {
         let pipeline = g.pipeline(&self.sc.up.kernel, true);
         // (No media pass while every medium is hidden: a pool of idle fireballs costs the frame nothing.)
         let media = self.sc.up.kernel.features & gpu::F_MEDIA != 0 && self.sc.up.media_hidden.borrow().iter().any(|h| !h);
-        let media_train = (media && self.cache.is_some()).then(|| g.media_pipeline(&self.sc.up.kernel, "media_train"));
-        let media_composite = media.then(|| g.media_pipeline(&self.sc.up.kernel, "media_composite"));
+        let media_train = (media && self.cache.is_some()).then(|| g.kernel_pass(&self.sc.up.kernel, "media_train"));
+        let media_composite = media.then(|| g.kernel_pass(&self.sc.up.kernel, "media_composite"));
+        // The pixels a sample's trace leaves at the radiance cache (pathtrace.wgsl `finish`).
+        let finish = self.targets.kernel.deferred.as_ref().filter(|_| self.cache.is_some()).map(|d| (g.kernel_pass(&self.sc.up.kernel, "finish"), d));
         // This frame's sub-pixel jitter (Halton 2, 3), every camera ray's and the raster visibility pass's: 8 phases at
         // full resolution, as many more as an output pixel has fewer traced ones (8 / scale^2: the upscaler needs each
         // output pixel visited), in the 12 bits a side the samples carry it in.
@@ -380,8 +389,7 @@ impl LiveCore {
                 // Light-sampled particles (sparks: Particles emitterArea) move their light every frame: the cache and
                 // the temporal pass keep the short history of a lighting edit while the scene has them.
                 let lit = self.live_lighting();
-                let cold = if self.cold_frames >= COLD_FALLBACK_FRAMES { 1 } else { 0 };
-                p.cache = [1.0, CACHE_SAMPLES, if lit { CACHE_FRAMES_LIT } else { CACHE_FRAMES }, (cache_flags() | cold) as f32];
+                p.cache = [1.0, CACHE_SAMPLES, if lit { CACHE_FRAMES_LIT } else { CACHE_FRAMES }, cache_flags() as f32];
             }
             p.time[0] = shader_time(self.time);
             p.cam_pos = [cam.pos.x, cam.pos.y, cam.pos.z, cam.tan_half_fov];
@@ -447,11 +455,19 @@ impl LiveCore {
                     (None, Some(t), Some(slot)) if k == 0 => Some(wgpu::ComputePassTimestampWrites { query_set: &t.queries, beginning_of_pass_write_index: Some(slot as u32 * 8), end_of_pass_write_index: Some(slot as u32 * 8 + 1) }),
                     _ => None,
                 };
+                if let Some((_, d)) = &finish {
+                    e.clear_buffer(&d.buffer, d.offset, Some(4));
+                }
                 let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("live trace"), timestamp_writes: tw });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &self.sc.up.bg, &[]);
                 pass.set_bind_group(1, &self.kernel_bg, &[]);
                 pass.dispatch_workgroups(iw.div_ceil(8), ih.div_ceil(8), 1);
+                // (Rows over every traced pixel: the invocations past the records' count leave at once.)
+                if let Some((f, _)) = &finish {
+                    pass.set_pipeline(f);
+                    pass.dispatch_workgroups(gpu::DEFERRED_ROW / 64, (iw * ih).div_ceil(gpu::DEFERRED_ROW), 1);
+                }
                 // Participating media: their volume voxels trained after the trace (pathtrace.wgsl media_train), and
                 // camera rays through media once the frame's samples are traced (media_composite). In the trace's pass
                 // and timing; profiled, the frame's last sample's media passes are a pass of their own (`media`).
@@ -499,23 +515,23 @@ impl LiveCore {
             cur: cam.uniform(self.aspect),
             prev: self.prev_cam.uniform(self.aspect),
             size: [w, h, self.frame, self.reset as u32],
-            misc: [self.sc.exposure, cap, self.vignette, (self.bloom.1.iter().sum::<f32>() > 0.0) as u32 as f32],
+            misc: [self.view.exposure, cap, self.vignette, (self.bloom.1.iter().sum::<f32>() > 0.0) as u32 as f32],
             // misc2.z: motion blur, this frame's motion (pixels) -> blur length. UE (PostProcessMotionBlur.cpp,
             // UpdateMotionBlurTimeScale) blurs over +- amount / 2 x the motion x (1 / target FPS) / frame time, the
             // actual frame time without a target. 0 while nothing moves (the pass then costs nothing).
             misc2: [1.0, SAMPLE_CEILING, if !blur { 0.0 } else if self.blur.1 > 0.0 { self.blur.0 / (self.blur.1 * self.frame_dt.clamp(1.0 / 240.0, 0.25)) } else { self.blur.0 }, spp.max(1) as f32],
             mode: [self.view_mode, 0, self.live_lighting() as u32, 0],
             post: self.post,
-            ae: self.sc.exposure_settings.ae,
-            ae2: self.sc.exposure_settings.ae2,
-            ae3: [self.sc.exposure_settings.speed[0], self.sc.exposure_settings.speed[1], self.frame_dt.clamp(1.0 / 240.0, 0.25), (self.reset || self.frame == 0 || exposure_snap()) as u32 as f32],
-            lx: self.sc.exposure_settings.lx,
+            ae: self.view.exposure_settings.ae,
+            ae2: self.view.exposure_settings.ae2,
+            ae3: [self.view.exposure_settings.speed[0], self.view.exposure_settings.speed[1], self.frame_dt.clamp(1.0 / 240.0, 0.25), (self.reset || self.frame == 0 || exposure_snap()) as u32 as f32],
+            lx: self.view.exposure_settings.lx,
             isz: [iw, ih, self.prev_isz.0, self.prev_isz.1],
             br: [r[0], r[1], r[2], r[3]],
             br2: [r[4], r[5], 0.0, 0.0],
             bt: [t[0], t[1], t[2], t[3]],
             bt2: [t[4], t[5], 0.0, 0.0],
-            dof: dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, h),
+            dof: dof_params(self.view.dof.as_ref(), cam.tan_half_fov, w, h),
             jit: [jitter.0, jitter.1, 0.0, 0.0],
             state: [1 - self.frame % 2, 0, 0, 0],
             lt: [tile_at.0, tile_at.1, 0, layout::light_tiles(iw)],
@@ -532,13 +548,13 @@ impl LiveCore {
             let low = (iw, ih) != (w, h);
             let tp = gpu::TranslucentParams { size: [w, h, t.first, 1], view: [iw, ih, gpu::VOLUME_TRAIN_CAP, low as u32], misc: [VOLUME_TRAIN_SHARE, translucent_hidden(self.frame) as u32 as f32, 0.0, 0.0] };
             g.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
-            (pipes, g.translucent_bind_group(t, target), &t.count)
+            (pipes, g.translucent_bind_group(t, target, self.targets.translucent_low.as_ref().expect("made at the frame's start")), &t.count)
         });
         // The pass (train = false) or the volume training (train = true).
         let tl_dispatch = |pass: &mut wgpu::ComputePass, train: bool| {
             if let Some((pipes, tbg, _)) = &tl {
                 pass.set_bind_group(0, &self.sc.up.bg, &[]);
-                pass.set_bind_group(1, &self.kernel_bg, &[]);
+                pass.set_bind_group(1, self.tl_kernel_bg.as_ref().unwrap(), &[]);
                 pass.set_bind_group(2, tbg, &[]);
                 if train {
                     pass.set_pipeline(&pipes.train);
@@ -574,7 +590,7 @@ impl LiveCore {
                 let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &p.queries, beginning_of_pass_write_index: Some(q), end_of_pass_write_index: Some(q + 1) }) });
                 if (self.view_mode != 0 || !layout::VIEW_MODE_PASSES.contains(name)) && (tiles_on || *name != layout::LIGHT_TILES_PASS) {
                     pass.set_pipeline(pipe);
-                    pass.set_bind_group(0, &self.sc.bgs[k], &[]);
+                    pass.set_bind_group(0, &self.targets.bgs[k], &[]);
                     let (gw, gh) = grid.size((w, h), (iw, ih), self.prev_isz);
                     pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
                 }
@@ -598,7 +614,7 @@ impl LiveCore {
                     continue;
                 }
                 pass.set_pipeline(pipe);
-                pass.set_bind_group(0, &self.sc.bgs[k], &[]);
+                pass.set_bind_group(0, &self.targets.bgs[k], &[]);
                 let (gw, gh) = grid.size((w, h), (iw, ih), self.prev_isz);
                 pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
                 if *name == "upscale" {
