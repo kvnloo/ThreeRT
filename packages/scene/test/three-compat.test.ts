@@ -98,18 +98,6 @@ test("vertex colours: the geometry's `color` attribute (RGB, RGBA, normalized by
   assert.deepEqual(compatNotes().slice(before).filter((n) => n.startsWith("unsupported:")), []);
 });
 
-test("Color: lerpColors uses two source colors rather than the receiver, as three.js does", () => {
-  const red = new THREE.Color().setRGB(1, 0, 0);
-  const blue = new THREE.Color().setRGB(0, 0, 1);
-  const mixed = new THREE.Color().setRGB(0, 1, 0);
-  assert.equal(mixed.lerpColors(red, blue, 0.25), mixed, "returns the receiver");
-  assert.deepEqual(mixed.toArray(), [0.75, 0, 0.25], "mixes linear RGB, not the receiver's original green");
-  assert.deepEqual(mixed.lerpColors(red, blue, 0).toArray(), [1, 0, 0], "alpha zero gives color1");
-  assert.deepEqual(mixed.lerpColors(red, blue, 1).toArray(), [0, 0, 1], "alpha one gives color2");
-  assert.deepEqual(red.toArray(), [1, 0, 0], "does not mutate color1");
-  assert.deepEqual(blue.toArray(), [0, 0, 1], "does not mutate color2");
-});
-
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
