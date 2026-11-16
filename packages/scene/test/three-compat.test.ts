@@ -98,6 +98,154 @@ test("vertex colours: the geometry's `color` attribute (RGB, RGBA, normalized by
   assert.deepEqual(compatNotes().slice(before).filter((n) => n.startsWith("unsupported:")), []);
 });
 
+test("Euler.order: changing the order notifies and keeps Object3D.quaternion in sync", () => {
+  const euler = new THREE.Euler(0.2, 0.3, 0.4);
+  let changes = 0;
+  euler._onChange = () => { changes++; };
+  euler.order = "YXZ";
+  assert.equal(changes, 1, "assigning order invokes the change callback once");
+  euler.set(0.2, 0.3, 0.4, "ZXY");
+  assert.equal(changes, 2, "set still invokes its callback just once");
+  euler.setFromQuaternion(new THREE.Quaternion(), false);
+  assert.equal(changes, 2, "the suppressed quaternion conversion does not invoke a callback");
+
+  const object = new THREE.Object3D();
+  object.rotation.set(Math.PI / 2, Math.PI / 2, 0, "XYZ");
+  assert.ok(Math.abs(object.quaternion.z - 0.5) < 1e-12, "XYZ begins with +0.5 z");
+  object.rotation.order = "YXZ";
+  const expected = [0.5, 0.5, -0.5, 0.5];
+  assert.ok(object.quaternion.toArray().every((value, i) => Math.abs(value - expected[i]) < 1e-12),
+    "YXZ recomposes the quaternion to (0.5, 0.5, -0.5, 0.5)");
+  assert.equal(object.rotation.order, "YXZ", "setting the order preserves the chosen order");
+});
+
+test("Euler: six-order rotation-matrix and quaternion conversions preserve orientation, order, and notifications", () => {
+  const orders = ["XYZ", "YXZ", "ZXY", "ZYX", "YZX", "XZY"] as const;
+  for (const order of orders) {
+    const original = new THREE.Euler(0.31, -0.42, 0.57, order);
+    const q = new THREE.Quaternion().setFromEuler(original);
+    const matrix = new THREE.Matrix4().makeRotationFromQuaternion(q);
+    const fromQuaternion = new THREE.Euler(0, 0, 0, order);
+    let changes = 0;
+    fromQuaternion._onChange = () => { changes++; };
+    assert.equal(fromQuaternion.setFromQuaternion(q), fromQuaternion, order);
+    assert.equal(fromQuaternion.order, order, "quaternion conversion retains the chosen order");
+    assert.equal(changes, 1, "conversion notifies exactly once");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(fromQuaternion).dot(q)) - 1) < 1e-12, order);
+
+    const fromMatrix = new THREE.Euler(0, 0, 0, "XYZ");
+    let matrixChanges = 0;
+    fromMatrix._onChange = () => { matrixChanges++; };
+    assert.equal(fromMatrix.setFromRotationMatrix(matrix, order, false), fromMatrix, order);
+    assert.equal(fromMatrix.order, order, "matrix conversion accepts an explicit order");
+    assert.equal(matrixChanges, 0, "suppressed conversion must not notify");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(fromMatrix).dot(q)) - 1) < 1e-12, order);
+    fromMatrix.setFromRotationMatrix(matrix, order);
+    assert.equal(matrixChanges, 1, "non-suppressed conversion notifies once");
+
+    const object = new THREE.Object3D();
+    object.rotation.set(0.13, -0.29, 0.41, order);
+    object.quaternion.copy(q);
+    assert.equal(object.rotation.order, order, "Object3D quaternion-to-Euler sync must not reset order");
+    assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(object.rotation).dot(q)) - 1) < 1e-12, order);
+  }
+
+  const target = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.2, -0.3, 0.4, "ZYX"));
+  const euler = new THREE.Euler();
+  let calls = 0;
+  euler._onChange = () => { calls++; };
+  euler.setFromQuaternion(target, "ZYX", false);
+  assert.equal(euler.order, "ZYX", "explicit order overrides the previous order");
+  assert.equal(calls, 0, "three.js-style update=false is silent");
+  euler.setFromQuaternion(target, "YZX");
+  assert.equal(euler.order, "YZX");
+  assert.equal(calls, 1);
+  euler.setFromQuaternion(target, false);
+  assert.equal(euler.order, "YZX", "legacy (quaternion, false) retains order");
+  assert.equal(calls, 1, "legacy suppression is silent");
+});
+
+test("Euler: both gimbal-lock signs recompose across all six rotation orders", () => {
+  const cases = [
+    ["XYZ", "y", "z"], ["YXZ", "x", "z"], ["ZXY", "x", "y"],
+    ["ZYX", "y", "x"], ["YZX", "z", "x"], ["XZY", "z", "y"],
+  ] as const;
+  for (const [order, middleAxis, zeroedAxis] of cases) {
+    for (const sign of [-1, 1]) {
+      const original = new THREE.Euler(0.23, -0.39, 0.51, order);
+      original[middleAxis] = sign * Math.PI / 2;
+      const q = new THREE.Quaternion().setFromEuler(original);
+      const matrix = new THREE.Matrix4().makeRotationFromQuaternion(q);
+      const fromMatrix = new THREE.Euler(0, 0, 0, order).setFromRotationMatrix(matrix);
+      const fromQuaternion = new THREE.Euler(0, 0, 0, order).setFromQuaternion(q);
+      for (const converted of [fromMatrix, fromQuaternion]) {
+        assert.equal(converted.order, order);
+        assert.ok(Math.abs(converted[middleAxis] - sign * Math.PI / 2) < 1e-7,
+          `${order} singular middle-axis angle (${sign})`);
+        assert.ok(Math.abs(converted[zeroedAxis]) < 1e-12, `${order} zeroes its redundant axis (${sign})`);
+        assert.ok(Math.abs(Math.abs(new THREE.Quaternion().setFromEuler(converted).dot(q)) - 1) < 1e-12,
+          `${order} at ${sign} pi/2 preserves the original rotation`);
+      }
+    }
+  }
+});
+
+test("Euler: copy, clone and equals preserve order with exactly one notification", () => {
+  const source = new THREE.Euler(Math.PI / 2, Math.PI / 2, 0, "YXZ");
+  const target = new THREE.Euler(-1, -2, -3, "XYZ");
+  let changes = 0;
+  target._onChange = () => { changes++; };
+  assert.equal(target.copy(source), target, "copy returns the target");
+  assert.equal(changes, 1, "copy notifies exactly once");
+  assert.deepEqual(target.toArray(), [Math.PI / 2, Math.PI / 2, 0, "YXZ"]);
+  assert.ok(target.equals(source), "same angles and order compare equal");
+  assert.equal(target.equals(new THREE.Euler(Math.PI / 2, Math.PI / 2, 0, "XYZ")), false,
+    "same angles in a different order are not equal");
+
+  const clone = target.clone();
+  assert.ok(clone !== target && clone.equals(target), "clone has independent identity and identical components");
+  clone.order = "ZXY";
+  assert.equal(target.order, "YXZ", "editing the clone cannot edit its source");
+  assert.equal(changes, 1, "the clone does not inherit its source's change listener");
+  assert.equal(clone.equals(target), false);
+
+  class CustomEuler extends THREE.Euler {}
+  assert.ok(new CustomEuler(1, 2, 3, "YZX").clone() instanceof CustomEuler,
+    "like three.js, clone preserves the Euler subclass");
+
+  const object = new THREE.Object3D();
+  object.rotation.copy(source);
+  assert.equal(object.rotation.order, "YXZ");
+  const expected = [0.5, 0.5, -0.5, 0.5];
+  assert.ok(object.quaternion.toArray().every((value, i) => Math.abs(value - expected[i]) < 1e-12),
+    "copy notifies Object3D to recompose its YXZ quaternion");
+});
+
+test("Euler: fromArray optional order and toArray offset match three.js", () => {
+  const euler = new THREE.Euler(9, 8, 7, "ZXY");
+  let changes = 0;
+  euler._onChange = () => { changes++; };
+  assert.equal(euler.fromArray([0.1, -0.2, 0.3]), euler);
+  assert.deepEqual(euler.toArray(), [0.1, -0.2, 0.3, "ZXY"],
+    "three numbers retain the existing order");
+  assert.equal(changes, 1, "three-component import notifies once");
+
+  assert.equal(euler.fromArray([Math.PI / 2, Math.PI / 2, 0, "YXZ"]), euler);
+  assert.equal(changes, 2, "four-component import also notifies once");
+  const output = [99, 99, 99, 99, 99, 99];
+  assert.equal(euler.toArray(output, 1), output, "toArray returns the supplied output array");
+  assert.deepEqual(output, [99, Math.PI / 2, Math.PI / 2, 0, "YXZ", 99],
+    "only the four slots after the offset are written");
+  assert.equal(changes, 2, "serialization is read-only");
+
+  const object = new THREE.Object3D();
+  object.rotation.fromArray(euler.toArray());
+  assert.equal(object.rotation.order, "YXZ");
+  const expected = [0.5, 0.5, -0.5, 0.5];
+  assert.ok(object.quaternion.toArray().every((value, i) => Math.abs(value - expected[i]) < 1e-12),
+    "import notifies Object3D and produces the YXZ orientation");
+});
+
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
