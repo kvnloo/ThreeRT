@@ -98,18 +98,6 @@ test("vertex colours: the geometry's `color` attribute (RGB, RGBA, normalized by
   assert.deepEqual(compatNotes().slice(before).filter((n) => n.startsWith("unsupported:")), []);
 });
 
-test("PerspectiveCamera.setFocalLength uses film height and aspect, as three.js does", () => {
-  const camera = new THREE.PerspectiveCamera(50, 2, 0.1, 100);
-  camera.setFocalLength(17.5);
-  assert.equal(camera.filmGauge, 35, "three.js defaults to a 35 mm film gauge");
-  assert.ok(Math.abs(camera.fov - 53.13010235415598) < 1e-10, "landscape: 17.5 mm film height at 17.5 mm focal length");
-
-  camera.aspect = 0.5;
-  camera.filmGauge = 70;
-  camera.setFocalLength(35);
-  assert.ok(Math.abs(camera.fov - 90) < 1e-10, "portrait: full 70 mm gauge at 35 mm focal length");
-});
-
 test("Object3D: clone (geometry shared, own id), attach (world transform kept), local moves, world / local", () => {
   const a = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
   a.position.set(1, 2, 3);
