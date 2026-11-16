@@ -2,27 +2,32 @@
 //! denoise + UE post) presented straight to a vsync'd swapchain at 60 fps. No encoding, no network.
 //!
 //!   threert-render play <game bundle.js> [--assets <dir>] [--room id] [--width 1280 --height 720 --fps 60]
+//!                       [--launch '{..}'] [--store <dir>] [--pick <dir|file>[,...]]
 //!
 //! The game runs in this process (script.rs): its code builds the scene, key bindings and clicks run its handlers, its
-//! frame script animates. `view` is the same window.
+//! frame script animates. `view` is the same window. The view is the window's pixels: resizing the window, or moving
+//! it to a display of another density, resizes the view (`fit`).
 //!
 //! A game that reads input (`pointer` in its definition; docs/RUNTIME.md "Input") has the keys, the pointer and the
 //! camera to itself: the window sends it an `input` message every frame and keeps none of the controls below but
 //! Esc. With `pointer: "look"` a click captures the pointer (its motion is the game's look), Esc lets go of it, and
 //! Esc again quits. The window is the app of the host channel: `--launch '{"room":"K7Q4MZ"}'` is the `launch`
 //! message, `--sensitivity 1.5` scales the look, `--hud-log` prints the HUD the game describes (the window draws
-//! none), the game's `net.*` messages are the binary's sockets and HTTP (src/net.rs), and its `audio.*` messages are
-//! played (src/audio, the `audio` feature: the ears are the camera of each frame).
+//! none; a selectable table's rows are chosen on stdin with a `hud.choose` host message, which it prints), the game's `net.*` messages are the binary's sockets and HTTP (src/net.rs), and its `audio.*` messages are
+//! played (src/audio, the `audio` feature: the ears are the camera of each frame). Its `files.*` and `store.*` are
+//! answered from `--pick <dir|file>[,...]` (the player's picks, in order) and `--store <dir>` (the game's storage,
+//! `<assets>/.threert/store` by default; `user:` assets resolve there): src/userfiles.rs.
 //!
 //! Controls: left-drag orbit · right/shift-drag pan · wheel zoom · WASD/QE fly · R reset camera · 1/2/4/8 cap spp,
 //! 0 adaptive · P snapshot · Esc quit. Scripted over stdio:
 //!   stdin  JSON lines: {"cmd":"event","type":t,"payload":{..}} | {"cmd":"camera",...} | {"cmd":"snapshot","path":p} | {"cmd":"quit"}
+//!                      | {"cmd":"resize","width":w,"height":h} (the window's size, pixels)
 //!                      | {"cmd":"host","messages":[{"t":..}, ..]}
 //!   stdout JSON lines: {"type":"ready"} | {"type":"click","u":..,"v":..,"cam":{..},"seq":n} | {"type":"key","key":"L"}
 //!                      | {"type":"host","messages":[..]} (what the game posted)
 
 use crate::gpu;
-use crate::host::{launch_message, HostServices, InputTracker};
+use crate::host::{launch_message_with_caps, HostServices, InputTracker};
 use crate::live::{next_spp, parse_cmd, parse_scale, save_bgra, Camera, Cmd, LiveCore};
 use crate::script::GameSession;
 use anyhow::Result;
@@ -32,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
@@ -57,6 +62,11 @@ pub struct ViewArgs {
     pub hud_log: bool,
     /// `--sensitivity`: scales the pointer's motion into the game's look (1: `host::LOOK_RADIANS` a count).
     pub sensitivity: f32,
+    /// `--store <dir>`: the game's store (`store.*`, `user:` assets; docs/RUNTIME.md "Files"); `<assets>/.threert/store`
+    /// by default.
+    pub store: PathBuf,
+    /// `--pick a,b`: what the player picks, in order, for the game's `files.pick` requests (none: `"unsupported"`).
+    pub pick: Vec<PathBuf>,
 }
 
 /// Editor-style orbit camera around a target point.
@@ -88,7 +98,12 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     core: LiveCore,
     blit: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    /// The view's and the surface's sizes for the blit (`BLIT`'s `size`).
+    blit_size: wgpu::Buffer,
     blit_bg: wgpu::BindGroup,
+    /// The last frame had a surface to draw on (`acquire`): its present paces the loop.
+    shown: bool,
     home: Orbit,
     orbit: Orbit,
     tan: f32,
@@ -187,7 +202,7 @@ impl App {
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let a = &self.args;
         let window = Arc::new(
-            el.create_window(Window::default_attributes().with_title("ThreeRT live").with_inner_size(LogicalSize::new(a.width, a.height)).with_resizable(false))?,
+            el.create_window(Window::default_attributes().with_title("ThreeRT live").with_inner_size(LogicalSize::new(a.width, a.height)))?,
         );
         let g = gpu::Gpu::new()?;
         let surface = g.instance.create_surface(window.clone())?;
@@ -207,47 +222,40 @@ impl App {
             color_space: Default::default(),
         };
         surface.configure(&g.device, &config);
-        // The view is the window's physical pixels (`--width` / `--height` are its size in points): the temporal upscaler
-        // resolves to the display, and nothing is stretched after it.
+        // The view is the window's physical pixels (`--width` / `--height` are its first size in points): the temporal
+        // upscaler resolves to the display, and nothing is stretched after it.
         let (vw, vh) = (config.width, config.height);
         let (mut game, mut core) = GameSession::start(&a.bundle, &a.room, &a.assets, g, &a.presets, vw, vh)?;
         // The host channel: how the game was opened, once after setup.
-        if let Err(e) = game.host_messages(&mut core, &[launch_message(a.launch.as_ref())]) {
+        if let Err(e) = game.host_messages(&mut core, &[launch_message_with_caps(a.launch.as_ref(), &self.services.caps())]) {
             eprintln!("game: launch: {e:#}");
         }
         let pointer = game.host.pointer().map(String::from);
         if let Some(p) = &pointer {
             eprintln!("view: the game reads input (pointer: {p}){}", if p == "look" { ": click to capture the pointer, Esc lets go" } else { "" });
         }
-        core.set_display_scale(window.scale_factor() as f32);
         core.bounces = a.bounces;
-        if let Some(s) = a.scale {
-            core.set_scale(s);
-        }
+        core.set_scale(a.scale.unwrap_or(0.0));
+        core.set_display_scale(window.scale_factor() as f32);
         let d = &core.g.device;
         let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("blit"), source: wgpu::ShaderSource::Wgsl(BLIT.into()) });
-        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
-        });
+        let buffer = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[buffer(0, wgpu::BufferBindingType::Storage { read_only: true }), buffer(1, wgpu::BufferBindingType::Uniform)] });
         let pl = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let blit = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blit"),
             layout: Some(&pl),
             vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[Some(format.into())], compilation_options: wgpu::PipelineCompilationOptions { constants: &[("W", vw as f64), ("H", vh as f64), ("SW", config.width as f64), ("SH", config.height as f64)], ..Default::default() } }),
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[Some(format.into())], compilation_options: Default::default() }),
             primitive: Default::default(),
             depth_stencil: None,
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
         });
-        let blit_bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: core.targets.out.as_entire_binding() }] });
+        let blit_size = d.create_buffer(&wgpu::BufferDescriptor { label: Some("blit size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        core.g.queue.write_buffer(&blit_size, 0, bytemuck::cast_slice(&[vw as f32, vh as f32, config.width as f32, config.height as f32]));
+        let blit_bg = blit_bind_group(d, &layout, &core.targets.out, &blit_size);
         let cam = core.scene_camera();
         let home = Orbit::from_camera(&cam);
         eprintln!("view: {}x{} ({}x{} points) on {} ({}), {:?}", vw, vh, a.width, a.height, core.g.adapter_info.name, if core.g.hwrt { "HW RT" } else { "BVH" }, format);
@@ -258,7 +266,10 @@ impl App {
             config,
             core,
             blit,
+            blit_layout: layout,
+            blit_size,
             blit_bg,
+            shown: false,
             home,
             orbit: home,
             tan: cam.tan_half_fov,
@@ -446,6 +457,8 @@ impl ApplicationHandler for App {
                     s.keys.remove(&name);
                 }
             }
+            // A display of another density (the window's pixels follow: `fit`).
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => s.core.set_display_scale(scale_factor as f32),
             WindowEvent::RedrawRequested => {
                 if let Err(e) = frame(s, &self.cmds, self.services.as_mut(), &self.args, fps) {
                     eprintln!("view: {e:#}");
@@ -468,10 +481,16 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let Some(s) = &self.state else { return };
         // Present on every vsync (Fifo blocks); `frame` decides whether to render a new image or re-show the last.
-        if let Some(s) = &self.state {
+        // With nothing to draw on (the window covered or minimised) no present blocks: the loop waits for the next
+        // content frame's time, at which the game's frame runs as ever.
+        let due = s.last + Duration::from_secs_f64(1.0 / self.args.fps as f64);
+        if s.shown || Instant::now() >= due {
             s.window.request_redraw();
             el.set_control_flow(ControlFlow::Poll);
+        } else {
+            el.set_control_flow(ControlFlow::WaitUntil(due));
         }
     }
 }
@@ -485,9 +504,68 @@ fn button_number(b: MouseButton) -> Option<u8> {
     }
 }
 
+/// The surface and the view at the window's size, once the window's pixels are no longer the surface's (it was
+/// resized, or moved to a display of another density): whether the view changed. Nothing to fit while the window has
+/// no pixels (minimised). A size the device does not hold as a view: the view stays, stretched to the window.
+fn fit(s: &mut State) -> bool {
+    let size = s.window.inner_size();
+    if size.width == 0 || size.height == 0 || (size.width, size.height) == (s.config.width, s.config.height) {
+        return false;
+    }
+    (s.config.width, s.config.height) = (size.width, size.height);
+    s.surface.configure(&s.core.g.device, &s.config);
+    let before = (s.core.w, s.core.h);
+    if let Err(e) = s.core.resize(size.width, size.height) {
+        eprintln!("view: {e:#}");
+    }
+    s.core.g.queue.write_buffer(&s.blit_size, 0, bytemuck::cast_slice(&[s.core.w as f32, s.core.h as f32, size.width as f32, size.height as f32]));
+    s.blit_bg = blit_bind_group(&s.core.g.device, &s.blit_layout, &s.core.targets.out, &s.blit_size);
+    (s.core.w, s.core.h) != before
+}
+
+/// The surface's texture to draw this frame on, each answer of `get_current_texture` taken as wgpu says. None when
+/// there is nothing to draw on for now: the window has no pixels (minimised) or is covered, or its surface was no
+/// longer the window's and is configured again (made again, if lost) for the next frame. Said once when a window
+/// that was drawn no longer is: a driver that waits for a snapshot of a covered window sees why none comes.
+fn acquire(s: &mut State) -> Result<Option<wgpu::SurfaceTexture>> {
+    use wgpu::CurrentSurfaceTexture as T;
+    let size = s.window.inner_size();
+    let (tex, why) = if size.width == 0 || size.height == 0 {
+        (None, "no pixels")
+    } else {
+        match s.surface.get_current_texture() {
+            // (Suboptimal: another size, which `fit` configures before the next frame.)
+            T::Success(t) | T::Suboptimal(t) => (Some(t), ""),
+            T::Timeout => (None, "timeout"),
+            T::Occluded => (None, "occluded"),
+            T::Outdated => {
+                s.surface.configure(&s.core.g.device, &s.config);
+                (None, "outdated")
+            }
+            T::Lost => {
+                s.surface = s.core.g.instance.create_surface(s.window.clone())?;
+                s.surface.configure(&s.core.g.device, &s.config);
+                (None, "lost")
+            }
+            T::Validation => return Err(anyhow::anyhow!("surface: a validation error")),
+        }
+    };
+    if s.shown && tex.is_none() {
+        eprintln!("view: nothing to draw on ({why})");
+    }
+    s.shown = tex.is_some();
+    Ok(tex)
+}
+
+fn blit_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, out: &wgpu::Buffer, size: &wgpu::Buffer) -> wgpu::BindGroup {
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("blit"), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: size.as_entire_binding() }] })
+}
+
 fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServices, args: &ViewArgs, fps: u32) -> Result<()> {
-    // Content runs at `fps` regardless of the display's refresh rate (120 Hz panels re-show the last image).
-    let render_new = s.last.elapsed() >= Duration::from_secs_f64(1.0 / fps as f64) - Duration::from_millis(2);
+    let resized = fit(s);
+    // Content runs at `fps` regardless of the display's refresh rate (120 Hz panels re-show the last image; a resized
+    // view has none).
+    let render_new = resized || s.last.elapsed() >= Duration::from_secs_f64(1.0 / fps as f64) - Duration::from_millis(2);
     if !render_new {
         return reshow(s);
     }
@@ -516,6 +594,10 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
             }
             Cmd::SppCap(n) => s.spp_cap = n,
             Cmd::Scale(v) => s.core.set_scale(v),
+            Cmd::Resize(w, h) => {
+                // The window's size; the view follows it (`fit`).
+                let _ = s.window.request_inner_size(PhysicalSize::new(w, h));
+            }
             Cmd::Event(kind, payload) => {
                 let cam = s.core.scene_camera();
                 s.game.event(&mut s.core, &kind, payload)?;
@@ -569,10 +651,15 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
         services.post(p);
         if args.hud_log && p["t"] == "hud" {
             eprintln!("hud: {}", p["hud"]);
+            // (The window draws no HUD: a menu's row is chosen on stdin, as an app that draws it sends the click.)
+            for (item, title, rows) in crate::host::hud_selectables(&p["hud"]) {
+                eprintln!("hud: selectable table {item} \"{title}\", {rows} rows: choose one with {}", serde_json::json!({ "cmd": "host", "messages": [crate::host::hud_choose_message(&item, 0)] }));
+            }
         }
     }
     if !posts.is_empty() {
-        emit(serde_json::json!({ "type": "host", "messages": posts }));
+        // (A file the game stores is its length here, not tens of megabytes of base64.)
+        emit(serde_json::json!({ "type": "host", "messages": posts.iter().map(crate::userfiles::without_payload).collect::<Vec<_>>() }));
     }
     // A game that reads input has the camera to itself (the view follows it with every commit); any other game is
     // looked at through the window's orbit camera, which follows the game's when a handler moves it.
@@ -589,13 +676,8 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
         }
     }
 
-    let tex = match s.surface.get_current_texture() {
-        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-        other => {
-            s.surface.configure(&s.core.g.device, &s.config);
-            return Err(anyhow::anyhow!("surface: {other:?}"));
-        }
-    };
+    // (Nothing to draw on: the game's frame ran.)
+    let Some(tex) = acquire(s)? else { return Ok(()) };
     let view = tex.texture.create_view(&Default::default());
     let (blit, bg) = (&s.blit, &s.blit_bg);
     let snap = s.snapshot.take().map(|p| {
@@ -678,10 +760,7 @@ fn follow_game_camera(s: &mut State, before: Camera) {
 
 /// Re-present the last rendered image (no path tracing) on refreshes between content frames.
 fn reshow(s: &mut State) -> Result<()> {
-    let tex = match s.surface.get_current_texture() {
-        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-        _ => return Ok(()),
-    };
+    let Some(tex) = acquire(s)? else { return Ok(()) };
     let view = tex.texture.create_view(&Default::default());
     let mut e = s.core.g.device.create_command_encoder(&Default::default());
     {
@@ -704,11 +783,9 @@ fn reshow(s: &mut State) -> Result<()> {
 }
 
 const BLIT: &str = r#"
-override W: f32 = 1280.0;
-override H: f32 = 720.0;
-override SW: f32 = 1280.0;
-override SH: f32 = 720.0;
+struct Size { view: vec2<f32>, surface: vec2<f32> }
 @group(0) @binding(0) var<storage, read> px: array<u32>;
+@group(0) @binding(1) var<uniform> size: Size;
 
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -716,15 +793,13 @@ override SH: f32 = 720.0;
 }
 
 fn texel(x: i32, y: i32) -> vec4<f32> {
-    let c = px[u32(clamp(y, 0, i32(H) - 1)) * u32(W) + u32(clamp(x, 0, i32(W) - 1))];
+    let c = px[u32(clamp(y, 0, i32(size.view.y) - 1)) * u32(size.view.x) + u32(clamp(x, 0, i32(size.view.x) - 1))];
     return vec4<f32>(f32((c >> 16u) & 255u), f32((c >> 8u) & 255u), f32(c & 255u), 255.0) / 255.0;
 }
 
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    // The view's pixels are the window's (1 : 1); bilinear if the window moved to a display of another density.
-    let dims = vec2<f32>(W, H);
-    let uv = p.xy / vec2<f32>(SW, SH);
-    let q = uv * dims - 0.5;
+    // The view's pixels are the window's (1 : 1); bilinear for a view that could not take the window's size (`fit`).
+    let q = p.xy / size.surface * size.view - 0.5;
     let f = fract(q);
     let i = vec2<i32>(floor(q));
     let a = mix(texel(i.x, i.y), texel(i.x + 1, i.y), f.x);
@@ -775,5 +850,7 @@ pub fn parse_args(args: &[String], presets: &Path) -> Result<ViewArgs> {
         launch: crate::live::parse_launch(flag("--launch").as_deref())?,
         hud_log: args.iter().any(|a| a == "--hud-log"),
         sensitivity: flag("--sensitivity").map(|v| v.parse::<f32>()).transpose()?.filter(|v| v.is_finite()).unwrap_or(1.0),
+        store: flag("--store").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(flag("--assets").unwrap_or_else(|| ".".into())).join(".threert/store")),
+        pick: flag("--pick").map(|p| p.split(',').filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default(),
     })
 }
