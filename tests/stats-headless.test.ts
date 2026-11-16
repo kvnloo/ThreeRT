@@ -2,7 +2,10 @@
 // are built before this test; unlike rendering, stats must need no display or GPU.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { VoxelGrid } from "@threert/voxel";
+import { encodeProcAsset } from "../tools/lib/proc-asset.ts";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
@@ -21,13 +24,13 @@ function count(stats: Stats, field: Field): number {
   return value;
 }
 
-function readStats(scene: string): Stats {
+function readStats(scene: string, assets = root): Stats {
   const bundle = join(root, "out", "bundles", `${scene}.js`);
   assert.ok(existsSync(binary), `missing ${binary}: build the release renderer first`);
-  assert.ok(existsSync(bundle), `missing ${bundle}: run node tools/build-scenes.ts cornell-box instancing sun-room`);
+  assert.ok(existsSync(bundle), `missing ${bundle}: build that scene bundle before running this test`);
 
   // A displayless process must still characterise all three scenes.
-  const result = spawnSync(binary, ["stats", bundle, "--assets", root, "--room", "local", "--seed", "17"], {
+  const result = spawnSync(binary, ["stats", bundle, "--assets", assets, "--room", "local", "--seed", "17"], {
     cwd: root,
     encoding: "utf8",
     timeout: 120_000,
@@ -79,3 +82,32 @@ for (const scene of ["cornell-box", "instancing", "sun-room"] as const) {
     }
   });
 }
+
+test("stats realizes native voxel geometry like the render scene path", () => {
+  // Same TRTPROC encoding as tools/voxel-level/generate.ts, but no external benchmark assets.
+  const assets = mkdtempSync(join(tmpdir(), "threert-voxel-parity-"));
+  try {
+    const dir = join(assets, "stats-voxel");
+    mkdirSync(dir, { recursive: true });
+    const grid = new VoxelGrid(0.1);
+    grid.set(0, 0, 0, 1);
+    const { boxes, data } = grid.layout("object");
+    writeFileSync(join(dir, "single.tpg"), encodeProcAsset(boxes, data));
+
+    const first = readStats("stats-voxel", assets);
+    const again = readStats("stats-voxel", assets);
+    for (const field of fields) {
+      assert.equal(count(first, field), count(again, field), `voxel: non-deterministic ${field}`);
+    }
+    // One isolated occupied cell exposes six quads, each divided into two triangles.
+    // Before voxel realization stats sees none of these triangles; Hosts::scene realizes them.
+    assert.equal(count(first, "triangles"), 12);
+    assert.equal(count(first, "triangles"), count(first, "flat_triangles") + count(first, "instanced_triangles"));
+    assert.ok(count(first, "objects") >= 1);
+    assert.ok(count(first, "geometries") >= 1);
+    assert.ok(count(first, "materials") >= 2);
+    assert.equal(count(first, "emitters"), 0);
+  } finally {
+    rmSync(assets, { recursive: true, force: true });
+  }
+});

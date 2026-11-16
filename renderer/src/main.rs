@@ -81,6 +81,16 @@ struct Hosts {
     hosts: HashMap<String, (ScriptHost, serde_json::Value)>,
 }
 
+/// Realize native voxel levels after script setup, before either rendering or headless stats.
+fn realize_voxel_level(host: &ScriptHost, assets: &Path) -> Result<()> {
+    let realized = host.voxels.borrow_mut().realize(&mut host.world.borrow_mut(), &mut host.physics.borrow_mut(), assets)?;
+    if let Some(r) = realized {
+        eprintln!("voxels: {r}");
+        host.world.borrow_mut().take_changes();
+    }
+    Ok(())
+}
+
 impl Hosts {
     /// The runtime with the job's scene: setup on first use, then the job's state (or the initial one) applied.
     fn scene(&mut self, job: &GameJob) -> Result<(&ScriptHost, f64)> {
@@ -103,11 +113,7 @@ impl Hosts {
             host.setup(&job.room, job.seed)?;
             // A native voxel level the scene code asked for (`voxelLevel`), loaded now that the asset root is known: the
             // offline reference of the live view's level (ROADMAP § 6 step 4). Its changes are the setup's, dropped.
-            let realized = host.voxels.borrow_mut().realize(&mut host.world.borrow_mut(), &mut host.physics.borrow_mut(), &job.assets)?;
-            if let Some(r) = realized {
-                eprintln!("voxels: {r}");
-                host.world.borrow_mut().take_changes();
-            }
+            realize_voxel_level(&host, &job.assets)?;
             let (initial, _) = host.state()?;
             self.hosts.insert(key.clone(), (host, initial));
         }
@@ -249,6 +255,8 @@ fn main() -> Result<()> {
             let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let assets = PathBuf::from(flag("--assets").unwrap_or_else(|| ".".into()));
             let setup_ms = host.setup(&flag("--room").unwrap_or_else(|| "local".into()), flag("--seed").map(|v| v.parse()).transpose()?)?;
+            // Reuse the normal renderer's pending voxel realization before counting geometry and emitters.
+            realize_voxel_level(&host, &assets)?;
             let w = host.world.borrow();
             let tb = Instant::now();
             let mut sc = scene::build(&w, &assets, &presets, None)?;

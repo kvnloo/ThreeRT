@@ -5,6 +5,7 @@ on:
     paths:
       - renderer/src/main.rs
       - tests/stats-headless.test.ts
+      - tests/fixtures/stats-voxel.game.ts
       - .github/workflows/stats-headless.yml
   workflow_dispatch:
 
@@ -25,5 +26,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: node tools/build-scenes.ts cornell-box instancing sun-room
+      - run: node tools/bundle-game.ts tests/fixtures/stats-voxel.game.ts
       - run: cargo build --release --locked --manifest-path renderer/Cargo.toml --bin threert-render
       - run: node --test tests/stats-headless.test.ts
