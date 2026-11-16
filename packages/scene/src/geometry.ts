@@ -165,6 +165,8 @@ export class BufferGeometry {
   attributes: Record<string, BufferAttribute> = {};
   /** Triangle indices (the DSL's: a Uint32Array; three.js's `index` attribute is `getIndex()`). Empty: not indexed. */
   index: Uint32Array = new Uint32Array();
+  /** Plain-array setIndex uses a Uint16 view when three.js r187 does; rendering keeps Uint32 indices. */
+  private plainUint16Index: Uint32Array | null = null;
   groups: GeometryGroup[] = [];
   boundingBox: Box3 | null = null;
   boundingSphere: Sphere | null = null;
@@ -224,12 +226,13 @@ export class BufferGeometry {
   /** three.js: the triangle indices (an array or an attribute); null: not indexed. */
   setIndex(index: ArrayLike<number> | BufferAttribute | null): this {
     this.index = index === null ? new Uint32Array() : Uint32Array.from(index instanceof BufferAttribute ? index.array : index);
+    this.plainUint16Index = Array.isArray(index) && !index.some((value: number) => value >= 65535) ? this.index : null;
     this.changed();
     return this;
   }
   getIndex(): BufferAttribute | null {
     if (!this.index.length) return null;
-    const a = new BufferAttribute(this.index, 1);
+    const a = new BufferAttribute(this.plainUint16Index === this.index ? Uint16Array.from(this.index) : this.index, 1);
     a._geometry = this;
     return a;
   }
