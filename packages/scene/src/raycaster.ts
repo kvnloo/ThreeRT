@@ -166,7 +166,10 @@ export class Raycaster {
     if (local.intersectBox(g.boundingBox!) === null) return;
     const p = g.positions, uv = g.uvs, idx = g.triangleIndices();
     const a = new Vector3(), b = new Vector3(), c = new Vector3();
-    const groups = g.groups.length ? g.groups : [{ start: 0, count: idx.length, materialIndex: 0 }];
+    // three.js Mesh.raycast uses geometry groups only when the material is an array.
+    const groups = Array.isArray((object as Mesh).material)
+      ? g.groups
+      : [{ start: 0, count: idx.length, materialIndex: 0 }];
     for (const grp of groups) {
       const mat = materials[Math.min(grp.materialIndex, materials.length - 1)];
       for (let i = grp.start; i + 2 < Math.min(grp.start + grp.count, idx.length); i += 3) {
