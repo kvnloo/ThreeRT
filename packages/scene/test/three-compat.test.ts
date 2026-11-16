@@ -153,6 +153,18 @@ test("Raycaster: the nearest hit first, front faces of single-sided materials, i
   assert.ok(r2.ray.direction.distanceTo(new THREE.Vector3(0, 0, -1)) < 1e-9);
 });
 
+test("InstancedMesh: setMatrixAt returns the mesh for chaining, as three.js does", () => {
+  const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial(), 2);
+  const translation = new THREE.Matrix4().makeTranslation(2, 3, 4);
+  const result = mesh.setMatrixAt(1, translation);
+  assert.equal(result, mesh, "setMatrixAt returns the mesh, not undefined");
+  assert.deepEqual([...mesh.getMatrixAt(1, new THREE.Matrix4()).elements], [...translation.elements], "instance 1 receives its matrix");
+  assert.deepEqual([...mesh.getMatrixAt(0, new THREE.Matrix4()).elements], [...new THREE.Matrix4().elements], "instance 0 stays the identity");
+  const version = mesh.instanceMatrix.version;
+  mesh.instanceMatrix.needsUpdate = true;
+  assert.equal(mesh.instanceMatrix.version, version + 1, "the required upload flag still works");
+});
+
 test("the binding: ambient lights as the environment, black background, three.js exposure; background, fog, groups, unlit", () => {
   const scene = new THREE.Scene();
   scene.add(new THREE.AmbientLight(0xffffff, Math.PI), new THREE.HemisphereLight(0xffffff, 0x000000, 0));
