@@ -406,11 +406,48 @@ pub struct CameraData {
     pub dof: Option<desc::Dof>,
 }
 
+/// The environment beside its sky, as the world describes it: one derivation (`of`) for a build and for an edit, one
+/// place that says what the kernel takes from it (`write`, `features`).
+#[derive(Clone, Debug)]
+pub struct EnvSettings {
+    pub fog: Option<desc::Fog>,
+    /// three.js `scene.background` (`desc::Environment::background`): the kernel's F_BACKGROUND, `Params::background`.
+    pub background: Option<[f32; 3]>,
+    /// The sky's aerial perspective (`aerial_params`): the kernel's F_AERIAL, `Params::aerial`.
+    pub aerial: [f32; 4],
+    /// Global wetness and rain intensity (0..1).
+    pub wetness: f32,
+    pub rain: f32,
+    /// Cloud cover (0..1) of an atmosphere sky: the sky is baked with it (`bake_sky`).
+    pub cloud_cover: f32,
+}
+
+impl EnvSettings {
+    pub fn of(w: &World) -> EnvSettings {
+        let e = &w.environment;
+        EnvSettings { fog: e.fog.clone(), background: e.background, aerial: aerial_params(&e.sky), wetness: e.wetness.clamp(0.0, 1.0), rain: e.rain.clamp(0.0, 1.0), cloud_cover: e.cloud_cover.clamp(0.0, 1.0) }
+    }
+
+    /// The kernel's parameters for them.
+    pub fn write(&self, p: &mut crate::gpu::Params) {
+        p.time[1] = self.wetness;
+        p.time[2] = self.rain;
+        p.background = self.background.map_or([0.0; 4], |c| [c[0], c[1], c[2], 1.0]);
+        p.aerial = self.aerial;
+        [p.fog, p.fog_color, p.vol, p.vol2] = crate::fog_params(self.fog.as_ref());
+    }
+
+    /// The kernel features they ask for (`gpu::environment_features`).
+    pub fn features(&self) -> u32 {
+        crate::gpu::environment_features(self.fog.as_ref(), self.background.is_some(), self.aerial)
+    }
+}
+
 pub enum SkyData {
     None,
     Color(Vec3),
     /// `dynamic`: baked at `sky::DYNAMIC_SKY` (the live view re-bakes it as the sun moves); `glow`: night-sky radiance.
-    Atmosphere { sun_dir: Vec3, sun_lux: Vec3, rayleigh: f32, mie: f32, g: f32, ground: Vec3, sun_node: Option<usize>, dynamic: bool, glow: crate::sky::Glow },
+    Atmosphere { sun_dir: Vec3, sun_lux: Vec3, rayleigh: f32, mie: f32, g: f32, ground: Vec3, dynamic: bool, glow: crate::sky::Glow },
     Gradient(crate::sky::Gradient),
 }
 
@@ -453,12 +490,8 @@ pub struct Scene {
     pub lights: Vec<GpuLight>,
     pub camera: CameraData,
     pub sky: SkyData,
-    pub fog: Option<desc::Fog>,
-    /// Global wetness and rain intensity (0..1).
-    pub wetness: f32,
-    pub rain: f32,
-    /// Cloud cover (0..1) of an atmosphere sky.
-    pub cloud_cover: f32,
+    /// The environment beside its sky (`EnvSettings::of`).
+    pub environment: EnvSettings,
     pub preset: desc::Preset,
     pub stats: HashMap<&'static str, f64>,
     /// Triangle ranges per object (name, first, end), in `tris` order: picking and selection outlines.
@@ -468,10 +501,6 @@ pub struct Scene {
     /// Some object has instance colours (`InstanceTable::colors`): the kernel's F_TINT, 4 vec4s an object
     /// (`object_stride`).
     pub tinted: bool,
-    /// three.js `scene.background` (`desc::Environment::background`): the kernel's F_BACKGROUND, `Params::background`.
-    pub background: Option<Vec3>,
-    /// The sky's aerial perspective (`aerial_params`): the kernel's F_AERIAL, `Params::aerial`.
-    pub aerial: [f32; 4],
     /// Instanced static glTF meshes (model-space triangles, flags, attributes) and their placements. `prepare` appends
     /// the pool after the flattened triangles (hardware RT) or flattens the instances (software traversal).
     pub pool_tris: Vec<[Vec3A; 3]>,
@@ -776,7 +805,7 @@ fn bytes_key(kind: &str, bytes: &[u8]) -> String {
 fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image::RgbaImage>)> {
     match &t.source {
         world::TextureSource::File(uri) => {
-            let path = assets.join(uri);
+            let path = crate::files::asset_path(assets, uri);
             let key = file_key(&path);
             Ok((key.clone(), cached_image(&key, || crate::files::image(&path).with_context(|| format!("texture {uri}")))?))
         }
@@ -793,7 +822,7 @@ fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image
 
 /// A model file (cached per file version).
 pub fn model_gltf(uri: &str, assets: &Path) -> Result<Arc<skin::Model>> {
-    let path = assets.join(uri);
+    let path = crate::files::asset_path(assets, uri);
     cached_gltf(&file_key(&path), || skin::Model::new(import_gltf(&path).with_context(|| format!("asset {uri}"))?))
 }
 
@@ -944,8 +973,67 @@ pub const MAX_MEDIA: usize = 32;
 /// (pathtrace.wgsl `medium_span`).
 pub const MEDIUM_HIDDEN: u32 = 2;
 
-pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<Scene> {
-    let t0 = web_time::Instant::now();
+/// The scene's sky as the renderer bakes it, and the atmosphere's sun (its light object: `Retained::sun`). `matrix`:
+/// an object's world matrix (the build has its own, a product in another order than `World::world_matrix`'s: the
+/// same to the bit only for an object without a parent).
+pub fn sky_data(w: &World, assets: &Path, matrix: &dyn Fn(u32) -> Mat4) -> Result<(SkyData, Option<u32>)> {
+    let mut sun_id = None;
+    let sky = match &w.environment.sky {
+        Sky::Atmosphere { sun, ground_albedo, rayleigh_scale, mie_scale, mie_anisotropy, dynamic, glow, horizon_glow, .. } => {
+            let sun_light = sun.and_then(|s| w.objects.get(&s).map(|o| (s, o)));
+            let (sun_dir, sun_lux) = match sun_light.map(|(s, o)| (matrix(s), &o.kind)) {
+                Some((m, Kind::Light(Light::Directional { color, intensity, .. }))) => (-m.transform_vector3(Vec3::NEG_Z).normalize(), Vec3::from(*color) * *intensity),
+                _ => (Vec3::Y, Vec3::ZERO),
+            };
+            sun_id = sun_light.map(|(s, _)| s);
+            SkyData::Atmosphere {
+                sun_dir,
+                sun_lux,
+                rayleigh: *rayleigh_scale,
+                mie: *mie_scale,
+                g: *mie_anisotropy,
+                ground: Vec3::from(*ground_albedo),
+                dynamic: *dynamic,
+                glow: crate::sky::glow_of(glow, horizon_glow),
+            }
+        }
+        Sky::Color { color, intensity, .. } if *intensity > 0.0 => SkyData::Color(Vec3::from(*color) * *intensity),
+        Sky::Color { .. } => SkyData::None,
+        Sky::Hdri { .. } => return Err(anyhow!("hdri environments are not supported by the native renderer yet")),
+        Sky::Gradient { zenith, horizon, ground, intensity, horizon_exponent, glow, clouds, .. } => {
+            let cloud_map = match clouds.as_ref().and_then(|c| c.map.map(|m| (c, m))) {
+                Some((c, tid)) => {
+                    let t = w.textures.get(&tid).ok_or_else(|| anyhow!("unknown texture {tid}"))?;
+                    let (key, image) = texture_image(t, assets)?;
+                    Some(crate::sky::CloudMap {
+                        key,
+                        image,
+                        threshold: c.threshold.unwrap_or([0.35, 0.85]),
+                        gain: c.gain.unwrap_or(1.8),
+                        offset: Vec3::from(c.color) * *intensity,
+                        projection: c.projection.unwrap_or(0.35),
+                        bias: c.bias.unwrap_or(0.25),
+                        fade: c.fade.unwrap_or(4.0),
+                    })
+                }
+                None => None,
+            };
+            SkyData::Gradient(crate::sky::Gradient {
+                zenith: Vec3::from(*zenith) * *intensity,
+                horizon: Vec3::from(*horizon) * *intensity,
+                ground: Vec3::from(*ground) * *intensity,
+                horizon_exponent: *horizon_exponent,
+                glow: glow.as_ref().map(|g| (Vec3::from(g.color) * g.intensity * *intensity, g.height.max(1e-3), g.width.map(|w| (w, g.power.unwrap_or(6.0))))),
+                clouds: if cloud_map.is_some() { None } else { clouds.as_ref().map(|c| (c.coverage, Vec3::from(c.color) * *intensity, c.scale.max(0.05), c.seed)) },
+                cloud_map,
+            })
+        }
+    };
+    Ok((sky, sun_id))
+}
+
+/// A world's render preset: the preset its settings name, the settings' overrides over it, then `overrides`.
+pub fn preset_of(w: &World, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<desc::Preset> {
     let st = &w.settings;
     let mut preset_json: serde_json::Value = serde_json::from_slice(&crate::files::preset(presets_dir, &st.preset).with_context(|| format!("preset {}", st.preset))?)?;
     if let Some(o) = &st.overrides {
@@ -954,7 +1042,13 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     if let Some(o) = overrides {
         desc::merge_json(&mut preset_json, o);
     }
-    let preset: desc::Preset = serde_json::from_value(preset_json)?;
+    Ok(serde_json::from_value(preset_json)?)
+}
+
+pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<Scene> {
+    let t0 = web_time::Instant::now();
+    let st = &w.settings;
+    let preset = preset_of(w, presets_dir, overrides)?;
     let order = w.ordered();
     let mut worlds: HashMap<u32, Mat4> = HashMap::new();
     for id in &order {
@@ -1737,60 +1831,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         }
     }
 
-    let env = &w.environment;
-    let sky = match &env.sky {
-        Sky::Atmosphere { sun, ground_albedo, rayleigh_scale, mie_scale, mie_anisotropy, dynamic, glow, horizon_glow, .. } => {
-            let sun_light = sun.and_then(|s| w.objects.get(&s).map(|o| (s, o)));
-            let (sun_dir, sun_lux) = match sun_light.map(|(s, o)| (worlds.get(&s).copied().unwrap_or(Mat4::IDENTITY), &o.kind)) {
-                Some((m, Kind::Light(Light::Directional { color, intensity, .. }))) => (-m.transform_vector3(Vec3::NEG_Z).normalize(), Vec3::from(*color) * *intensity),
-                _ => (Vec3::Y, Vec3::ZERO),
-            };
-            let idx = sun_light.and_then(|(s, _)| retained.light_nodes.iter().position(|id| *id == s));
-            retained.sun = sun_light.map(|(s, _)| s);
-            SkyData::Atmosphere {
-                sun_dir,
-                sun_lux,
-                rayleigh: *rayleigh_scale,
-                mie: *mie_scale,
-                g: *mie_anisotropy,
-                ground: Vec3::from(*ground_albedo),
-                sun_node: idx,
-                dynamic: *dynamic,
-                glow: crate::sky::glow_of(glow, horizon_glow),
-            }
-        }
-        Sky::Color { color, intensity, .. } if *intensity > 0.0 => SkyData::Color(Vec3::from(*color) * *intensity),
-        Sky::Color { .. } => SkyData::None,
-        Sky::Hdri { .. } => return Err(anyhow!("hdri environments are not supported by the native renderer yet")),
-        Sky::Gradient { zenith, horizon, ground, intensity, horizon_exponent, glow, clouds, .. } => {
-            let cloud_map = match clouds.as_ref().and_then(|c| c.map.map(|m| (c, m))) {
-                Some((c, tid)) => {
-                    let t = w.textures.get(&tid).ok_or_else(|| anyhow!("unknown texture {tid}"))?;
-                    let (key, image) = texture_image(t, assets)?;
-                    Some(crate::sky::CloudMap {
-                        key,
-                        image,
-                        threshold: c.threshold.unwrap_or([0.35, 0.85]),
-                        gain: c.gain.unwrap_or(1.8),
-                        offset: Vec3::from(c.color) * *intensity,
-                        projection: c.projection.unwrap_or(0.35),
-                        bias: c.bias.unwrap_or(0.25),
-                        fade: c.fade.unwrap_or(4.0),
-                    })
-                }
-                None => None,
-            };
-            SkyData::Gradient(crate::sky::Gradient {
-                zenith: Vec3::from(*zenith) * *intensity,
-                horizon: Vec3::from(*horizon) * *intensity,
-                ground: Vec3::from(*ground) * *intensity,
-                horizon_exponent: *horizon_exponent,
-                glow: glow.as_ref().map(|g| (Vec3::from(g.color) * g.intensity * *intensity, g.height.max(1e-3), g.width.map(|w| (w, g.power.unwrap_or(6.0))))),
-                clouds: if cloud_map.is_some() { None } else { clouds.as_ref().map(|c| (c.coverage, Vec3::from(c.color) * *intensity, c.scale.max(0.05), c.seed)) },
-                cloud_map,
-            })
-        }
-    };
+    let (sky, sun) = sky_data(w, assets, &|id| worlds.get(&id).copied().unwrap_or(Mat4::IDENTITY))?;
+    retained.sun = sun;
 
     let mut stats = HashMap::new();
     stats.insert("load_ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -1820,8 +1862,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         }
     }
     stats.insert("unique_triangles", (tris.len() + pool_tris.len()) as f64);
-    // Cutout materials: their triangles take the any-hit path in traversal. Glass lets shadow rays through
-    // (unattenuated: no caustics, like UE's raster shadows of translucency).
+    // Cutout materials: their triangles take the any-hit path in traversal. Glass casts no shadow of its own: what a
+    // shadow ray keeps past it is the kernel's (`glass_tr`; in full with `A_GLASS_SHADOWS`).
     for (f, a) in tri_flags.iter_mut().zip(&attrs) {
         let m = &materials[a.uv[3].to_bits() as usize];
         if m.uv2[3] > 0.0 {
@@ -1853,17 +1895,12 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         lights,
         camera: camera.ok_or_else(|| anyhow!("no camera (settings.camera must name a camera object)"))?,
         sky,
-        fog: env.fog.clone(),
-        wetness: env.wetness.clamp(0.0, 1.0),
-        rain: env.rain.clamp(0.0, 1.0),
-        cloud_cover: env.cloud_cover.clamp(0.0, 1.0),
+        environment: EnvSettings::of(w),
         preset,
         stats,
         tri_nodes,
         tri_instances,
         tinted,
-        background: w.environment.background.map(Vec3::from),
-        aerial: aerial_params(&w.environment.sky),
         retained,
         particles,
         particle_fns,
