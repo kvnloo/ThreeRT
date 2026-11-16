@@ -8,6 +8,8 @@ test("Object3D.lookAt: ambient and hemisphere lights aim local -Z at the target"
   const forward = new THREE.Vector3(0, 0, 1);
   const ambient = new THREE.AmbientLight();
   const hemisphere = new THREE.HemisphereLight();
+  // three.js starts HemisphereLight at (0, 1, 0); put both at the origin so the expected direction is +Z in both.
+  for (const light of [ambient, hemisphere]) light.position.set(0, 0, 0);
   ambient.lookAt(target);
   hemisphere.lookAt(0, 0, 5);
   for (const light of [ambient, hemisphere]) {
