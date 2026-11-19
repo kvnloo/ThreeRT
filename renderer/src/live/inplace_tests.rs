@@ -414,6 +414,7 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
     let cdf = read(&up.heap.buffer, up.heap.at(Table::Emitters), (tables.emitter_tris.len() * 16) as u64);
     let record_size = std::mem::size_of::<scene::GpuInstance>();
     let records = read(&up.heap.buffer, up.heap.at(Table::Instances), (c.sc.gpu_instances.len() * record_size) as u64);
+    let gpu_rows = read(&up.words.buffer, up.words.at(crate::heap::Stream::Rows), up.words.cap(crate::heap::Stream::Rows));
     let mut alive = 0;
     for (i, e) in tables.emitter_tris.iter().enumerate() {
         let r: crate::GpuEmitterTri = bytemuck::pod_read_unaligned(&list[i * size..][..size]);
@@ -440,7 +441,18 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
             for (got, want) in [r.v0, r.e1, r.e2].into_iter().zip(placed) {
                 assert!((glam::Vec3::from(got) - want).length() <= 1e-4 * (1.0 + want.length()), "{what}: emitter {i}'s triangle {got:?}, its instance places it at {want:?}");
             }
-            assert_eq!((record.n[2][3].to_bits(), record.n[2][3].to_bits() + a.x[3].to_bits()), (inst.first_emitter, i as u32 + 1), "{what}: triangle {} of instance {} finds its emitter", e.tri, e.inst);
+            if record.n[1][3].to_bits() & scene::INST_ROWS == 0 {
+                assert_eq!((record.n[2][3].to_bits(), record.n[2][3].to_bits() + a.x[3].to_bits()), (inst.first_emitter, i as u32 + 1), "{what}: triangle {} of instance {} finds its emitter", e.tri, e.inst);
+                alive += 1;
+                continue;
+            }
+            // An instance with rows: its section's row as the GPU has it says the material and where the section's
+            // emitters start, the triangle its index among them.
+            let at = (record.info[3] + a.uv[3].to_bits()) as usize;
+            let row: scene::Row = bytemuck::pod_read_unaligned(&gpu_rows[at * 16..][..16]);
+            assert_eq!(row, c.sc.rows[at], "{what}: row {at} on the GPU is the scene's");
+            assert_eq!((record.info[3], record.n[2][3].to_bits()), (inst.rows, inst.first_emitter), "{what}: instance {}'s record has its rows and its first emitter", e.inst);
+            assert_eq!((row[2].wrapping_add(a.x[3].to_bits()), scene::row_material(&row)), (i as u32, e.mat), "{what}: triangle {} of instance {} finds its emitter, of its row's material", e.tri, e.inst);
         }
         alive += 1;
     }
@@ -893,16 +905,18 @@ fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does()
         // (The sun away: the meshes will light the scene.)
         w.set_visible(20, false).unwrap();
         w.set_material(6, late(0.0));
-        // Sixteen quads in a row in one geometry, a group each, by turns of the lamp's material, which emits, and of
-        // the late one; the geometry has them out of the row's order (so that a mesh tree orders them its own way under
-        // software traversal).
-        let (mut positions, mut indices, mut groups) = (vec![], vec![], vec![]);
+        // Sixteen quads in a row in one geometry, four to a group, the groups by turns of the lamp's material, which
+        // emits, and of the late one; the geometry has the quads out of the row's order (so that a mesh tree orders a
+        // section's triangles its own way under software traversal).
+        let (mut positions, mut indices) = (vec![], vec![]);
         for q in 0..16u32 {
             let x = -0.48 + 0.06 * ((q * 7) % 16) as f32;
             positions.extend([x, -0.15, 0.0, x + 0.06, -0.15, 0.0, x + 0.06, 0.15, 0.0, x, 0.15, 0.0]);
             indices.extend([0, 1, 2, 0, 2, 3].map(|i| 4 * q + i));
-            groups.push([6 * q, 6, q % 2]);
         }
+        let groups = (0..4u32).map(|k| [24 * k, 24, k % 2]).collect();
+        // (And the same quads without groups, for the mesh added in place below: one section of 32 triangles.)
+        w.set_geometry(8, Geometry { positions: positions.clone(), normals: [0.0, 0.0, 1.0].repeat(64), uvs: vec![0.0; 128], indices: indices.clone(), groups: vec![], colors: vec![] }).unwrap();
         w.set_geometry(7, Geometry { positions, normals: [0.0, 0.0, 1.0].repeat(64), uvs: vec![0.0; 128], indices, groups, colors: vec![] }).unwrap();
         let mesh = |geometry, material, materials| Kind::Mesh { geometry, material, own_blas: false, materials };
         w.set_object(13, "one".into(), None, mesh(3, 6, vec![]), true, false).unwrap();
@@ -939,14 +953,19 @@ fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does()
         let mesh_of = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).expect("a mesh is an instance").instance as usize].mesh;
         assert_eq!(mesh_of(&live, 13), mesh_of(&live, 14), "the two objects share their mesh");
         let two = mesh_of(&live, 15) as usize;
-        assert_eq!((live.sc.meshes[two].count, live.sc.meshes[two].emitters), (32, 16), "the mesh of two materials: one emits");
+        let emitters_of = |c: &LiveCore, id: u32| {
+            let i = &c.sc.instances[c.sc.tables.retained.instance(id).unwrap().instance as usize];
+            let m = c.sc.meshes[i.mesh as usize];
+            scene::rows_emitters(m.sections(&c.sc.sections), &c.sc.rows[i.rows as usize..][..m.sect_count as usize], &c.sc.tables.materials)
+        };
+        assert_eq!((live.sc.meshes[two].count, live.sc.meshes[two].sect_count, emitters_of(&live, 15)), (32, 4, 16), "the mesh of two materials, a section a group: one emits");
         // (A third object of the shared mesh, hidden when the material starts: it has its emitters when it is shown.)
         w.set_visible(33, false).unwrap();
         assert!(!live.commit(&mut w).unwrap(), "a mesh hidden, {with} a light tree: in place ({:?})", live.fallback);
         w.set_material(6, late(30.0));
         let what = format!("a material started emitting in place, {with} a light tree");
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
-        assert_eq!((live.sc.meshes[two].emitters, live.sc.meshes[mesh_of(&live, 13) as usize].emitters), (32, 2), "{what}: the meshes' emitters");
+        assert_eq!((emitters_of(&live, 15), emitters_of(&live, 13), emitters_of(&live, 14)), (32, 2, 2), "{what}: the instances' emitters");
         list_is_its_triangles(&what, &live);
         let moving = |c: &LiveCore, id: u32| {
             let r = c.sc.tables.retained.instance(id).unwrap().instance;
@@ -959,16 +978,15 @@ fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does()
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
         list_is_its_triangles(&what, &live);
         lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
-        if live.g.hwrt {
-            w.set_object(29, "added".into(), None, Kind::Mesh { geometry: 3, material: 8, own_blas: true, materials: vec![] }, true, false).unwrap();
-            w.set_transform(29, Vec3::new(-0.2, 0.1, 1.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
-            assert!(!live.commit(&mut w).unwrap(), "a mesh added, {with} a light tree: in place ({:?})", live.fallback);
-            w.set_material(8, late(20.0));
-            let what = format!("the material of a mesh added in place started emitting, {with} a light tree");
-            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
-            list_is_its_triangles(&what, &live);
-            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
-        }
+        // (A mesh of many triangles added in place: under software traversal its tree orders them its own way.)
+        w.set_object(29, "added".into(), None, Kind::Mesh { geometry: 8, material: 8, own_blas: true, materials: vec![] }, true, false).unwrap();
+        w.set_transform(29, Vec3::new(-0.2, 0.1, 1.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        assert!(!live.commit(&mut w).unwrap(), "a mesh added, {with} a light tree: in place ({:?})", live.fallback);
+        w.set_material(8, late(20.0));
+        let what = format!("the material of a mesh added in place started emitting, {with} a light tree");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        list_is_its_triangles(&what, &live);
+        lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
         w.set_transform(14, Vec3::new(0.2, -0.3, 1.2), glam::Quat::from_rotation_z(0.6), Vec3::ONE).unwrap();
         let what = format!("the movable one of them moved, {with} a light tree");
         assert!(!(live.commit(&mut w).unwrap() && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
@@ -1294,6 +1312,184 @@ fn a_still_model_is_hidden_removed_and_moved_in_place() {
                 assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
             }
         }
+    }
+}
+
+/// Objects of one geometry share its mesh whatever their materials: one that reads the geometry's vertex colours
+/// and one that does not, a cutout that lets everything through and one that lets nothing, glass, one that emits. At
+/// the build; one more placed in place; an object given another material, which keeps the mesh (none is made, no
+/// triangle written). Each time the picture is a build's, and the picture of the same world with a geometry an
+/// object, so a mesh an object; it is not the picture of the objects all with one material, nor of the plain one
+/// reading the colours too.
+#[test]
+fn objects_of_one_geometry_share_its_mesh_whatever_their_materials() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let json = |v: serde_json::Value| serde_json::from_value::<crate::desc::Material>(v).unwrap();
+    let plain = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        json(m)
+    };
+    // (30 + i: the geometry of object 40 + i where each has its own.)
+    let tile = || Geometry { positions: vec![-0.4, -0.4, 0.0, 0.4, -0.4, 0.0, 0.4, 0.4, 0.0, -0.4, 0.4, 0.0], normals: [0.0, 0.0, 1.0].repeat(4), uvs: vec![0.0; 8], indices: vec![0, 1, 2, 0, 2, 3], groups: vec![], colors: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0] };
+    let mats = [61, 62, 63, 64, 65, 5];
+    // (`variant` 1: the objects all of the plain material; 2: the plain material reads the colours too.)
+    let scene = |own: bool, variant: u32| {
+        let mut w = world();
+        w.set_material(61, plain(serde_json::json!({ "vertexColors": true })));
+        w.set_material(62, plain(serde_json::json!({ "vertexColors": variant == 2 })));
+        w.set_material(63, plain(serde_json::json!({ "opacity": 0.3, "alphaTest": 0.5 })));
+        w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": 0.5, "color": [0.2, 0.6, 0.9] })));
+        w.set_material(65, plain(serde_json::json!({ "color": [0.5, 0.9, 0.5], "roughness": 0, "transmission": 1, "ior": 1.5 })));
+        for (i, mat) in mats.iter().enumerate() {
+            let geometry = 30 + if own { i as u32 } else { 0 };
+            w.set_geometry(geometry, tile()).unwrap();
+            let id = 40 + i as u32;
+            w.set_object(id, format!("tile{i}"), None, Kind::Mesh { geometry, material: if variant == 1 { 62 } else { *mat }, own_blas: i == 0, materials: vec![] }, true, false).unwrap();
+            w.set_transform(id, Vec3::new(-2.25 + 0.9 * i as f32, 0.55, 0.6), glam::Quat::from_rotation_y(0.2), Vec3::ONE).unwrap();
+        }
+        w
+    };
+    let mesh_of = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).expect("a mesh is an instance").instance as usize].mesh;
+    let mut w = scene(false, 0);
+    let mut live = match open(&w) {
+        Ok(c) if c.g.hwrt => c,
+        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let shared = mesh_of(&live, 40);
+    assert!((41..46).all(|id| mesh_of(&live, id) == shared), "the six objects of one geometry share its mesh");
+    assert!(live.sc.meshes[shared as usize].colored && live.sc.meshes[shared as usize].sect_count == 1);
+    let features = live.sc.up.kernel.features;
+    assert_eq!(features & (gpu::F_ROWS | gpu::F_MASKED | gpu::F_VCOLOR), gpu::F_ROWS | gpu::F_MASKED | gpu::F_VCOLOR);
+    let placed = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).unwrap().instance as usize].clone();
+    assert!(!placed(&live, 44).cast_shadow && placed(&live, 43).cast_shadow, "glass alone casts no shadow");
+    list_is_its_triangles("objects of one geometry, at the build", &live);
+    let mut apart_world = open(&scene(true, 0)).unwrap();
+    let meshes: std::collections::HashSet<u32> = (40..46).map(|id| mesh_of(&apart_world, id)).collect();
+    assert_eq!(meshes.len(), 6, "a geometry an object: a mesh an object");
+    let (a, b) = (picture(&mut live, 64), picture(&mut apart_world, 64));
+    assert!(apart(&a, &b) < 0.5, "one mesh for six materials: the picture is {:.2} steps from six meshes'", apart(&a, &b));
+    let c = picture(&mut open(&scene(false, 1)).unwrap(), 64);
+    assert!(apart(&a, &c) > 0.5, "the materials are in the picture ({:.2} steps from the objects all of one)", apart(&a, &c));
+    let c = picture(&mut open(&scene(false, 2)).unwrap(), 64);
+    assert!(apart(&a, &c) > 0.5, "the plain material reads no colour of the mesh ({:.2} steps from where it does)", apart(&a, &c));
+    // One more of the geometry, glass, placed in place: the mesh it shares, nothing made.
+    let (meshes, triangles) = (live.sc.meshes.len(), live.sc.pool_tris.len());
+    let place = |w: &mut World, id: u32, material: u32, at: Vec3| {
+        w.set_object(id, format!("tile{}", id - 40), None, Kind::Mesh { geometry: 30, material, own_blas: false, materials: vec![] }, true, false).unwrap();
+        w.set_transform(id, at, glam::Quat::from_rotation_y(0.2), Vec3::ONE).unwrap();
+    };
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        list_is_its_triangles(what, live);
+        let mut fresh = open(w).unwrap();
+        lit_as_a_build(what, live, &mut fresh);
+    };
+    place(&mut w, 46, 65, Vec3::new(0.2, -0.5, 0.9));
+    assert!(!live.commit(&mut w).unwrap(), "an object of the geometry placed: in place ({:?})", live.fallback);
+    assert_eq!((mesh_of(&live, 46), live.sc.meshes.len(), live.sc.pool_tris.len()), (shared, meshes, triangles), "it shares the mesh: none made");
+    against_a_build("an object of the geometry placed in place", &mut live, &w);
+    // Another material for an object: its row. The plain one emits now, the one that emitted is a cutout.
+    for (id, material, at) in [(41, 5, Vec3::new(-1.35, 0.55, 0.6)), (45, 64, Vec3::new(2.25, 0.55, 0.6))] {
+        place(&mut w, id, material, at);
+        let what = format!("object {id} given material {material}");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert_eq!((mesh_of(&live, id), live.sc.meshes.len(), live.sc.pool_tris.len()), (shared, meshes, triangles), "{what}: it keeps the mesh, none made");
+        assert_eq!(scene::row_material(&live.sc.rows[placed(&live, id).rows as usize]), live.sc.tables.retained.materials[&material], "{what}: its row names it");
+        against_a_build(&what, &mut live, &w);
+    }
+    // A geometry with colours that no object read at the build: its mesh was made without them, and an object that
+    // reads them, placed later, has them by a rebuild.
+    let mut w = world();
+    w.set_material(61, plain(serde_json::json!({ "vertexColors": true })));
+    w.set_material(62, plain(serde_json::json!({})));
+    w.set_geometry(30, tile()).unwrap();
+    w.set_object(40, "tile0".into(), None, Kind::Mesh { geometry: 30, material: 62, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(40, Vec3::new(-0.6, 0.55, 0.6), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    // (And a coloured mesh in the scene: the kernel has vertex colours.)
+    w.set_geometry(31, tile()).unwrap();
+    w.set_object(41, "tile1".into(), None, Kind::Mesh { geometry: 31, material: 61, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(41, Vec3::new(0.9, -0.6, 0.6), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = open(&w).unwrap();
+    w.take_changes();
+    assert!(!live.sc.meshes[mesh_of(&live, 40) as usize].colored && live.sc.meshes[mesh_of(&live, 41) as usize].colored);
+    place(&mut w, 42, 61, Vec3::new(0.0, 0.55, 0.6));
+    assert!(live.commit(&mut w).unwrap(), "colours asked of a mesh made without them: a rebuild");
+    assert!(live.sc.meshes[mesh_of(&live, 42) as usize].colored && mesh_of(&live, 42) == mesh_of(&live, 40));
+    against_a_build("an object that reads its geometry's colours placed", &mut live, &w);
+}
+
+/// Glass among an instance's other sections lets the sky's and the sun's light through as an instance that is all
+/// glass does: a pane and its frame as one mesh of two materials, against the two as a mesh each, before a wall, in
+/// a scene with a cutout and in one without (the kernel then tests no hit for a cutout, and still steps through the
+/// glass). A shadow ray steps through the first's glass by its row and never meets the second's (its mask); a
+/// sample of the sky weighs the same against the surface's own rays, which pass the glass either way (glass is no
+/// cutout's hole), so the pictures are the same.
+#[test]
+fn glass_among_an_instances_sections_is_lit_through_as_glass_alone() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let json = |v: serde_json::Value| serde_json::from_value::<crate::desc::Material>(v).unwrap();
+    let quads = |q: &[[f32; 4]], groups: Vec<[u32; 3]>| {
+        let (mut positions, mut indices) = (vec![], vec![]);
+        for (k, &[x0, y0, x1, y1]) in q.iter().enumerate() {
+            positions.extend([x0, y0, 0.0, x1, y0, 0.0, x1, y1, 0.0, x0, y1, 0.0]);
+            indices.extend([0, 1, 2, 0, 2, 3].map(|i| 4 * k as u32 + i));
+        }
+        Geometry { normals: [0.0, 0.0, 1.0].repeat(4 * q.len()), uvs: vec![0.0; 8 * q.len()], positions, indices, groups, colors: vec![] }
+    };
+    let (pane, frame) = ([-1.0, -1.0, 1.0, 0.6], [-1.0, 0.6, 1.0, 1.0]);
+    // (`parts` 0: the pane and its frame one mesh; 1: a mesh each; 2: neither.)
+    let scene = |parts: u32, cutout: bool| {
+        let mut w = world();
+        w.set_material(71, json(serde_json::json!({ "name": "pane", "color": [0.6, 0.9, 0.6], "opacity": 1, "metalness": 0, "roughness": 0, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true, "transmission": 1, "ior": 1.5 })));
+        w.set_material(72, json(serde_json::json!({ "name": "frame", "color": [0.05, 0.05, 0.05], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true })));
+        w.set_material(73, json(serde_json::json!({ "name": "grille", "color": [0.5, 0.5, 0.5], "opacity": 0.9, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true, "alphaTest": 0.5 })));
+        // A sky of one colour, and no lamp beside it, so that the sky is sampled as a light (the rays the wall's surface
+        // samples find it too); a cutout in a corner.
+        w.set_environment(crate::desc::Environment { sky: sky(serde_json::json!({ "type": "color", "color": [1.0, 1.0, 1.0], "intensity": 0.3, "skyLightIntensity": 1 })), ..w.environment.clone() });
+        w.set_material(5, json(serde_json::json!({ "name": "off", "color": [0.2, 0.2, 0.2], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true })));
+        if cutout {
+            w.set_object(13, "grille".into(), None, Kind::Mesh { geometry: 3, material: 73, own_blas: false, materials: vec![] }, true, false).unwrap();
+            w.set_transform(13, Vec3::new(-0.8, -0.8, 0.9), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        }
+        let at = |w: &mut World, id: u32| w.set_transform(id, Vec3::new(0.0, 0.0, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        match parts {
+            0 => {
+                w.set_geometry(50, quads(&[pane, frame], vec![[0, 6, 0], [6, 6, 1]])).unwrap();
+                w.set_object(30, "window".into(), None, Kind::Mesh { geometry: 50, material: 71, own_blas: false, materials: vec![71, 72] }, true, false).unwrap();
+                at(&mut w, 30);
+            }
+            1 => {
+                for (id, geometry, q, material) in [(30, 51, pane, 71), (31, 52, frame, 72)] {
+                    w.set_geometry(geometry, quads(&[q], vec![])).unwrap();
+                    w.set_object(id, format!("part{id}"), None, Kind::Mesh { geometry, material, own_blas: false, materials: vec![] }, true, false).unwrap();
+                    at(&mut w, id);
+                }
+            }
+            _ => {}
+        }
+        w
+    };
+    for cutout in [true, false] {
+        let mut one = match open(&scene(0, cutout)) {
+            Ok(c) if c.g.hwrt => c,
+            Ok(_) => return eprintln!("skipped: no hardware RT"),
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        let window = one.sc.instances.iter().find(|i| i.name == "window").expect("the window is an instance").clone();
+        assert_eq!((window.bits, window.cast_shadow, one.sc.meshes[window.mesh as usize].sect_count), (scene::INST_ROWS | scene::INST_GLASS, true, 2), "glass and a frame: one mesh, which casts");
+        let wanted = gpu::F_ROWS | gpu::F_IGLASS | if cutout { gpu::F_MASKED } else { 0 };
+        assert_eq!(one.sc.up.kernel.features & (wanted | gpu::F_MASKED), wanted);
+        assert_eq!(one.sc.base.counts2[1], 1, "the sky is sampled as a light");
+        let mut two = open(&scene(1, cutout)).unwrap();
+        assert!(!two.sc.instances.iter().find(|i| i.name == "part30").unwrap().cast_shadow, "the pane alone casts no shadow");
+        let (a, b) = (picture(&mut one, 96), picture(&mut two, 96));
+        assert!(apart(&a, &b) < 0.5, "a pane among its mesh's sections, with a cutout in the scene: {cutout}: the picture is {:.2} steps from the pane's as a mesh of its own", apart(&a, &b));
+        let c = picture(&mut open(&scene(2, cutout)).unwrap(), 96);
+        assert!(apart(&a, &c) > 0.5, "the window is in the picture ({:.2} steps from none)", apart(&a, &c));
     }
 }
 

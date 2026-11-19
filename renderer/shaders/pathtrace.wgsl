@@ -71,6 +71,7 @@ fn approx(a: u32) -> bool { return (APPROX & a) != 0u; }
 // Features the scene uses (gpu::F_*): the rest is compiled out, so plain scenes pay nothing for them.
 override FEAT: u32 = 0xffffffffu;
 const F_MASKED: u32 = 1u;
+const F_ROWS: u32 = 2u; // an instance has rows (`row_word`): a section's material is its row's
 const F_FOG: u32 = 64u;
 const F_VOLUME: u32 = 128u;
 const F_TEX: u32 = 256u;
@@ -90,7 +91,7 @@ const F_BACKGROUND: u32 = 2097152u; // scene.background (`sky_mis`)
 const F_VCOLOR: u32 = 4194304u; // vertex colours (`vcolor`)
 const F_GRID: u32 = 33554432u; // density grids (`vgrid`)
 const F_IFUNC: u32 = 268435456u; // a material function on an instanced mesh: `mat_in_at` places the triangle by its instance
-const F_IGLASS: u32 = 536870912u; // glass among other triangles in an instanced mesh: shadow rays cull its geometry (trace_hw.wgsl), a unit's glass triangles by their flag
+const F_IGLASS: u32 = 536870912u; // glass among an instance's other triangles: shadow rays pass it by its row, or cull a model's glass geometry (trace_hw.wgsl); a unit's glass triangles by their flag
 const F_LISTS: u32 = 134217728u; // light tiles (`lt_list_start`): a scene whose shadow-casting local lights are resampled
 fn has(f: u32) -> bool { return (FEAT & f) != 0u; }
 
@@ -125,7 +126,7 @@ struct Params {
     ltile2: vec4<u32>,     // the traced size they were built at, -, -
     lt_cam: array<vec4<f32>, 4>, // the camera they were built under: position (w = tan(fov/2)), forward (w = aspect), right, up
     table_first: array<vec4<u32>, 3>, // each table's first vec4 in `tables` (heap.rs `Table`): light tree (0), materials, lights, light groups; emitters, tex_info, objects, instances; media, energy LUT, glass energy, emitter triangles
-    word_first: vec4<u32>, // each stream's first word in `words` (heap.rs `Stream`): environment CDF (0), procedural data, vertex colours, -
+    word_first: vec4<u32>, // each stream's first word in `words` (heap.rs `Stream`): environment CDF (0), procedural data, vertex colours, the instances' rows
     live_first: array<vec4<u32>, 2>, // the merged layout: each of group 1's vec4 sections' first vec4 in `ML.vecs` (heap.rs `Live`): cache values (0), refl, motion, direct; lists, -, -, -
     live_len: vec4<u32>,   // and the vec4s of refl, motion, direct, lists
 };
@@ -150,7 +151,8 @@ struct Light { pos: vec4<f32>, dir: vec4<f32>, color: vec4<f32>, ext: vec4<f32>,
 @group(0) @binding(9) var env_tex: texture_2d<f32>;
 // The scene's flat arrays, sections of one buffer of 32-bit words (heap.rs `Stream`), each from the word
 // `P.word_first` names: the environment's CDF (floats: [0, H) the rows' marginal CDF, then H rows of W conditional
-// entries; `env_cdf_at`), the procedural data (`pword`, `gdata`), the vertex colours (`vcolor_word`).
+// entries; `env_cdf_at`), the procedural data (`pword`, `gdata`), the vertex colours (`vcolor_word`), the instances'
+// rows (`row_word`).
 @group(0) @binding(5) var<storage, read> words: array<u32>;
 // (The CDF is the buffer's first section: from word 0, no offset to read.)
 fn env_cdf_at(i: u32) -> f32 { return bitcast<f32>(words[i]); }
@@ -293,11 +295,33 @@ fn inst_normal(r: Instance, n: vec4<f32>) -> vec4<f32> {
 fn inst_x(info: vec4<u32>, x: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(x.x + bitcast<f32>(info.z), bitcast<f32>(info.y), x.z, x.w);
 }
+// An instance's rows (scene.rs `Row`): four words a section of its mesh, from the record's info.w on. The material
+// with its class bits, the section's first triangle, its first emitter (NO_EMITTER: it does not emit). A record's
+// n1.w says whether it has rows (INST_ROWS: its mesh is its geometry's alone, and a triangle's attributes hold its
+// section in uv.w and its index in the section in x.w), and whether a row of it is a cutout's or glass.
+const INST_ROWS: u32 = 8u;
+const INST_CUTOUT: u32 = 16u;
+const INST_GLASS: u32 = 32u;
+const ROW_MATERIAL: u32 = 0xffffffu;
+const ROW_CUTOUT: u32 = 0x1000000u;
+const ROW_GLASS: u32 = 0x2000000u;
+const NO_EMITTER: u32 = 0xffffffffu;
+fn has_rows(r: Instance) -> bool { return has(F_ROWS) && (bitcast<u32>(r.n1.w) & INST_ROWS) != 0u; }
+fn row_word(first: u32, section: u32, k: u32) -> u32 { return words[P.word_first.w + (first + section) * 4u + k]; }
+
 // The material of a triangle, given its attributes and the instance that places it (NO_INST: none). Every read of a
-// hit's material goes through here: where the material is kept is this function's alone.
+// hit's material goes through here: where the material is kept is this function's alone. On the triangle; with rows,
+// in the row of the triangle's section.
 fn material_of(a: TriAttr, inst: u32) -> u32 {
-    return bitcast<u32>(a.uv.w);
+    let m = triangle_material(a);
+    if (has(F_ROWS) && inst != NO_INST) {
+        let r = instance_at(inst);
+        if (has_rows(r)) { return row_word(r.info.w, m, 0u) & ROW_MATERIAL; }
+    }
+    return m;
 }
+// The material a triangle itself holds: one that no instance with rows places.
+fn triangle_material(a: TriAttr) -> u32 { return bitcast<u32>(a.uv.w); }
 
 // A model-space triangle's shading attributes placed by instance r (scene::instance_attr).
 fn inst_attr(r: Instance, a: TriAttr) -> TriAttr {
@@ -889,7 +913,7 @@ fn glass_at(h: Hit, d: vec3<f32>, t: f32) -> GlassAt {
     if (tr <= 0.0) { return g; }
     g.tint = m.base_color.rgb;
     if (has(F_TINT)) { g.tint *= obj_tint(object_of(a)); }
-    if (has(F_VCOLOR)) { g.tint *= vcolor(h.tri, h.u, h.v); }
+    if (has(F_VCOLOR) && m.uv.w > 0.0) { g.tint *= vcolor(h.tri, h.u, h.v); }
     if (has(F_TEX) && (m.tex0.x >= 0 || m.uv.z > 0.5)) {
         let uv = mesh_uv(a, m, h.u, h.v);
         var lod = mesh_lod(a, m) + log2(max(t * 2.0 * P.cam_pos.w / lod_height(), 1e-7)) - LOD_BIAS;
@@ -1267,7 +1291,7 @@ fn surface(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
     s.card = m.tex1.z == MAT_EMITTER_CARD;
     var base = m.base_color.rgb;
     if (has(F_TINT)) { base *= obj_tint(object_of(a)); }
-    if (has(F_VCOLOR)) { base *= vcolor(i, h.u, h.v); }
+    if (has(F_VCOLOR) && m.uv.w > 0.0) { base *= vcolor(i, h.u, h.v); }
     var rough = m.params.y;
     var metal = m.params.x;
     var spec = m.params.z;
@@ -1866,10 +1890,23 @@ fn emitter_attrs(em: EmitterTri) -> TriAttr {
 fn emit_mis(hit: Hit, d: vec3<f32>, pdf: f32) -> f32 {
     if (is_proc(hit) || P.counts.y == 0u) { return 1.0; }
     // The hit triangle's emitter: its attributes' x.w is the entry + 1 (0: it is not light-sampled), counted from its
-    // instance's first entry (the record's n2.w) when an instance places it.
-    var entry = bitcast<u32>(attrs[hit.tri].x.w);
+    // instance's first entry (the record's n2.w) when an instance places it. With rows: x.w is the triangle's index
+    // in its section, counted from the section's first entry (its row's).
+    let a = attrs[hit.tri];
+    var entry = bitcast<u32>(a.x.w);
+    var rows = false;
+    if (has(F_INST) && hit.inst != NO_INST) {
+        let r = instance_at(hit.inst);
+        rows = has_rows(r);
+        if (rows) {
+            let first = row_word(r.info.w, bitcast<u32>(a.uv.w), 2u);
+            if (first == NO_EMITTER) { return 1.0; }
+            entry += first + 1u;
+        } else if (entry != 0u) {
+            entry += bitcast<u32>(r.n2.w);
+        }
+    }
     if (entry == 0u) { return 1.0; }
-    if (has(F_INST) && hit.inst != NO_INST) { entry += bitcast<u32>(instance_at(hit.inst).n2.w); }
     let em = emitter_tri_at(entry - 1u);
     let cr = cross(em.e1, em.e2);
     let area = 0.5 * length(cr);

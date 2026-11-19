@@ -1,5 +1,6 @@
 // Hardware ray tracing (wgpu ray query). Up to four instances (see Prepared::groups): shadow casters mask 1, the rest
-// mask 2 (glass among them; an instanced mesh's glass is a geometry of its BLAS that a shadow ray culls); opaque groups
+// mask 2 (glass among them; a model's mesh's glass is a geometry of its BLAS that a shadow ray culls, an instance's
+// glass among its other sections is stepped through by its row); opaque groups
 // never report candidates, alpha-cutout groups are confirmed by `alpha_pass`.
 // instance_custom_data holds the instance's first global triangle index, or in scenes where a group starts beyond
 // 2^24 triangles (F_HUGE: custom data has 24 bits) its traversal group, whose first triangle is in P.group_first.
@@ -10,8 +11,9 @@
     if (rays_off) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST); }
     let mask = select(0xffu, 1u, mode == TRACE_SHADOW);
     let any = mode != TRACE_CLOSEST;
-    // (A scene without cutouts: one query. A feature bit: the kernel has this or what follows, not both.)
-    if (!has(F_MASKED)) { return trace_opaque(o, d, tmax_in, mask, any); }
+    // (A scene without cutouts: one query. A feature bit: the kernel has this or what follows, not both. Glass among an
+    // instance's other sections is stepped through as a cutout is: `passes`.)
+    if (!has(F_MASKED) && !(has(F_IGLASS) && has(F_ROWS))) { return trace_opaque(o, d, tmax_in, mask, any); }
     // Whether a cutout stops this ray as any triangle does: A_CUTOUT_PATHS, A_CUTOUT_EMITTERS (TRACE_ANY_OPAQUE)
     // (pathtrace.wgsl `cutouts_opaque`, `emitter_tr`).
     @if(!cutout_lite) let solid = cutouts_opaque() || mode == TRACE_ANY_OPAQUE;
@@ -38,15 +40,22 @@
     // origin.
     var first = any;
     var t0 = 0.0;
+    var hole = false;
     for (var k = 0u; k < steps + u32(any); k++) {
         let h = trace_opaque(o + d * t0, d, tmax_in - t0, mask, first);
         if (h.tri == 0xffffffffu) {
-            // (A shadow ray comes here in order only past a cutout that let it through: `shadow_hole`.)
-            if (any && !first) { shadow_hole = true; }
+            // (A shadow ray comes here in order only past a cutout that let it through, `shadow_hole`, or past glass.)
+            if (any && !first && hole) { shadow_hole = true; }
             return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST);
         }
         let t = t0 + h.t;
-        if (solid || is_proc(h) || !cutout(h.tri, h.inst) || alpha_pass(h.tri, h.inst, h.u, h.v, t)) { return Hit(t, h.tri, h.u, h.v, h.inst); }
+        // A shadow ray passes the glass among an instance's sections (its row says so; an instance that is all glass is
+        // out of its way by its mask).
+        let passes = has(F_IGLASS) && has(F_ROWS) && mask == 1u && hit_row != NO_ROW && (hit_row & ROW_GLASS) != 0u;
+        if (!passes) {
+            if (!has(F_MASKED) || solid || is_proc(h) || !cutout_hit(h) || alpha_pass(h.tri, h.inst, h.u, h.v, t)) { return Hit(t, h.tri, h.u, h.v, h.inst); }
+            hole = true;
+        }
         if (first) { first = false; } else { t0 = t + 1e-4 * max(1.0, t); }
     }
     if (any) { return Hit(t0, 0u, 0.0, 0.0, NO_INST); }
@@ -55,11 +64,13 @@
 
 // The closest (or with `any`, the first found) hit, every triangle opaque.
 @if(hwrt) fn trace_opaque(o: vec3<f32>, d: vec3<f32>, tmax_in: f32, mask: u32, any: bool) -> Hit {
+    hit_row = NO_ROW;
     @if(strict) if (ray_bad(o, d, tmax_in)) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST); }
     var rq: ray_query;
-    // A shadow ray (mask 1) where an instanced mesh mixes glass with other triangles (F_IGLASS): it culls the geometry
+    // A shadow ray (mask 1) where a model's mesh mixes glass with other triangles (F_IGLASS): it culls the geometry
     // that is not flagged opaque, the glass parts alone (gpu.rs), instead of forcing every geometry opaque. A mesh that
-    // is all glass is out of its way by the instance's mask. (Measured on Metal with every geometry opaque: the same
+    // is all glass is out of its way by the instance's mask. (A mesh with sections has every geometry flagged opaque:
+    // `trace` steps through its glass.) (Measured on Metal with every geometry opaque: the same
     // pictures, at most 0.5 % of a frame's GPU time.)
     let opacity = select(RAY_FLAG_FORCE_OPAQUE, RAY_FLAG_CULL_NO_OPAQUE, has(F_IGLASS) && mask == 1u);
     let flags = select(opacity, opacity | RAY_FLAG_TERMINATE_ON_FIRST_HIT, any);
@@ -98,10 +109,15 @@
     return Hit(it.t, ti, it.barycentrics.x, it.barycentrics.y, hit_inst(it.instance_custom_data));
 }
 
-// An alpha-cutout triangle: its material has an alpha test (as the build flags TRI_MASKED; model instances' pool
-// triangles carry no flags).
-@if(hwrt) fn cutout(ti: u32, inst: u32) -> bool {
-    return material_at(material_of(attrs[ti], inst)).uv2.w > 0.0;
+// The first word of the row of the hit `trace_opaque` last found (its material and class bits), NO_ROW where its
+// instance has no rows: the trace's tests of a hit read no attribute and no material then.
+@if(hwrt) var<private> hit_row: u32;
+@if(hwrt) const NO_ROW: u32 = 0xffffffffu;
+// Whether that hit is an alpha-cutout's: its row says, or without a row its triangle's material has an alpha test (as
+// the build flags TRI_MASKED; a model instance's pool triangles carry no flags, and its record is not asked again).
+@if(hwrt) fn cutout_hit(h: Hit) -> bool {
+    if (has(F_ROWS) && hit_row != NO_ROW) { return (hit_row & ROW_CUTOUT) != 0u; }
+    return material_at(triangle_material(attrs[h.tri])).uv2.w > 0.0;
 }
 
 // The model-instance record a hit's custom data names (F_INST), or NO_INST for a traversal group.
@@ -118,6 +134,14 @@
         // (Its mesh's geometries: where the second and the third start, scene.rs `InstMesh::part_offsets`; a third
         // only with glass.)
         let rec = instance_at(custom & (INSTANCE_BIT - 1u));
+        // (With rows: a geometry is a section, and its row has where its triangles start; the first section starts
+        // where the mesh does. The row's class is read where the trace tests a hit by it.)
+        if (has_rows(rec)) {
+            if (has(F_MASKED) || has(F_IGLASS)) { hit_row = row_word(rec.info.w, geometry, 0u); }
+            var first = rec.info.x;
+            if (geometry != 0u) { first = row_word(rec.info.w, geometry, 1u); }
+            return first + prim;
+        }
         var at = select(0u, rec.info.w, geometry == 1u);
         if (has(F_IGLASS) && geometry == 2u) { at = bitcast<u32>(rec.n0.w); }
         return rec.info.x + at + prim;
