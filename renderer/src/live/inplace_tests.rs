@@ -504,14 +504,25 @@ fn a_glass_mesh_added_is_drawn_as_a_build_draws_it() {
         let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
         assert!(apart(&before, &b) > 0.5, "the pane is in the picture ({:.2} steps)", apart(&before, &b));
         assert!(apart(&a, &b) < 0.5, "glass on an instance already: {has}: the picture is {:.2} steps from a build's", apart(&a, &b));
-        // A material of an instance's triangles that turns glass (the mesh of its own, and the wall): by a rebuild, its
-        // instances' masks and its mesh's geometries being the build's.
+        // A material of instances' triangles that turns glass (the mesh of its own, and the wall), and is plain
+        // again: their rows and their masks say so, in place.
         w.set_material(1, serde_json::from_value(serde_json::json!({ "name": "m", "color": [0.8, 0.4, 0.8], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [1, 1, 1], "emissiveIntensity": 0, "doubleSided": true, "transmission": 1, "ior": 1.5 })).unwrap());
-        assert!(live.commit(&mut w).unwrap(), "a material of an instance's triangles turned glass: a rebuild");
+        assert!(!live.commit(&mut w).unwrap(), "a material of instances' triangles turned glass: in place ({:?})", live.fallback);
+        let wall = live.sc.instances.iter().find(|i| i.name == "wall").expect("the wall is an instance");
+        assert!(!wall.cast_shadow && wall.bits & scene::INST_GLASS != 0, "the wall is glass: it casts no shadow");
         let mut fresh = open(&w).unwrap();
         forget(&mut live);
         let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
         assert!(apart(&a, &b) < 0.5, "a material turned glass: the picture is {:.2} steps from a build's", apart(&a, &b));
+        w.set_material(1, serde_json::from_value(serde_json::json!({ "name": "m", "color": [0.8, 0.4, 0.8], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [1, 1, 1], "emissiveIntensity": 0, "doubleSided": true })).unwrap());
+        assert!(!live.commit(&mut w).unwrap(), "the material plain again: in place ({:?})", live.fallback);
+        let wall = live.sc.instances.iter().find(|i| i.name == "wall").expect("the wall is an instance");
+        assert!(wall.cast_shadow && wall.bits & scene::INST_GLASS == 0, "the wall casts its shadow again");
+        let mut fresh = open(&w).unwrap();
+        forget(&mut live);
+        let (c, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+        assert!(apart(&c, &b) < 0.5, "the material plain again: the picture is {:.2} steps from a build's", apart(&c, &b));
+        assert!(apart(&a, &c) > 0.5, "glass or not is in the picture ({:.2} steps)", apart(&a, &c));
     }
 }
 
@@ -660,12 +671,8 @@ fn an_emitting_instanced_object_added_in_place_is_lit_as_a_build_lights_it() {
         let mut run = 0;
         for (what, edit) in &edits {
             let what = format!("an emitting instanced object {what} in place, {} a light tree", if tree { "with" } else { "without" });
-            // (Its material covers instances' triangles once it is added: `Tables::fixed_mats`.)
-            let covers = |c: &LiveCore| c.sc.tables.fixed_mats.contains(&c.sc.tables.retained.materials[&5]);
-            let before = covers(&live);
             edit(&mut w);
             assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
-            assert!(covers(&live) && (before || what.contains("added")), "{what}: its material is among those of instances' triangles");
             // Its copies' rows: a run of the room's, the room's again once it is removed.
             match live.sc.tables.retained.instanced(15) {
                 Some(place) => {
@@ -1004,6 +1011,23 @@ fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does()
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
         list_is_its_triangles(&what, &live);
         lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        // A material an instanced object added in place has too: its copy's emitters, as the meshes'.
+        if live.g.hwrt {
+            w.set_object(31, "more".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![9], capacity: 1 }, true, false).unwrap();
+            w.set_instances(31, 1, Some(glam::Mat4::from_translation(Vec3::new(0.4, 0.2, 1.1)).to_cols_array().to_vec()), None, None).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "an instanced object added, {with} a light tree: in place ({:?})", live.fallback);
+            w.set_material(9, late(30.0));
+            let what = format!("a material an instanced object added in place has too started emitting, {with} a light tree");
+            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+            list_is_its_triangles(&what, &live);
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        }
+        // One an instanced object of the build has too: its copies', a copy that is not shown at no weight.
+        w.set_material(7, late(30.0));
+        let what = format!("a material an instanced object has too started emitting, {with} a light tree");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        list_is_its_triangles(&what, &live);
+        lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
         w.set_transform(14, Vec3::new(0.2, -0.3, 1.2), glam::Quat::from_rotation_z(0.6), Vec3::ONE).unwrap();
         let what = format!("the movable one of them moved, {with} a light tree");
         assert!(!(live.commit(&mut w).unwrap() && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
@@ -1012,24 +1036,14 @@ fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does()
         forget(&mut live);
         let (a, b) = (picture(&mut live, 64), picture(&mut open(&w).unwrap(), 64));
         assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
-        // A material meshes had alone, until an instanced object of it is added in place: a rebuild from then on.
-        if live.g.hwrt {
-            w.set_object(31, "more".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![9], capacity: 1 }, true, false).unwrap();
-            w.set_instances(31, 1, Some(glam::Mat4::from_translation(Vec3::new(0.4, 0.2, 1.1)).to_cols_array().to_vec()), None, None).unwrap();
-            assert!(!live.commit(&mut w).unwrap(), "an instanced object added, {with} a light tree: in place ({:?})", live.fallback);
-            w.set_material(9, late(30.0));
-            assert!(live.commit(&mut w).unwrap(), "a material an instanced object added in place has too started emitting, {with} a light tree: a rebuild");
-        }
-        // (Its copies' emitters are a build's to make.)
-        w.set_material(7, late(30.0));
-        assert!(live.commit(&mut w).unwrap(), "a material an instanced object has too started emitting, {with} a light tree: a rebuild");
     }
 }
 
 /// A mesh hidden or shown by its `visible` is drawn and lit as a build draws it, in place: a still mesh, one that
 /// emits, one hidden when the scene was built, a group of two, a movable one moved while it was hidden. With and
 /// without a light tree. After each: no rebuild, the light list is its triangles, the weights and the picture are a
-/// build's. A mesh whose geometry changed while it was hidden is drawn again by a rebuild.
+/// build's. So for what an edit places unseen: a mesh whose geometry changed while it was hidden, one added hidden,
+/// one added without size.
 #[test]
 fn meshes_hidden_and_shown_in_place_are_drawn_as_a_build_draws_them() {
     let presets = crate::default_presets_dir();
@@ -1109,18 +1123,47 @@ fn meshes_hidden_and_shown_in_place_are_drawn_as_a_build_draws_them() {
             lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
         }
         assert_eq!((hidden(&live, 13), hidden(&live, 11), hidden(&live, 21)), ((true, true), (false, false), (false, false)), "{with} a light tree: as the world has them");
-        // Its geometry changed while it was hidden: the instance an edit took out is no longer its own to show.
+        // An edit places a mesh that is hidden, or has no size, as the build does: an instance no ray sees. Its geometry
+        // changed while it was hidden (its old mesh is left without a user), a mesh added hidden, one added without size:
+        // each comes back in place. A hidden mesh removed takes its mesh's user with it.
         if live.g.hwrt {
+            let mesh_of = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).unwrap().instance as usize].mesh;
             w.set_visible(22, false).unwrap();
             assert!(!live.commit(&mut w).unwrap(), "a mesh the scene edits hidden, {with} a light tree: in place ({:?})", live.fallback);
-            let its = live.sc.instances[live.sc.tables.retained.instance(22).unwrap().instance as usize].mesh;
+            let its = mesh_of(&live, 22);
             w.set_geometry(8, quad(0.35)).unwrap();
-            assert!(!live.commit(&mut w).unwrap(), "its geometry changed while hidden, {with} a light tree: in place ({:?})", live.fallback);
-            assert_eq!(hidden(&live, 22), (true, false), "taken out by the edit");
-            assert_eq!(live.sc.edit.users.get(&its).copied().unwrap_or(0), 0, "and its mesh has no user left");
-            w.set_visible(22, true).unwrap();
-            assert!(live.commit(&mut w).unwrap(), "shown after its geometry changed, {with} a light tree: a rebuild");
-            let what = format!("a mesh shown after its geometry changed while hidden, {with} a light tree");
+            place(&mut w, 23, "added hidden", None, mesh(3, 5, false), false, [0.3, 0.6, 1.0]);
+            w.set_visible(23, false).unwrap();
+            w.set_object(24, "added without size".into(), None, mesh(3, 1, false), true, false).unwrap();
+            w.set_transform(24, Vec3::new(0.6, -0.1, 0.8), glam::Quat::IDENTITY, Vec3::ZERO).unwrap();
+            let what = format!("a hidden mesh's geometry changed, a mesh added hidden, one added without size, {with} a light tree");
+            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+            assert_eq!((hidden(&live, 22), hidden(&live, 23), hidden(&live, 24)), ((true, true), (true, true), (true, true)), "{what}: instances no ray sees");
+            // (As many triangles as before: the mesh is written again where it was, and has its one user.)
+            assert_eq!((mesh_of(&live, 22), live.sc.edit.users.get(&its).copied().unwrap_or(0)), (its, 1), "{what}: its mesh has its one user");
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+            let back: Vec<Edit> = vec![
+                ("a mesh shown after its geometry changed while hidden", show(22, true)),
+                ("a mesh added hidden shown", show(23, true)),
+                ("a mesh added without size given one", Box::new(|w| w.set_transform(24, Vec3::new(0.6, -0.1, 0.8), glam::Quat::from_rotation_y(-0.3), Vec3::ONE).unwrap())),
+                ("the added lamp hidden again", show(23, false)),
+            ];
+            for (what, edit) in &back {
+                let what = format!("{what}, {with} a light tree");
+                edit(&mut w);
+                assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+                if live.sc.tables.emitter_tris.iter().any(|e| e.area > 0.0) {
+                    list_is_its_triangles(&what, &live);
+                }
+                lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+            }
+            let its = mesh_of(&live, 22);
+            w.set_visible(22, false).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "hidden once more, {with} a light tree: in place ({:?})", live.fallback);
+            w.remove(22);
+            let what = format!("a hidden mesh removed, {with} a light tree");
+            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+            assert_eq!(live.sc.edit.users.get(&its).copied().unwrap_or(0), 0, "{what}: its mesh has no user left");
             lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
         }
     }
@@ -1608,6 +1651,355 @@ fn the_first_caster_with_glass_among_its_sections_is_a_rebuilds() {
     let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
     assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from a build's", apart(&a, &b));
     assert_ne!(live.sc.up.kernel.features & gpu::F_IGLASS, 0, "the kernel passes its glass");
+    // So for a mesh of several materials, glass one of them, added where none like it cast a shadow.
+    let mut w = world();
+    w.set_material(65, serde_json::from_value(serde_json::json!({ "name": "m", "color": [0.5, 0.9, 0.5], "opacity": 1, "metalness": 0, "roughness": 0, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true, "transmission": 1, "ior": 1.5 })).unwrap());
+    w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(28, Vec3::new(0.9, -0.1, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = open(&w).unwrap();
+    w.take_changes();
+    assert_eq!(live.sc.up.kernel.features & gpu::F_IGLASS, 0, "no caster has glass among its sections");
+    w.set_geometry(30, Geometry { positions: vec![-1.0, -0.5, 0.0, 0.0, -0.5, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5, 0.0, 0.0, 0.5, 0.0, 1.0, 0.5, 0.0], normals: [0.0, 0.0, 1.0].repeat(6), uvs: vec![0.0; 12], indices: vec![0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4], groups: vec![[0, 6, 0], [6, 6, 1]], colors: vec![] }).unwrap();
+    w.set_object(31, "pane".into(), None, Kind::Mesh { geometry: 30, material: 1, own_blas: false, materials: vec![1, 65] }, true, false).unwrap();
+    w.set_transform(31, Vec3::new(0.0, 0.0, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    live.commit(&mut w).unwrap();
+    let mut fresh = open(&w).unwrap();
+    forget(&mut live);
+    let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+    assert!(apart(&a, &b) < 0.5, "a mesh with glass among its sections: the picture is {:.2} steps from a build's", apart(&a, &b));
+    assert_ne!(live.sc.up.kernel.features & gpu::F_IGLASS, 0, "the kernel passes its glass");
+}
+
+/// A mesh of several materials (a geometry group each) is edited in place as one of a single material is: added
+/// (its mesh made with its sections), given other materials (its rows: nothing made), another of its geometry added
+/// (the mesh shared), its geometry changed (the same sections: where it lies; others: a new mesh), removed (its rows
+/// the room's again). Each time the light list, the weights and the picture are a build's.
+#[test]
+fn a_mesh_of_several_materials_is_edited_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let plain = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<crate::desc::Material>(m).unwrap()
+    };
+    // Bands side by side, `w` wide each, a group for each run of `groups` of them.
+    let bands = |w: f32, groups: &[u32]| {
+        let n: u32 = groups.iter().sum();
+        let positions: Vec<f32> = (0..=n).flat_map(|i| { let x = (i as f32 - n as f32 / 2.0) * w; [x, -0.4, 0.0, x, 0.4, 0.0] }).collect();
+        let indices: Vec<u32> = (0..n).flat_map(|i| [2 * i, 2 * i + 2, 2 * i + 3, 2 * i, 2 * i + 3, 2 * i + 1]).collect();
+        let mut at = 0;
+        let groups = groups.iter().enumerate().map(|(k, &g)| { at += g * 6; [at - g * 6, g * 6, k as u32] }).collect();
+        Geometry { normals: [0.0, 0.0, 1.0].repeat(2 * (n as usize + 1)), uvs: vec![0.0; 4 * (n as usize + 1)], positions, indices, groups, colors: vec![] }
+    };
+    let mut w = world();
+    w.set_material(62, plain(serde_json::json!({})));
+    w.set_material(63, plain(serde_json::json!({ "opacity": 0.3, "alphaTest": 0.5 })));
+    w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": 0.5, "color": [0.2, 0.6, 0.9] })));
+    w.set_material(65, plain(serde_json::json!({ "color": [0.5, 0.9, 0.5], "roughness": 0, "transmission": 1, "ior": 1.5 })));
+    // (At the build: a caster with a cutout and glass among its sections, so the kernel has both; a mesh the scene
+    // says it edits, for the room.)
+    w.set_geometry(30, bands(0.3, &[1, 1, 1])).unwrap();
+    w.set_object(40, "bands".into(), None, Kind::Mesh { geometry: 30, material: 62, own_blas: true, materials: vec![62, 63, 65] }, true, false).unwrap();
+    w.set_transform(40, Vec3::new(-0.9, 0.6, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let placed = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).expect("a mesh is an instance").instance as usize].clone();
+    let rows_of = |c: &LiveCore, id: u32| { let i = placed(c, id); c.sc.rows[i.rows as usize..][..c.sc.meshes[i.mesh as usize].sect_count as usize].to_vec() };
+    let materials = |c: &LiveCore, id: u32| rows_of(c, id).iter().map(scene::row_material).collect::<Vec<u32>>();
+    let of = |c: &LiveCore, ids: &[u32]| ids.iter().map(|k| c.sc.tables.retained.materials[k]).collect::<Vec<u32>>();
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        list_is_its_triangles(what, live);
+        let mut fresh = open(w).unwrap();
+        lit_as_a_build(what, live, &mut fresh);
+    };
+    let place = |w: &mut World, id: u32, geometry: u32, materials: &[u32], at: Vec3| {
+        w.set_object(id, format!("bands{id}"), None, Kind::Mesh { geometry, material: materials[0], own_blas: false, materials: materials.to_vec() }, true, false).unwrap();
+        w.set_transform(id, at, glam::Quat::from_rotation_y(0.2), Vec3::ONE).unwrap();
+    };
+    // Added: an emitter, a cutout, a plain band.
+    w.set_geometry(31, bands(0.25, &[1, 1, 1])).unwrap();
+    place(&mut w, 41, 31, &[5, 64, 62], Vec3::new(0.3, -0.5, 0.9));
+    assert!(!live.commit(&mut w).unwrap(), "a mesh of three materials added: in place ({:?})", live.fallback);
+    let (mesh, first) = (placed(&live, 41).mesh, placed(&live, 41).rows);
+    assert_eq!((live.sc.meshes[mesh as usize].sect_count, materials(&live, 41)), (3, of(&live, &[5, 64, 62])), "its mesh has three sections, its rows their materials");
+    against_a_build("a mesh of three materials added in place", &mut live, &w);
+    // Other materials: its rows where they are, no mesh made, no triangle written. The emitter is another section's.
+    let (meshes, triangles) = (live.sc.meshes.len(), live.sc.pool_tris.len());
+    place(&mut w, 41, 31, &[62, 65, 5], Vec3::new(0.3, -0.5, 0.9));
+    assert!(!live.commit(&mut w).unwrap(), "its materials changed: in place ({:?})", live.fallback);
+    assert_eq!((placed(&live, 41).mesh, placed(&live, 41).rows, live.sc.meshes.len(), live.sc.pool_tris.len()), (mesh, first, meshes, triangles), "it keeps its mesh and its rows: nothing made");
+    assert_eq!(materials(&live, 41), of(&live, &[62, 65, 5]));
+    against_a_build("a mesh of three materials given others", &mut live, &w);
+    // Another object of the geometry, with its own materials: the mesh shared.
+    place(&mut w, 42, 31, &[64, 5, 62], Vec3::new(-0.2, 0.55, 1.2));
+    assert!(!live.commit(&mut w).unwrap(), "another of the geometry: in place ({:?})", live.fallback);
+    assert_eq!((placed(&live, 42).mesh, live.sc.meshes.len()), (mesh, meshes), "it shares the mesh");
+    against_a_build("another object of a geometry of three materials", &mut live, &w);
+    // The geometry changed, its sections as they were: the mesh rewritten where it lies.
+    w.set_geometry(31, bands(0.2, &[1, 1, 1])).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "its geometry changed: in place ({:?})", live.fallback);
+    assert_eq!((placed(&live, 41).mesh, placed(&live, 42).mesh, live.sc.meshes.len()), (mesh, mesh, meshes), "the same sections: the mesh where it lies");
+    against_a_build("a geometry of three materials changed, its sections as they were", &mut live, &w);
+    // Other sections (two groups, the first of two bands): a new mesh, the rows as many as it has now.
+    w.set_geometry(31, bands(0.2, &[2, 1])).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "its geometry's groups changed: in place ({:?})", live.fallback);
+    let mesh = placed(&live, 41).mesh;
+    assert_eq!((live.sc.meshes[mesh as usize].sect_count, placed(&live, 42).mesh, materials(&live, 41), materials(&live, 42)), (2, mesh, of(&live, &[62, 65]), of(&live, &[64, 5])), "two sections: two rows an object");
+    against_a_build("a geometry whose groups changed", &mut live, &w);
+    // Three sections again, then four: a freed mesh's sections are the next one's only where they are as many.
+    for groups in [&[1, 1, 1][..], &[1, 1, 1, 1]] {
+        w.set_geometry(31, bands(0.2, groups)).unwrap();
+        let what = format!("a geometry of {} groups after one of fewer", groups.len());
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert_eq!(live.sc.meshes[placed(&live, 41).mesh as usize].sect_count as usize, groups.len(), "{what}: as many sections");
+        against_a_build(&what, &mut live, &w);
+    }
+    // Removed: their rows are the room's again.
+    let (a, b) = (placed(&live, 41).rows, placed(&live, 42).rows);
+    w.remove(41);
+    w.remove(42);
+    assert!(!live.commit(&mut w).unwrap(), "the two removed: in place ({:?})", live.fallback);
+    assert!(rows_free(&live, a, 4) && rows_free(&live, b, 4), "their rows are the room's again");
+    against_a_build("meshes of several materials removed", &mut live, &w);
+}
+
+/// A material that becomes a cutout, or stops being one, in place: the instances with a row of it say so (a mesh, a
+/// mesh of several materials, an instanced object's copies), and the picture is a build's. In a scene without a
+/// cutout the kernel has no alpha test: the first one is a rebuild's. A material created after the build, of any
+/// class (a cutout, glass, one that emits), is added in place with the mesh that is drawn with it.
+#[test]
+fn a_materials_alpha_test_comes_and_goes_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let plain = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<crate::desc::Material>(m).unwrap()
+    };
+    let two = || Geometry { positions: vec![-0.5, -0.3, 0.0, 0.0, -0.3, 0.0, 0.5, -0.3, 0.0, -0.5, 0.3, 0.0, 0.0, 0.3, 0.0, 0.5, 0.3, 0.0], normals: [0.0, 0.0, 1.0].repeat(6), uvs: vec![0.0; 12], indices: vec![0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4], groups: vec![[0, 6, 0], [6, 6, 1]], colors: vec![] };
+    // (`cutout`: a material of the scene is a cutout at the build, so the kernel has the alpha test.)
+    let scene = |cutout: bool| {
+        let mut w = world();
+        // (Opacity 0.3: with an alpha test at 0.5, nothing of it is there.)
+        w.set_material(61, plain(serde_json::json!({ "opacity": 0.3, "color": [0.2, 0.6, 0.9] })));
+        w.set_material(62, plain(serde_json::json!({})));
+        w.set_material(63, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": if cutout { 0.5 } else { 0.0 } })));
+        w.set_object(40, "tile".into(), None, Kind::Mesh { geometry: 3, material: 61, own_blas: true, materials: vec![] }, true, false).unwrap();
+        w.set_transform(40, Vec3::new(-0.6, 0.5, 0.6), glam::Quat::IDENTITY, Vec3::splat(1.6)).unwrap();
+        w.set_geometry(30, two()).unwrap();
+        w.set_object(41, "pair".into(), None, Kind::Mesh { geometry: 30, material: 62, own_blas: false, materials: vec![62, 61] }, true, false).unwrap();
+        w.set_transform(41, Vec3::new(0.5, 0.5, 0.7), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        w.set_object(42, "copies".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![61], capacity: 2 }, true, false).unwrap();
+        let at = |x: f32| glam::Mat4::from_translation(Vec3::new(x, -0.5, 0.8)).to_cols_array();
+        w.set_instances(42, 2, Some([at(-0.4), at(0.4)].concat()), None, None).unwrap();
+        w.set_object(43, "other".into(), None, Kind::Mesh { geometry: 3, material: 63, own_blas: false, materials: vec![] }, true, false).unwrap();
+        w.set_transform(43, Vec3::new(1.2, -0.5, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        w
+    };
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| -> Vec<u8> {
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 64), picture(&mut fresh, 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let mut w = scene(true);
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let bits = |c: &LiveCore, name: &str| c.sc.instances.iter().filter(|i| i.name == name && (!i.hidden || i.masked)).map(|i| i.bits & scene::INST_CUTOUT).collect::<Vec<u32>>();
+    let before = picture(&mut live, 64);
+    w.set_material(61, plain(serde_json::json!({ "opacity": 0.3, "color": [0.2, 0.6, 0.9], "alphaTest": 0.5 })));
+    assert!(!live.commit(&mut w).unwrap(), "a material becomes a cutout: in place ({:?})", live.fallback);
+    assert_eq!((bits(&live, "tile"), bits(&live, "pair"), bits(&live, "copies")), (vec![scene::INST_CUTOUT], vec![scene::INST_CUTOUT], vec![scene::INST_CUTOUT; 2]), "their records say they have a cutout");
+    let holes = against_a_build("a material becomes a cutout", &mut live, &w);
+    assert!(apart(&before, &holes) > 0.5, "what was drawn with it is gone ({:.2} steps)", apart(&before, &holes));
+    w.set_material(61, plain(serde_json::json!({ "opacity": 0.3, "color": [0.2, 0.6, 0.9] })));
+    assert!(!live.commit(&mut w).unwrap(), "it stops being one: in place ({:?})", live.fallback);
+    assert_eq!((bits(&live, "tile"), bits(&live, "pair"), bits(&live, "copies")), (vec![0], vec![0], vec![0; 2]), "their records say they have none");
+    let back = against_a_build("a material stops being a cutout", &mut live, &w);
+    assert!(apart(&before, &back) < 0.5, "it is drawn again ({:.2} steps)", apart(&before, &back));
+    // Materials made after the build, of every class, and a mesh drawn with them.
+    w.set_material(71, plain(serde_json::json!({ "opacity": 0.3, "alphaTest": 0.5 })));
+    w.set_material(72, plain(serde_json::json!({ "color": [0.5, 0.9, 0.5], "roughness": 0, "transmission": 1, "ior": 1.5 })));
+    w.set_material(73, plain(serde_json::json!({ "color": [0.0, 0.0, 0.0], "emissive": [1.0, 0.6, 0.2], "emissiveIntensity": 30 })));
+    for (i, material) in [71, 72, 73].into_iter().enumerate() {
+        w.set_object(50 + i as u32, format!("late{i}"), None, Kind::Mesh { geometry: 3, material, own_blas: false, materials: vec![] }, true, false).unwrap();
+        w.set_transform(50 + i as u32, Vec3::new(-1.0 + i as f32, 0.0, 1.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    }
+    assert!(!live.commit(&mut w).unwrap(), "materials of every class made after the build, and meshes of them: in place ({:?})", live.fallback);
+    list_is_its_triangles("a material that emits, made after the build", &live);
+    lit_as_a_build("materials of every class made after the build", &mut live, &mut open(&w).unwrap());
+    // Without a cutout at the build, the first is a rebuild's.
+    let mut w = scene(false);
+    let mut live = open(&w).unwrap();
+    w.take_changes();
+    assert_eq!(live.sc.up.kernel.features & gpu::F_MASKED, 0, "no cutout: the kernel has no alpha test");
+    w.set_material(61, plain(serde_json::json!({ "opacity": 0.3, "color": [0.2, 0.6, 0.9], "alphaTest": 0.5 })));
+    live.commit(&mut w).unwrap();
+    against_a_build("the scene's first cutout", &mut live, &w);
+    assert_ne!(live.sc.up.kernel.features & gpu::F_MASKED, 0, "the kernel has it now");
+}
+
+/// An instanced object given another material, in place: every copy's row names it (a copy that is not shown too),
+/// with its class, and the copies' emitters go or are made with it. Plain, then one that emits, a third copy shown,
+/// a cutout, glass, plain again: each time the light list, the weights and the picture are a build's.
+#[test]
+fn an_instanced_object_given_another_material_has_it_in_its_copies_rows() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let plain = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<crate::desc::Material>(m).unwrap()
+    };
+    let mut w = world();
+    w.set_material(62, plain(serde_json::json!({ "color": [0.2, 0.6, 0.9] })));
+    w.set_material(63, plain(serde_json::json!({ "opacity": 0.3, "alphaTest": 0.5 })));
+    w.set_material(65, plain(serde_json::json!({ "color": [0.5, 0.9, 0.5], "roughness": 0, "transmission": 1, "ior": 1.5 })));
+    let copies = |w: &mut World, material: u32| w.set_object(42, "copies".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![material], capacity: 3 }, true, false).unwrap();
+    let at = |x: f32, y: f32| glam::Mat4::from_translation(Vec3::new(x, y, 0.8)).to_cols_array();
+    // (`by`: the copies moved that far along x.)
+    let placed = |w: &mut World, count: u32, by: f32| w.set_instances(42, count, Some([at(-0.5 + by, -0.5), at(0.4 + by, -0.5), at(by, 0.5)].concat()), None, None).unwrap();
+    let shown = |w: &mut World, count: u32| placed(w, count, 0.0);
+    copies(&mut w, 62);
+    shown(&mut w, 2);
+    // (A cutout at the build: the kernel has the alpha test.)
+    w.set_object(43, "other".into(), None, Kind::Mesh { geometry: 3, material: 63, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(43, Vec3::new(1.3, 0.6, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let named = |c: &LiveCore, material: u32| {
+        let place = *c.sc.tables.retained.instanced(42).expect("the copies are instances");
+        (0..3).all(|i| scene::row_material(&c.sc.rows[c.sc.instances[place.first as usize + i].rows as usize]) == c.sc.tables.retained.materials[&material])
+    };
+    let mut last = picture(&mut live, 64);
+    for (material, count, what) in [(5, 2, "one that emits"), (5, 3, "the third copy shown"), (63, 3, "a cutout"), (65, 3, "glass"), (62, 3, "a plain one again")] {
+        copies(&mut w, material);
+        shown(&mut w, count);
+        let what = format!("an instanced object given {what}");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert!(named(&live, material), "{what}: its copies' rows name it, the one not shown too");
+        if live.sc.tables.emitter_tris.iter().any(|e| e.area > 0.0) {
+            list_is_its_triangles(&what, &live);
+        }
+        lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        let now = picture(&mut live, 64);
+        assert!(apart(&last, &now) > 0.5, "{what}: it is in the picture ({:.2} steps)", apart(&last, &now));
+        last = now;
+    }
+    // Another material and another place in one commit: the emitters are where the copies are now.
+    copies(&mut w, 5);
+    placed(&mut w, 3, 0.35);
+    let what = "an instanced object given a material that emits and moved at once";
+    assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+    list_is_its_triangles(what, &live);
+    lit_as_a_build(what, &mut live, &mut open(&w).unwrap());
+    copies(&mut w, 62);
+    assert!(!live.commit(&mut w).unwrap(), "plain again: in place ({:?})", live.fallback);
+    // Its material starts emitting while a copy is not shown: that copy's emitters weigh nothing.
+    shown(&mut w, 2);
+    assert!(!live.commit(&mut w).unwrap(), "a copy hidden: in place ({:?})", live.fallback);
+    w.set_material(62, plain(serde_json::json!({ "color": [0.2, 0.6, 0.9], "emissive": [1.0, 0.7, 0.4], "emissiveIntensity": 25 })));
+    let what = "the copies' material starts emitting, a copy not shown";
+    assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+    list_is_its_triangles(what, &live);
+    lit_as_a_build(what, &mut live, &mut open(&w).unwrap());
+}
+
+/// What still changes by a rebuild: a material of world-space triangles. Particles' (dynamic triangles: their class
+/// is theirs, and they get no emitters in place) when it starts emitting or becomes a cutout; one that still
+/// triangles have (the build groups them by whether they are cutouts) when it becomes a cutout. The same change of
+/// a material that only instances' rows name is in place.
+#[test]
+fn a_material_of_world_space_triangles_changes_by_a_rebuild() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let plain = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<crate::desc::Material>(m).unwrap()
+    };
+    let mut w = world();
+    w.set_material(62, plain(serde_json::json!({})));
+    w.set_material(63, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": 0.5 })));
+    w.set_material(64, plain(serde_json::json!({ "opacity": 0.9 })));
+    w.set_particle_fn("spark", "fn pf_spark(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(0.3, 0.2, 1.0), vec3<f32>(0.05, 0.0, 0.0), vec3<f32>(0.0, 0.05, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(18, "sparks".into(), None, Kind::Particles { count: 3, emitter: "spark".into(), params: vec![], material: 62, emitter_area: 0.01 }, true, false).unwrap();
+    // (A cutout at the build: the kernel has the alpha test. And a mesh of a material of its own.)
+    w.set_object(43, "cut".into(), None, Kind::Mesh { geometry: 3, material: 63, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(43, Vec3::new(1.2, -0.5, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    w.set_object(44, "tile".into(), None, Kind::Mesh { geometry: 3, material: 64, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(44, Vec3::new(-1.0, -0.5, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let index = |c: &LiveCore, id: u32| c.sc.tables.retained.materials[&id];
+    assert!(live.sc.tables.moving_mats.contains(&index(&live, 62)) && !live.sc.tables.moving_mats.contains(&index(&live, 64)), "the particles' material is dynamic triangles', the tile's is not");
+    // The tile's material, which rows alone name: a cutout and back, in place.
+    for (test, what) in [(0.5, "becomes a cutout"), (0.0, "is none again")] {
+        w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": test })));
+        assert!(!live.commit(&mut w).unwrap(), "a material of rows {what}: in place ({:?})", live.fallback);
+    }
+    // The same, were it still triangles' too: a rebuild.
+    let k = index(&live, 64);
+    live.sc.tables.static_mats.insert(k);
+    w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": 0.5 })));
+    assert!(live.commit(&mut w).unwrap(), "a material of still triangles becomes a cutout: a rebuild");
+    // The particles' material: it starts emitting, it becomes a cutout.
+    w.set_material(62, plain(serde_json::json!({ "emissive": [1.0, 0.8, 0.6], "emissiveIntensity": 20 })));
+    assert!(live.commit(&mut w).unwrap(), "the particles' material starts emitting: a rebuild");
+    w.set_material(62, plain(serde_json::json!({ "emissive": [1.0, 0.8, 0.6], "emissiveIntensity": 20, "opacity": 0.9, "alphaTest": 0.5 })));
+    assert!(live.commit(&mut w).unwrap(), "the particles' material becomes a cutout: a rebuild");
+}
+
+/// A material that turns glass takes its instances' shadows with it, in place, and gives them back when it is
+/// plain again: a screen before the wall in the sun, of a material of its own. The picture is a build's each time.
+#[test]
+fn a_material_turned_glass_stops_casting_its_shadow_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let screen = |glass: bool| {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.9, 0.9, 0.9], "opacity": 1, "metalness": 0, "roughness": if glass { 0.0 } else { 1.0 }, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        if glass {
+            m.as_object_mut().unwrap().extend(serde_json::json!({ "transmission": 1, "ior": 1.5 }).as_object().unwrap().clone());
+        }
+        serde_json::from_value::<crate::desc::Material>(m).unwrap()
+    };
+    let mut w = world();
+    w.set_material(66, screen(false));
+    w.set_object(45, "screen".into(), None, Kind::Mesh { geometry: 2, material: 66, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(45, Vec3::new(0.3, 0.0, 0.5), glam::Quat::IDENTITY, Vec3::splat(0.5)).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let casts = |c: &LiveCore| c.sc.instances.iter().find(|i| i.name == "screen").expect("the screen is an instance").cast_shadow;
+    let mut last = picture(&mut live, 64);
+    for glass in [true, false, true] {
+        w.set_material(66, screen(glass));
+        let what = if glass { "the screen's material turns glass" } else { "it is plain again" };
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert_eq!(casts(&live), !glass, "{what}: whether it casts a shadow");
+        let mut fresh = open(&w).unwrap();
+        forget(&mut live);
+        let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last, &a) > 0.5, "{what}: it is in the picture ({:.2} steps)", apart(&last, &a));
+        last = a;
+    }
 }
 
 /// Models in a shared pose posed again in place (tests/render/data/arm.glb: a skinned strip, a dark half and a light
