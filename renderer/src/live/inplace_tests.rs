@@ -20,6 +20,11 @@ fn world() -> World {
     w.set_transform(11, Vec3::new(-0.4, 0.0, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
     w.set_object(12, "lamp".into(), None, mesh(3, 5), true, false).unwrap();
     w.set_transform(12, Vec3::new(0.6, 0.3, 1.5), glam::Quat::from_rotation_y(2.6), Vec3::ONE).unwrap();
+    // (A mesh of two sections behind the camera: an instance's rows are not at its record's index, here and for
+    // everything an edit places after.)
+    w.set_geometry(9, Geometry { groups: vec![[0, 3, 0], [3, 3, 1]], ..quad(0.05) }).unwrap();
+    w.set_object(9, "two".into(), None, Kind::Mesh { geometry: 9, material: 1, own_blas: false, materials: vec![1, 1] }, true, false).unwrap();
+    w.set_transform(9, Vec3::new(0.0, 0.0, 9.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
     let sun = serde_json::from_value(serde_json::json!({ "type": "directional", "color": [1.0, 0.9, 0.8], "castShadow": true, "intensity": 2.0, "angularDiameter": 0.5 })).unwrap();
     w.set_object(20, "sun".into(), None, Kind::Light(sun), true, false).unwrap();
     w.set_transform(20, Vec3::ZERO, glam::Quat::from_rotation_x(-0.5) * glam::Quat::from_rotation_y(0.4), Vec3::ONE).unwrap();
@@ -93,6 +98,13 @@ fn picture(core: &mut LiveCore, frames: u32) -> Vec<u8> {
     d.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     let bytes = to.slice(..).get_mapped_range().unwrap().to_vec();
     bytes
+}
+
+/// Whether rows `at .. at + n` are the room's to give again (a hole holds them, or they are past what is in use): what
+/// an object an edit placed gives back when it goes.
+fn rows_free(c: &LiveCore, at: u32, n: u32) -> bool {
+    let rows = &c.sc.edit.rows;
+    at as usize >= rows.end || rows.free.iter().any(|(&start, &len)| start <= at as usize && (at + n) as usize <= start + len)
 }
 
 /// The view without its histories (the radiance cache emptied, the frames' histories reset), as a new view is.
@@ -441,17 +453,13 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
             for (got, want) in [r.v0, r.e1, r.e2].into_iter().zip(placed) {
                 assert!((glam::Vec3::from(got) - want).length() <= 1e-4 * (1.0 + want.length()), "{what}: emitter {i}'s triangle {got:?}, its instance places it at {want:?}");
             }
-            if record.n[1][3].to_bits() & scene::INST_ROWS == 0 {
-                assert_eq!((record.n[2][3].to_bits(), record.n[2][3].to_bits() + a.x[3].to_bits()), (inst.first_emitter, i as u32 + 1), "{what}: triangle {} of instance {} finds its emitter", e.tri, e.inst);
-                alive += 1;
-                continue;
-            }
-            // An instance with rows: its section's row as the GPU has it says the material and where the section's
-            // emitters start, the triangle its index among them.
+            // Its section's row as the GPU has it says the material and where the section's emitters start, the
+            // triangle its index among them.
             let at = (record.info[3] + a.uv[3].to_bits()) as usize;
             let row: scene::Row = bytemuck::pod_read_unaligned(&gpu_rows[at * 16..][..16]);
             assert_eq!(row, c.sc.rows[at], "{what}: row {at} on the GPU is the scene's");
-            assert_eq!((record.info[3], record.n[2][3].to_bits()), (inst.rows, inst.first_emitter), "{what}: instance {}'s record has its rows and its first emitter", e.inst);
+            assert_eq!(record.info[3], inst.rows, "{what}: instance {}'s record has its rows", e.inst);
+            assert!(inst.first_emitter <= i as u32, "{what}: emitter {i} is of instance {}'s run, from {}", e.inst, inst.first_emitter);
             assert_eq!((row[2].wrapping_add(a.x[3].to_bits()), scene::row_material(&row)), (i as u32, e.mat), "{what}: triangle {} of instance {} finds its emitter, of its row's material", e.tri, e.inst);
         }
         alive += 1;
@@ -649,6 +657,7 @@ fn an_emitting_instanced_object_added_in_place_is_lit_as_a_build_lights_it() {
                 }),
             ),
         ];
+        let mut run = 0;
         for (what, edit) in &edits {
             let what = format!("an emitting instanced object {what} in place, {} a light tree", if tree { "with" } else { "without" });
             // (Its material covers instances' triangles once it is added: `Tables::fixed_mats`.)
@@ -657,6 +666,14 @@ fn an_emitting_instanced_object_added_in_place_is_lit_as_a_build_lights_it() {
             edit(&mut w);
             assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
             assert!(covers(&live) && (before || what.contains("added")), "{what}: its material is among those of instances' triangles");
+            // Its copies' rows: a run of the room's, the room's again once it is removed.
+            match live.sc.tables.retained.instanced(15) {
+                Some(place) => {
+                    run = live.sc.instances[place.first as usize].rows;
+                    assert!((0..3).all(|i| live.sc.instances[place.first as usize + i].rows == run + i as u32) && !rows_free(&live, run, 3), "{what}: a row a copy, in a run");
+                }
+                None => assert!(rows_free(&live, run, 3), "{what}: its rows are the room's again"),
+            }
             if live.sc.tables.emitter_tris.iter().any(|e| e.area > 0.0) {
                 list_is_its_triangles(&what, &live);
             }
@@ -1363,7 +1380,7 @@ fn objects_of_one_geometry_share_its_mesh_whatever_their_materials() {
     assert!((41..46).all(|id| mesh_of(&live, id) == shared), "the six objects of one geometry share its mesh");
     assert!(live.sc.meshes[shared as usize].colored && live.sc.meshes[shared as usize].sect_count == 1);
     let features = live.sc.up.kernel.features;
-    assert_eq!(features & (gpu::F_ROWS | gpu::F_MASKED | gpu::F_VCOLOR), gpu::F_ROWS | gpu::F_MASKED | gpu::F_VCOLOR);
+    assert_eq!(features & (gpu::F_MASKED | gpu::F_VCOLOR), gpu::F_MASKED | gpu::F_VCOLOR);
     let placed = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).unwrap().instance as usize].clone();
     assert!(!placed(&live, 44).cast_shadow && placed(&live, 43).cast_shadow, "glass alone casts no shadow");
     list_is_its_triangles("objects of one geometry, at the build", &live);
@@ -1391,13 +1408,16 @@ fn objects_of_one_geometry_share_its_mesh_whatever_their_materials() {
     assert!(!live.commit(&mut w).unwrap(), "an object of the geometry placed: in place ({:?})", live.fallback);
     assert_eq!((mesh_of(&live, 46), live.sc.meshes.len(), live.sc.pool_tris.len()), (shared, meshes, triangles), "it shares the mesh: none made");
     against_a_build("an object of the geometry placed in place", &mut live, &w);
-    // Another material for an object: its row. The plain one emits now, the one that emitted is a cutout.
-    for (id, material, at) in [(41, 5, Vec3::new(-1.35, 0.55, 0.6)), (45, 64, Vec3::new(2.25, 0.55, 0.6))] {
+    // Another material for an object: its row, the one it had (the build's, or the room's for the one placed above).
+    // The plain one emits now, the one that emitted is a cutout, the glass one placed in place is plain.
+    for (id, material, at) in [(41, 5, Vec3::new(-1.35, 0.55, 0.6)), (45, 64, Vec3::new(2.25, 0.55, 0.6)), (46, 62, Vec3::new(0.2, -0.5, 0.9))] {
+        let row = placed(&live, id).rows;
         place(&mut w, id, material, at);
         let what = format!("object {id} given material {material}");
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
         assert_eq!((mesh_of(&live, id), live.sc.meshes.len(), live.sc.pool_tris.len()), (shared, meshes, triangles), "{what}: it keeps the mesh, none made");
-        assert_eq!(scene::row_material(&live.sc.rows[placed(&live, id).rows as usize]), live.sc.tables.retained.materials[&material], "{what}: its row names it");
+        assert_eq!(placed(&live, id).rows, row, "{what}: it keeps its row");
+        assert_eq!(scene::row_material(&live.sc.rows[row as usize]), live.sc.tables.retained.materials[&material], "{what}: its row names it");
         against_a_build(&what, &mut live, &w);
     }
     // A geometry with colours that no object read at the build: its mesh was made without them, and an object that
@@ -1480,8 +1500,8 @@ fn glass_among_an_instances_sections_is_lit_through_as_glass_alone() {
             Err(e) => return eprintln!("skipped: {e}"),
         };
         let window = one.sc.instances.iter().find(|i| i.name == "window").expect("the window is an instance").clone();
-        assert_eq!((window.bits, window.cast_shadow, one.sc.meshes[window.mesh as usize].sect_count), (scene::INST_ROWS | scene::INST_GLASS, true, 2), "glass and a frame: one mesh, which casts");
-        let wanted = gpu::F_ROWS | gpu::F_IGLASS | if cutout { gpu::F_MASKED } else { 0 };
+        assert_eq!((window.bits, window.cast_shadow, one.sc.meshes[window.mesh as usize].sect_count), (scene::INST_GLASS, true, 2), "glass and a frame: one mesh, which casts");
+        let wanted = gpu::F_IGLASS | if cutout { gpu::F_MASKED } else { 0 };
         assert_eq!(one.sc.up.kernel.features & (wanted | gpu::F_MASKED), wanted);
         assert_eq!(one.sc.base.counts2[1], 1, "the sky is sampled as a light");
         let mut two = open(&scene(1, cutout)).unwrap();
@@ -1491,6 +1511,134 @@ fn glass_among_an_instances_sections_is_lit_through_as_glass_alone() {
         let c = picture(&mut open(&scene(2, cutout)).unwrap(), 96);
         assert!(apart(&a, &c) > 0.5, "the window is in the picture ({:.2} steps from none)", apart(&a, &c));
     }
+}
+
+/// A model of several materials placed in place has its rows from the room: as many as its mesh's sections, the
+/// file's materials, each where its section's triangles start, on the GPU as here, its record naming their first.
+/// It is drawn as a build draws it. Removed, it gives the rows back, and the next one placed takes them.
+#[test]
+fn a_model_of_several_materials_placed_in_place_has_its_rows() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    // (An opaque, a cutout and a glass quad: three sections.)
+    let model = || Kind::Model { uri: "tests/render/data/frame-pane.glb".into(), nodes: None, animation: None, functions: vec![] };
+    let mut w = world();
+    w.set_object(30, "first".into(), None, model(), true, false).unwrap();
+    w.set_transform(30, Vec3::new(-0.5, 0.3, 0.8), glam::Quat::IDENTITY, Vec3::splat(0.5)).unwrap();
+    // (A mesh the scene says it edits: room for what is placed.)
+    w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(28, Vec3::new(0.9, -0.1, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let built = live.sc.rows.len();
+    let placed = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).expect("a model is an instance").instance as usize].clone();
+    let read = |c: &LiveCore, b: &wgpu::Buffer, at: u64, bytes: u64| -> Vec<u8> {
+        let to = c.g.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut e = c.g.device.create_command_encoder(&Default::default());
+        e.copy_buffer_to_buffer(b, at, &to, 0, bytes);
+        c.g.queue.submit([e.finish()]);
+        to.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        c.g.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let bytes = to.slice(..).get_mapped_range().unwrap().to_vec();
+        bytes
+    };
+    let mut check = |live: &mut LiveCore, w: &World, id: u32, what: &str| -> u32 {
+        let (first, it) = (placed(live, 30), placed(live, id));
+        let im = live.sc.meshes[it.mesh as usize];
+        assert_eq!((it.mesh, im.sect_count), (first.mesh, 3), "{what}: an instance of the model's mesh, of three sections");
+        assert!(it.rows as usize >= built, "{what}: its rows are the room's");
+        let rows = |i: &scene::Instance| live.sc.rows[i.rows as usize..][..3].to_vec();
+        assert_eq!((rows(&it), it.bits, it.cast_shadow), (rows(&first), first.bits, first.cast_shadow), "{what}: the mesh's rows, as the first has them");
+        let up = &live.sc.up;
+        let on_gpu: Vec<scene::Row> = bytemuck::pod_collect_to_vec(&read(live, &up.words.buffer, up.words.at(crate::heap::Stream::Rows) + it.rows as u64 * 16, 48));
+        assert_eq!(on_gpu, rows(&it), "{what}: its rows on the GPU");
+        let record = live.sc.tables.retained.instance(id).unwrap().instance as u64;
+        let size = std::mem::size_of::<scene::GpuInstance>() as u64;
+        let rec: scene::GpuInstance = bytemuck::pod_read_unaligned(&read(live, &up.heap.buffer, up.heap.at(Table::Instances) + record * size, size));
+        assert_eq!(rec.info[3], it.rows, "{what}: its record names its rows");
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 64), picture(&mut fresh, 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        it.rows
+    };
+    let place = |w: &mut World, id: u32, at: Vec3| {
+        w.set_object(id, format!("m{id}"), None, model(), true, false).unwrap();
+        w.set_transform(id, at, glam::Quat::from_rotation_y(0.3), Vec3::splat(0.5)).unwrap();
+    };
+    place(&mut w, 31, Vec3::new(0.5, -0.3, 0.9));
+    assert!(!live.commit(&mut w).unwrap(), "a model placed: in place ({:?})", live.fallback);
+    let rows = check(&mut live, &w, 31, "a model placed in place");
+    w.remove(31);
+    assert!(!live.commit(&mut w).unwrap(), "the model removed: in place ({:?})", live.fallback);
+    assert!(rows_free(&live, rows, 3), "the model removed: its rows are the room's again");
+    place(&mut w, 32, Vec3::new(0.2, 0.5, 1.0));
+    assert!(!live.commit(&mut w).unwrap(), "another placed: in place ({:?})", live.fallback);
+    assert_eq!(check(&mut live, &w, 32, "another placed after the first was removed"), rows, "it takes the rows the first gave back");
+}
+
+/// A model with glass among its sections, in a scene where no instance of it casts a shadow: the kernel was built
+/// without what has a shadow ray pass such glass, so the first instance that casts is placed by a rebuild.
+#[test]
+fn the_first_caster_with_glass_among_its_sections_is_a_rebuilds() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let model = || Kind::Model { uri: "tests/render/data/frame-pane.glb".into(), nodes: None, animation: None, functions: vec![] };
+    let mut w = world();
+    w.set_object(30, "first".into(), None, model(), false, false).unwrap();
+    w.set_transform(30, Vec3::new(-0.5, 0.3, 0.8), glam::Quat::IDENTITY, Vec3::splat(0.5)).unwrap();
+    // (A mesh the scene says it edits: room for what is placed.)
+    w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(28, Vec3::new(0.9, -0.1, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert_eq!(live.sc.up.kernel.features & gpu::F_IGLASS, 0, "no caster has glass among its sections");
+    // (Upright before the wall, its pane 1 m wide: the pane's shadow is the sun's light through it.)
+    w.set_object(31, "caster".into(), None, model(), true, false).unwrap();
+    w.set_transform(31, Vec3::new(0.5, 0.0, 0.5), glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(2.0)).unwrap();
+    live.commit(&mut w).unwrap();
+    let mut fresh = open(&w).unwrap();
+    forget(&mut live);
+    let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+    assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from a build's", apart(&a, &b));
+    assert_ne!(live.sc.up.kernel.features & gpu::F_IGLASS, 0, "the kernel passes its glass");
+}
+
+/// Models in a shared pose posed again in place (tests/render/data/arm.glb: a skinned strip, a dark half and a light
+/// half that a joint swings): their mesh is skinned where it lies, each triangle still in its section. The picture is
+/// a build's.
+#[test]
+fn models_in_a_shared_pose_posed_again_keep_their_sections() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let bend = |time| Some(crate::desc::Animation { clip: "bend".into(), time, r#loop: true });
+    let mut w = world();
+    for (id, x) in [(30, -0.7), (31, 0.7)] {
+        w.set_object(id, format!("arm{id}"), None, Kind::Model { uri: "tests/render/data/arm.glb".into(), nodes: None, animation: bend(0.0), functions: vec![] }, true, false).unwrap();
+        w.set_transform(id, Vec3::new(x, -1.0, 0.8), glam::Quat::IDENTITY, Vec3::splat(2.0)).unwrap();
+    }
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let groups = &live.sc.tables.retained.pose_groups;
+    assert_eq!((groups.len(), live.sc.meshes[groups[0].mesh as usize].sect_count), (1, 2), "the two share a pose's mesh, of two sections");
+    for id in [30, 31] {
+        w.set_animation(id, bend(0.75)).unwrap();
+    }
+    let rebuilt = live.commit(&mut w).unwrap();
+    assert!(!(rebuilt && live.g.hwrt), "the pose changed in place ({:?})", live.fallback);
+    let mut fresh = open(&w).unwrap();
+    forget(&mut live);
+    let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+    assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from a build's", apart(&a, &b));
 }
 
 /// A scene whose only volume is hidden has its media passes made when it is loaded: the frame that shows the volume
