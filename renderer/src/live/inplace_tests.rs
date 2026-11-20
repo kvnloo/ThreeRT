@@ -117,6 +117,15 @@ fn forget(core: &mut LiveCore) {
     core.reset = true;
 }
 
+/// Whether the rays see the instance at `record`: by its mask above the triangles, or its unit.
+fn seen_by_rays(c: &LiveCore, record: u32) -> bool {
+    match (&c.sc.up.accel, &c.sc.up.units) {
+        (Some(a), _) => a.tlas[a.inst_base + record as usize].as_ref().is_some_and(|t| t.mask != 0),
+        (None, Some(u)) => u.slots.get(record as usize).copied().flatten().is_some_and(|x| !x.hidden),
+        _ => false,
+    }
+}
+
 /// Mean absolute difference of two pictures, in 8-bit steps.
 fn apart(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
@@ -2006,7 +2015,97 @@ fn a_material_turned_glass_stops_casting_its_shadow_in_place() {
 /// a node 5 m along x, a grey quad on a node the clip moves) is posed and moved in place: a new pose moves the
 /// node's instance alone; one moved takes the part left alone with it, whose emitters are moving ones from that
 /// first move (still ones, in the light tree, until then), movable object or not. Each time the light list is its
-/// triangles and the picture a build's.
+/// triangles and the picture a build's. Under software traversal too, where its parts are units.
+/// A posed rigid model given another clip of its file, which moves another node (tests/render/data/two-clips.glb), is
+/// posed in place: its parts are the nodes any clip moves, so they are the same ones.
+#[test]
+fn a_posed_rigid_model_given_another_clip_is_posed_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let pose = |clip: &str, time| Some(crate::desc::Animation { clip: clip.into(), time, r#loop: true, nodes: Default::default() });
+    let mut w = world();
+    w.set_object(32, "posed".into(), None, Kind::Model { uri: "tests/render/data/two-clips.glb".into(), nodes: None, animation: pose("raise-left", 0.5), functions: vec![] }, true, false).unwrap();
+    w.set_transform(32, Vec3::new(-0.2, 0.1, 0.6), glam::Quat::IDENTITY, Vec3::splat(0.12)).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let parts = |c: &LiveCore| {
+        let r = c.sc.tables.retained.rigid(32).expect("a posed rigid model");
+        (r.instances.iter().map(|&(node, i)| (node, c.sc.instances[i as usize].world)).collect::<Vec<_>>(), r.still.map(|i| c.sc.instances[i as usize].world))
+    };
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        let mut fresh = open(w).unwrap();
+        assert_eq!(parts(live), parts(&fresh), "{what}: its parts and where they stand, as a build's");
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+    };
+    let loaded = parts(&live);
+    let at = |p: &(Vec<(usize, glam::Mat4)>, Option<glam::Mat4>), node: usize| p.0.iter().find(|q| q.0 == node).expect("the node's part").1;
+    assert_eq!((loaded.0.len(), loaded.1.is_some()), (2, true), "a part each node a clip moves, and the node none does");
+    against_a_build("a posed rigid model, as loaded", &mut live, &w);
+    w.set_animation(32, pose("raise-right", 0.75)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "another clip of the file: in place ({:?})", live.fallback);
+    let other = parts(&live);
+    assert!(at(&other, 1) != at(&loaded, 1) && at(&other, 2) != at(&loaded, 2) && other.1 == loaded.1, "the first clip's node is back where the file has it, the other's is raised, the third stays");
+    against_a_build("another clip of the file", &mut live, &w);
+}
+
+/// A pose that moves other nodes than the one its parts were made for (it names a node the clip leaves alone): the
+/// parts are a build's to make again. In place the named node would stay where the part it is merged into stands.
+#[test]
+fn a_posed_rigid_model_whose_new_pose_moves_other_nodes_is_rebuilt() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let pose = |time, nodes: &[(&str, [f32; 7])]| Some(crate::desc::Animation { clip: "slide".into(), time, r#loop: true, nodes: nodes.iter().map(|(n, v)| (n.to_string(), v.to_vec())).collect() });
+    let model = |a| Kind::Model { uri: "tests/render/data/panel-slider.glb".into(), nodes: None, animation: a, functions: vec![] };
+    let mut w = world();
+    w.set_object(32, "posed".into(), None, model(pose(0.25, &[])), true, false).unwrap();
+    w.set_transform(32, Vec3::new(-0.6, 0.2, 0.6), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        list_is_its_triangles(what, live);
+        let mut fresh = open(w).unwrap();
+        let parts = |c: &LiveCore| c.sc.tables.retained.rigid(32).map(|r| (r.instances.iter().map(|&(node, i)| (node, c.sc.instances[i as usize].world)).collect::<Vec<_>>(), r.still.map(|i| c.sc.instances[i as usize].world)));
+        assert_eq!(parts(live), parts(&fresh), "{what}: its parts and where they stand, as a build's");
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let before = against_a_build("a posed rigid model, as loaded", &mut live, &w);
+    // The panel, a node the clip leaves alone, named by the pose: lifted and turned.
+    let lifted = [("panel", [2.0, 4.0, 0.0, 0.0, 0.0, 0.38268343, 0.92387953])];
+    w.set_animation(32, pose(0.25, &lifted)).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "a pose that names a node the clip leaves alone: a rebuild");
+    let named = against_a_build("a pose that names a node the clip leaves alone", &mut live, &w);
+    assert!(apart(&before, &named) > 0.5, "the named node's pose is in the picture ({:.2} steps)", apart(&before, &named));
+    // The same nodes named, posed on: in place.
+    w.set_animation(32, pose(0.75, &[("panel", [3.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0])])).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the same nodes posed on: in place ({:?})", live.fallback);
+    against_a_build("the same nodes posed on", &mut live, &w);
+    // Another placed with the same node named: the scene's parts, in place; posed on in place; named no more, a rebuild.
+    w.set_object(33, "second".into(), None, model(pose(0.5, &lifted)), true, false).unwrap();
+    w.set_transform(33, Vec3::new(0.5, -0.4, 0.7), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "another with the same node named: in place ({:?})", live.fallback);
+    w.set_animation(33, pose(0.9, &lifted)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "it, posed on: in place ({:?})", live.fallback);
+    against_a_build("another with the same node named, posed on", &mut live, &w);
+    w.set_animation(33, pose(0.9, &[])).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "it, its node named no more: a rebuild");
+    against_a_build("another, its node named no more", &mut live, &w);
+    // Named no more: a rebuild again.
+    w.set_animation(32, pose(0.75, &[])).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "a pose that names the node no more: a rebuild");
+    against_a_build("a pose that names the node no more", &mut live, &w);
+}
+
 #[test]
 fn a_posed_rigid_model_is_posed_and_moved_in_place_with_the_nodes_its_clip_leaves_alone() {
     let presets = crate::default_presets_dir();
@@ -2020,8 +2119,7 @@ fn a_posed_rigid_model_is_posed_and_moved_in_place_with_the_nodes_its_clip_leave
     w.set_object(33, "movable".into(), None, model(0.25), true, true).unwrap();
     w.set_transform(33, Vec3::new(0.2, -0.7, 0.6), glam::Quat::IDENTITY, size).unwrap();
     let mut live = match open(&w) {
-        Ok(c) if c.g.hwrt => c,
-        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Ok(c) => c,
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
@@ -2092,8 +2190,7 @@ fn a_posed_rigid_model_under_groups_is_not_moved_by_a_new_pose() {
     let local = |id: u32| w.objects[&id].local();
     assert_ne!((local(50) * local(51)) * local(32), w.world_matrix(32), "the test's transforms: the two products differ");
     let mut live = match open(&w) {
-        Ok(c) if c.g.hwrt => c,
-        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Ok(c) => c,
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
@@ -2108,6 +2205,274 @@ fn a_posed_rigid_model_under_groups_is_not_moved_by_a_new_pose() {
     forget(&mut live);
     let (a, b) = (picture(&mut live, 48), picture(&mut fresh, 48));
     assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from a build's", apart(&a, &b));
+}
+
+/// A posed rigid model is hidden, shown and removed in place, under either traversal. Hidden, its parts are
+/// instances no ray sees, their emitters at no weight, and it is posed and moved on; shown, it stands where it was
+/// moved to, as its clip has it now; removed, its instances are no object's. Each time the light list is its
+/// triangles and the picture a build's.
+#[test]
+fn a_posed_rigid_model_is_hidden_shown_and_removed_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let slide = |time| Some(crate::desc::Animation { clip: "slide".into(), time, r#loop: true, nodes: Default::default() });
+    let model = |time| Kind::Model { uri: "tests/render/data/panel-slider.glb".into(), nodes: None, animation: slide(time), functions: vec![] };
+    let size = Vec3::splat(0.08);
+    let mut w = world();
+    w.set_object(32, "posed".into(), None, model(0.25), true, false).unwrap();
+    w.set_transform(32, Vec3::new(-1.3, 0.6, 0.5), glam::Quat::IDENTITY, size).unwrap();
+    w.set_object(33, "movable".into(), None, model(0.25), true, true).unwrap();
+    w.set_transform(33, Vec3::new(0.2, -0.7, 0.6), glam::Quat::IDENTITY, size).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let records = |c: &LiveCore, id: u32| c.sc.tables.retained.rigid(id).expect("a posed rigid model").records();
+    let (a, b) = (records(&live, 32), records(&live, 33));
+    let seen = |c: &LiveCore, of: &[u32]| of.iter().map(|&i| (c.sc.instances[i as usize].hidden, c.sc.instances[i as usize].masked)).collect::<Vec<_>>();
+    let lit = |c: &LiveCore, of: &[u32]| c.sc.tables.emitter_tris.iter().filter(|e| of.contains(&e.inst) && crate::emitter_power(e, &c.sc.tables.materials, &c.sc.tables.objects, c.sc.tables.stride) > 0.0).count();
+    let rays = |c: &LiveCore, of: &[u32]| of.iter().map(|&i| seen_by_rays(c, i)).collect::<Vec<bool>>();
+    // (The panel's two triangles: 32 m2 each in the model, 0.08 x 0.08 of that as it is placed.)
+    let areas = |c: &LiveCore, of: &[u32]| c.sc.tables.emitter_tris.iter().filter(|e| of.contains(&e.inst) && e.area > 0.0).map(|e| (e.area * 1e4).round() / 1e4).collect::<Vec<f32>>();
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        list_is_its_triangles(what, live);
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let before = against_a_build("posed rigid models, as loaded", &mut live, &w);
+    assert_eq!((lit(&live, &a), lit(&live, &b)), (2, 2), "each panel's two emitters weigh something");
+    // Hidden: instances no ray sees, emitters at no weight.
+    w.set_visible(33, false).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "a posed rigid model hidden: in place ({:?})", live.fallback);
+    assert_eq!((seen(&live, &b), lit(&live, &b), seen(&live, &a), lit(&live, &a)), (vec![(true, true); 2], 0, vec![(false, false); 2], 2), "its parts are unseen, the other model's are not");
+    assert_eq!((rays(&live, &b), rays(&live, &a)), (vec![false; 2], vec![true; 2]), "no ray sees its parts");
+    assert_eq!((areas(&live, &b), areas(&live, &a)), (vec![32.0; 2], vec![0.2048; 2]), "an unseen instance's emitters have their mesh's own area, as a hidden mesh's");
+    let hidden = against_a_build("a posed rigid model hidden", &mut live, &w);
+    assert!(apart(&before, &hidden) > 0.5, "it is gone from the picture ({:.2} steps)", apart(&before, &hidden));
+    // Posed while hidden, then moved while hidden: nothing of it is drawn.
+    w.set_animation(33, slide(0.8)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "posed while hidden: in place ({:?})", live.fallback);
+    assert_eq!(rays(&live, &b), vec![false; 2], "posed while hidden: no ray sees its parts");
+    w.set_transform(33, Vec3::new(-0.5, -0.1, 0.9), glam::Quat::from_rotation_z(0.5), size).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "moved while hidden: in place ({:?})", live.fallback);
+    assert_eq!((seen(&live, &b), lit(&live, &b)), (vec![(true, true); 2], 0));
+    let still = against_a_build("a hidden posed rigid model posed and moved", &mut live, &w);
+    assert!(apart(&hidden, &still) < 0.5, "nothing of it is in the picture ({:.2} steps)", apart(&hidden, &still));
+    // Shown: where it was moved to, as its clip has it now.
+    w.set_visible(33, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "shown again: in place ({:?})", live.fallback);
+    assert_eq!((seen(&live, &b), lit(&live, &b)), (vec![(false, false); 2], 2), "its parts are seen, its emitters weigh something again");
+    assert_eq!((rays(&live, &b), areas(&live, &b)), (vec![true; 2], vec![0.2048; 2]), "the rays see them, their emitters as they are placed");
+    let shown = against_a_build("a posed rigid model shown where it was moved to while hidden", &mut live, &w);
+    assert!(apart(&hidden, &shown) > 0.5 && apart(&before, &shown) > 0.5, "it is in the picture, and not where it was ({:.2}, {:.2} steps)", apart(&hidden, &shown), apart(&before, &shown));
+    // The one that is not movable, hidden and shown where it stands.
+    w.set_visible(32, false).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the other hidden: in place ({:?})", live.fallback);
+    w.set_visible(32, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the other shown: in place ({:?})", live.fallback);
+    let again = against_a_build("a posed rigid model hidden and shown where it stands", &mut live, &w);
+    assert!(apart(&shown, &again) < 0.5, "as before it was hidden ({:.2} steps)", apart(&shown, &again));
+    // Removed: its instances are no object's, its emitters at no weight.
+    w.remove(33);
+    assert!(!live.commit(&mut w).unwrap(), "a posed rigid model removed: in place ({:?})", live.fallback);
+    assert!(live.sc.tables.retained.rigid(33).is_none() && seen(&live, &b) == vec![(true, false); 2] && lit(&live, &b) == 0, "its parts are no object's");
+    let removed = against_a_build("a posed rigid model removed", &mut live, &w);
+    assert!(apart(&again, &removed) > 0.5, "it is gone from the picture ({:.2} steps)", apart(&again, &removed));
+    assert_eq!(rays(&live, &b), vec![false; 2], "no ray sees what was its parts");
+    // The other posed on after: its own parts alone.
+    w.set_animation(32, slide(0.6)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the other posed on: in place ({:?})", live.fallback);
+    against_a_build("the other model posed on after the removal", &mut live, &w);
+    // And removed, never having moved: the part its clip leaves alone goes with the node.
+    w.remove(32);
+    assert!(!live.commit(&mut w).unwrap(), "the one that never moved removed: in place ({:?})", live.fallback);
+    assert_eq!((rays(&live, &a), lit(&live, &a)), (vec![false; 2], 0), "no ray sees what was its parts, its emitters weigh nothing");
+    against_a_build("a posed rigid model that never moved removed", &mut live, &w);
+}
+
+/// A model the scene has is placed again in place, with its emitters: a still one (tests/render/data/panel.glb), and
+/// a posed rigid one (panel-slider.glb), a part a record of the room in a run, each an instance of the mesh the
+/// build's placement has. The one placed is then posed, moved, hidden, shown and removed as one a build placed; its
+/// records and rows are the room's again, and the next one placed takes them. Each time the light list is its
+/// triangles and the picture a build's.
+#[test]
+fn a_model_with_emitters_is_placed_again_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let slide = |time| Some(crate::desc::Animation { clip: "slide".into(), time, r#loop: true, nodes: Default::default() });
+    let still = || Kind::Model { uri: "tests/render/data/panel.glb".into(), nodes: None, animation: None, functions: vec![] };
+    let posed = |time| Kind::Model { uri: "tests/render/data/panel-slider.glb".into(), nodes: None, animation: slide(time), functions: vec![] };
+    let mut w = world();
+    w.set_object(30, "still".into(), None, still(), true, false).unwrap();
+    w.set_transform(30, Vec3::new(-1.4, 0.7, 0.4), glam::Quat::from_rotation_y(0.4), Vec3::splat(0.05)).unwrap();
+    w.set_object(32, "posed".into(), None, posed(0.25), true, false).unwrap();
+    w.set_transform(32, Vec3::new(-1.3, -0.6, 0.5), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
+    // (A mesh the scene says it edits: room for what is placed.)
+    w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(28, Vec3::new(1.4, -0.7, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let pictured = |what: &str, live: &mut LiveCore, w: &World| {
+        list_is_its_triangles(what, live);
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let lit = |c: &LiveCore, of: &[u32]| c.sc.tables.emitter_tris.iter().filter(|e| of.contains(&e.inst) && crate::emitter_power(e, &c.sc.tables.materials, &c.sc.tables.objects, c.sc.tables.stride) > 0.0).count();
+    let before = pictured("as loaded", &mut live, &w);
+    // The still model again.
+    w.set_object(31, "still again".into(), None, still(), true, false).unwrap();
+    w.set_transform(31, Vec3::new(1.2, 0.7, 0.5), glam::Quat::from_rotation_y(-0.3), Vec3::splat(0.05)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "a still model with emitters placed again: in place ({:?})", live.fallback);
+    let (first, again) = (*live.sc.tables.retained.instance(30).unwrap(), *live.sc.tables.retained.instance(31).expect("it is an instance"));
+    assert_eq!((live.sc.instances[again.instance as usize].mesh, lit(&live, &[again.instance])), (live.sc.instances[first.instance as usize].mesh, 2), "an instance of the model's mesh, its two emitters its own");
+    list_is_its_triangles("a still model with emitters placed again", &live);
+    lit_as_a_build("a still model with emitters placed again", &mut live, &mut open(&w).unwrap());
+    // The posed rigid model again, elsewhere in its clip.
+    let place = |w: &mut World, id: u32, time: f32, at: Vec3| {
+        w.set_object(id, format!("posed{id}"), None, posed(time), true, false).unwrap();
+        w.set_transform(id, at, glam::Quat::from_rotation_z(0.3), Vec3::splat(0.08)).unwrap();
+    };
+    // (One whose pose names a node moves other nodes: other parts, a build's to make.)
+    let named = crate::desc::Animation { clip: "slide".into(), time: 0.75, r#loop: true, nodes: [("panel".to_string(), vec![0.0, 0.0, 0.0, 1.0])].into() };
+    w.set_object(35, "named".into(), None, Kind::Model { uri: "tests/render/data/panel-slider.glb".into(), nodes: None, animation: Some(named), functions: vec![] }, true, false).unwrap();
+    w.set_transform(35, Vec3::new(0.2, 0.3, 0.8), glam::Quat::from_rotation_z(0.3), Vec3::splat(0.08)).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "a model whose pose names a node the clip leaves alone: a rebuild");
+    w.remove(35);
+    live.commit(&mut w).unwrap();
+    place(&mut w, 33, 0.75, Vec3::new(0.2, 0.3, 0.8));
+    assert!(!live.commit(&mut w).unwrap(), "a posed rigid model placed again: in place ({:?})", live.fallback);
+    let (built, r) = (live.sc.tables.retained.rigid(32).unwrap().clone(), live.sc.tables.retained.rigid(33).expect("a posed rigid model").clone());
+    let (records, mesh) = (r.records(), |c: &LiveCore, i: u32| c.sc.instances[i as usize].mesh);
+    assert_eq!((r.instances.len(), mesh(&live, r.still.unwrap()), mesh(&live, r.instances[0].1)), (1, mesh(&live, built.still.unwrap()), mesh(&live, built.instances[0].1)), "its parts are instances of the meshes the build's placement has");
+    let run: Vec<u32> = (0..2).map(|j| records.iter().min().unwrap() + j).collect();
+    assert!(records.iter().all(|&i| live.sc.edit.in_room(i as usize) && run.contains(&i)), "a part a record of the room, in a run ({records:?})");
+    assert_eq!((lit(&live, &[r.still.unwrap()]), r.moving()), (2, vec![r.instances[0].1]), "its panel's emitters are its own, still ones");
+    assert!(live.sc.tables.emitter_tris.iter().filter(|e| e.inst == r.still.unwrap()).all(|e| !e.moves), "they are no moving emitters");
+    list_is_its_triangles("a posed rigid model placed again", &live);
+    let mut fresh = open(&w).unwrap();
+    // (Each part where a build places it: its node, and where its instance stands.)
+    let parts = |c: &LiveCore| {
+        let r = c.sc.tables.retained.rigid(33).unwrap();
+        let mut of: Vec<(usize, Vec<i64>)> = r.instances.iter().map(|&(n, i)| (n, i)).chain(r.still.map(|i| (scene::STILL_NODES, i))).map(|(n, i)| (n, c.sc.instances[i as usize].world.to_cols_array().iter().map(|x| (x * 1e4).round() as i64).collect())).collect();
+        of.sort();
+        of
+    };
+    assert_eq!(parts(&live), parts(&fresh), "each part stands where a build places it");
+    assert!(records.iter().all(|&i| seen_by_rays(&live, i)), "the rays see its parts");
+    lit_as_a_build("a posed rigid model placed again", &mut live, &mut fresh);
+    let placed = pictured("a posed rigid model placed again", &mut live, &w);
+    assert!(apart(&before, &placed) > 0.5, "the models placed are in the picture ({:.2} steps)", apart(&before, &placed));
+    // Posed on, moved, hidden and shown, as one the build placed.
+    w.set_animation(33, slide(0.4)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the one placed posed on: in place ({:?})", live.fallback);
+    assert!(!live.sc.tables.retained.rigid(33).unwrap().still_moves, "a new pose is no move: its panel stays, its emitters still ones");
+    pictured("the one placed posed on", &mut live, &w);
+    w.set_transform(33, Vec3::new(-0.3, 0.1, 1.0), glam::Quat::from_rotation_z(-0.4), Vec3::splat(0.08)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the one placed moved: in place ({:?})", live.fallback);
+    // (Every model's row of the object table as a build's: the moved one's pivot in its own row, no other's touched.
+    // Its world bounds' size apart: a move in place keeps the size the object was placed with, for every kind.)
+    let object_rows = |c: &LiveCore| {
+        let st = c.sc.tables.stride;
+        [30u32, 31, 32, 33].map(|id| {
+            c.sc.tables.retained.proxies[&id].object.map(|o| {
+                let mut row = c.sc.tables.objects[o as usize * st..(o as usize + 1) * st].to_vec();
+                row[1] = [0.0; 4];
+                row
+            })
+        })
+    };
+    assert_eq!(object_rows(&live), object_rows(&open(&w).unwrap()), "the one placed moved: each model's row of the object table, as a build's");
+    let moved = pictured("the one placed moved", &mut live, &w);
+    assert!(apart(&placed, &moved) > 0.5, "the move is in the picture ({:.2} steps)", apart(&placed, &moved));
+    w.set_visible(33, false).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the one placed hidden: in place ({:?})", live.fallback);
+    pictured("the one placed hidden", &mut live, &w);
+    w.set_visible(33, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "the one placed shown: in place ({:?})", live.fallback);
+    let shown = pictured("the one placed shown", &mut live, &w);
+    assert!(apart(&moved, &shown) < 0.5, "as before it was hidden ({:.2} steps)", apart(&moved, &shown));
+    // Removed: its records and rows are the room's again, and the next one placed takes the records.
+    let rows: Vec<(u32, u32)> = records.iter().map(|&i| (live.sc.instances[i as usize].rows, live.sc.meshes[live.sc.instances[i as usize].mesh as usize].sect_count)).collect();
+    w.remove(33);
+    assert!(!live.commit(&mut w).unwrap(), "the one placed removed: in place ({:?})", live.fallback);
+    assert!(rows.iter().all(|&(at, n)| rows_free(&live, at, n)) && lit(&live, &records) == 0, "its rows are the room's again, its emitters weigh nothing");
+    pictured("the one placed removed", &mut live, &w);
+    // (Made visible in the commit that adds it: placed as it is, by the edit that places it.)
+    place(&mut w, 34, 0.5, Vec3::new(0.4, -0.2, 0.9));
+    w.set_visible(34, false).unwrap();
+    w.set_visible(34, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "another placed after: in place ({:?})", live.fallback);
+    let mut next = live.sc.tables.retained.rigid(34).unwrap().records();
+    next.sort_unstable();
+    assert_eq!(next, run, "it takes the records the first gave back");
+    list_is_its_triangles("another posed rigid model placed after one was removed", &live);
+    lit_as_a_build("another posed rigid model placed after one was removed", &mut live, &mut open(&w).unwrap());
+}
+
+/// A posed rigid model with triangles flattened beside its parts (tests/render/data/panel-decal.glb: a cutout on
+/// exactly an emitter's vertices leaves the mesh with it) is hidden, and removed, by a rebuild: an instance's mask
+/// hides no world-space triangle. The picture is a build's.
+#[test]
+fn a_posed_rigid_model_with_flattened_triangles_is_hidden_and_removed_by_a_rebuild() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let model = || Kind::Model { uri: "tests/render/data/panel-decal.glb".into(), nodes: None, animation: Some(crate::desc::Animation { clip: "slide".into(), time: 0.25, r#loop: true, nodes: Default::default() }), functions: vec![] };
+    let scene = || {
+        let mut w = world();
+        w.set_object(32, "posed".into(), None, model(), true, false).unwrap();
+        w.set_transform(32, Vec3::new(-0.4, 0.3, 0.6), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
+        w
+    };
+    let pictured = |what: &str, live: &mut LiveCore, w: &World| {
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let mut w = scene();
+    let mut live = match open(&w) {
+        Ok(c) if c.g.hwrt => c,
+        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert!(!live.sc.tables.retained.rigid(32).expect("a posed rigid model").rest.mats.is_empty(), "the model has triangles flattened beside its part");
+    let before = picture(&mut live, 48);
+    w.set_visible(32, false).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "hidden: a rebuild");
+    let hidden = pictured("a posed rigid model with flattened triangles hidden", &mut live, &w);
+    assert!(apart(&before, &hidden) > 0.5, "it is gone from the picture ({:.2} steps)", apart(&before, &hidden));
+    let mut w = scene();
+    let mut live = open(&w).unwrap();
+    w.take_changes();
+    w.remove(32);
+    assert!(live.commit(&mut w).unwrap(), "removed: a rebuild");
+    let removed = pictured("a posed rigid model with flattened triangles removed", &mut live, &w);
+    assert!(apart(&hidden, &removed) < 0.5, "as when it was hidden ({:.2} steps)", apart(&hidden, &removed));
+    // Placed again: what is flattened beside its part is a build's to make.
+    let mut w = scene();
+    // (A mesh the scene says it edits: room for what is placed.)
+    w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(28, Vec3::new(1.4, -0.7, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    let mut live = open(&w).unwrap();
+    w.take_changes();
+    let one = picture(&mut live, 48);
+    w.set_object(33, "again".into(), None, model(), true, false).unwrap();
+    w.set_transform(33, Vec3::new(0.6, -0.4, 0.8), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
+    assert!(live.commit(&mut w).unwrap(), "placed again: a rebuild");
+    let two = pictured("a posed rigid model with flattened triangles placed again", &mut live, &w);
+    assert!(apart(&one, &two) > 0.5, "the second is in the picture ({:.2} steps)", apart(&one, &two));
 }
 
 /// Models in a shared pose posed again in place (tests/render/data/arm.glb: a skinned strip, a dark half and a light

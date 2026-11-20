@@ -753,6 +753,9 @@ pub struct Retained {
     /// Static models' instanced meshes by (uri, nodes), those with nothing flattened per placement: a model added in
     /// place is another instance of one (live/edits.rs `edit_geometry`).
     pub model_mesh: HashMap<(String, Option<Vec<String>>), u32>,
+    /// Posed rigid models' parts by (uri, `rigid_pose_key`), each its node (`STILL_NODES`) and its mesh, where every
+    /// part is a mesh with nothing flattened beside: one added in place is an instance of each.
+    pub rigid_meshes: HashMap<(String, String), Vec<(usize, u32)>>,
     /// A model's mesh's rows as every instance of it has them (the file's materials, `model_sections`; where a
     /// section's triangles and emitters are is each instance's to fill).
     pub mesh_rows: HashMap<u32, Vec<Row>>,
@@ -896,15 +899,16 @@ pub struct InstancedPlace {
     pub drawn: u32,
 }
 
-/// A posed glTF model without skins whose clip moves some of its nodes (Zero Day's 551 moving objects), in parts
-/// (`RigidPart`), each an instance of a mesh every placement of the model shares: the nodes the clip leaves alone
-/// merged into one mesh in the model's space, placed by the object's transform; each node it moves a mesh in the
-/// node's space, placed at object x node transform, so a new pose moves instances only (a part's emitters are its
+/// A posed glTF model without skins whose clips move some of its nodes (Zero Day's 551 moving objects), in parts
+/// (`RigidPart`), each an instance of a mesh every placement of the model shares: the nodes no clip of the file
+/// moves and the pose does not name merged into one mesh in the model's space, placed by the object's transform;
+/// each other node a mesh in the node's space, placed at object x node transform, so a new pose, of whichever clip,
+/// moves instances only (a part's emitters are its
 /// instance's in the light list, filled again when it moves). What `flatten_coincident` takes out of a part's mesh
 /// is flattened: `rest`, re-transformed in place from `rest_local`.
 #[derive(Clone, Default)]
 pub struct RigidModel {
-    /// (glTF node, instance index): the nodes the clip moves.
+    /// (glTF node, instance index): the nodes a pose may move.
     pub instances: Vec<(usize, u32)>,
     /// The instance of the nodes it leaves alone, if any is drawn. It moves with the object alone; its emitters are
     /// still ones until the object first moves (`still_moves`: live/edits.rs `repose_rigid`).
@@ -917,10 +921,18 @@ pub struct RigidModel {
     /// Per `rest` triangle: its node (`STILL_NODES`: the model's own space) and its triangle there (positions,
     /// normals, uvs, tangent).
     pub rest_local: Vec<(usize, [Vec3; 3], [Vec3; 3], [Vec2; 3], Option<(Vec3, f32)>)>,
+    /// `rigid_pose_key` of the pose its parts were made for: a pose with another is other parts (a build's to make).
+    pub pose: String,
 }
 
-/// In place of a node: the nodes a rigid model's clip leaves alone, merged (their space is the model's).
+/// In place of a node: the nodes no pose of a rigid model moves, merged (their space is the model's).
 pub const STILL_NODES: usize = usize::MAX;
+
+/// What a rigid model's parts go by, beside the model: the nodes its pose names (`skin::Model::moving_nodes`: they
+/// are parts with the nodes the file's clips move, whichever clip plays).
+pub fn rigid_pose_key(a: &desc::Animation) -> String {
+    a.nodes.keys().cloned().collect::<Vec<_>>().join("\u{0}")
+}
 
 impl RigidModel {
     /// The records of all its instances.
@@ -1747,8 +1759,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 if instancing && posed && nodes.is_none() && glb.rigid() {
                     let a = animation.as_ref().unwrap();
                     let globals = glb.node_globals(Some(a))?;
-                    // (What moves is the clip's nodes and the nodes the pose names.)
-                    let pkey = (key.clone(), format!("{}\u{0}{}", a.clip, a.nodes.keys().cloned().collect::<Vec<_>>().join("\u{0}")));
+                    let pkey = (key.clone(), rigid_pose_key(a));
                     if !rigid_parts.contains_key(&pkey) {
                         let moving = glb.moving_nodes(a)?;
                         // (THREERT_RIGID_NODES=all: no node merged, every one an instance of a mesh of its own: the A/B
@@ -1800,6 +1811,10 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                             let (merged, rest) = (lists.iter().filter(|l| l.0 == STILL_NODES).map(|l| l.1.len()).sum::<usize>(), parts.iter().map(|p| p.rest.len()).sum::<usize>());
                             eprintln!("rigid: {uri} ({}): {merged} triangles of the nodes left alone in one mesh, {} nodes apart, {rest} triangles flattened a placement", a.clip, lists.iter().filter(|l| l.0 != STILL_NODES).count());
                         }
+                        // (What an edit can place again: every part a mesh whole in the pool, the file's own materials.)
+                        if functions.is_empty() && parts.iter().all(|p| p.mesh.is_some() && p.rest.is_empty()) {
+                            retained.rigid_meshes.insert((uri.clone(), rigid_pose_key(a)), parts.iter().filter_map(|p| Some((p.node, p.mesh?))).collect());
+                        }
                         rigid_parts.insert(pkey.clone(), std::rc::Rc::new(parts));
                     }
                     let parts = rigid_parts[&pkey].clone();
@@ -1808,7 +1823,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     let (mut olo, mut ohi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
                     // (Where the object stands as an update finds it, `World::world_matrix`: the same product as `m`,
                     // multiplied in another order, so not always the same bits.)
-                    let mut rigid = RigidModel { world: w.world_matrix(*id), ..Default::default() };
+                    let mut rigid = RigidModel { world: w.world_matrix(*id), pose: rigid_pose_key(a), ..Default::default() };
                     rigid.rest.first = tris.len() as u32;
                     rigid.rest.object = oi;
                     for part in parts.iter() {
@@ -1958,9 +1973,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                             if std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "log") {
                                 eprintln!("instancing: {uri} {nodes:?}: {} opaque, {} cutout, {} glass instanced; {} flattened per placement", classed[0].len(), classed[1].len(), classed[2].len(), classed[FLAT].len());
                             }
-                            // (What an edit can place another instance of: a mesh whole in the pool. One with emitters is
-                            // not: an edit does not make a model's instance its emitters yet.)
-                            if let Some(k) = k.filter(|&k| meshes[k as usize].rest_count == 0 && pool_emitters(&classed, &emitting) == 0) {
+                            // (What an edit can place another instance of: a mesh whole in the pool.)
+                            if let Some(k) = k.filter(|&k| meshes[k as usize].rest_count == 0) {
                                 retained.model_mesh.insert(key.clone(), k);
                             }
                             mesh_of.insert(key, k);
@@ -2424,11 +2438,6 @@ fn flatten_coincident(classed: &mut [Vec<(usize, u32)>; 4], emitting: &std::coll
         classed[c] = stay;
         classed[FLAT].extend(go);
     }
-}
-
-/// The emitting triangles a mesh keeps (`InstMesh::emitters`): those of `classed` that stay in the pool.
-fn pool_emitters(classed: &[Vec<(usize, u32)>; 4], emitting: &std::collections::HashSet<u32>) -> u32 {
-    classed[..FLAT].iter().flatten().filter(|(_, mat)| emitting.contains(mat)).count() as u32
 }
 
 /// Whether a material created since the build can be drawn in place (tables.rs `add_materials`): 0 only when it is
