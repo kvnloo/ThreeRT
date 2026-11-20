@@ -877,40 +877,49 @@ impl LiveCore {
         if !sub.iter().all(held) {
             return false;
         }
-        let LoadedScene { tables, instances, pool_tris, meshes, rows, up, edit, .. } = &mut self.sc;
+        let mut started = vec![];
         for k in sub {
-            let Some(scene::Draw::Instance(i)) = tables.retained.proxies.get_mut(&k).map(|p| &mut p.draw) else { continue };
+            let Some(scene::Draw::Instance(i)) = self.sc.tables.retained.proxies.get_mut(&k).map(|p| &mut p.draw) else { continue };
             if std::mem::replace(&mut i.moves, true) {
                 continue;
             }
-            let r = i.instance;
-            let old = emitter_run(&tables.emitter_tris, instances, r);
-            if old.is_empty() || tables.emitter_tris[old.clone()].iter().all(|e| e.moves) {
-                continue;
-            }
-            let (was, first) = (old.start as u32, tables.emitter_tris.len() as u32);
-            let inst = &mut instances[r as usize];
             // (Where this commit's move places it: `move_instances`, next.)
-            let (to, _) = scene::placed_world(world.world_matrix(k), inst.world.w_axis.truncate());
-            for j in old {
-                let e = crate::EmitterTri { moves: true, in_tree: false, ..tables.emitter_tris[j] };
-                tables.emitter_tris[j].area = 0.0;
-                let w = pool_tris[e.tri as usize - edit.pool_first].map(|v| glam::Vec3A::from(to.transform_point3(v.into())));
-                self.pending_emitters.push((tables.emitter_tris.len() as u32, crate::GpuEmitterTri::of(&e, w, 0)));
-                tables.emitter_tris.push(e);
-            }
-            inst.first_emitter = first;
-            // (Its rows say where its sections' emitters start: where the run is now.)
-            let at = inst.rows as usize..inst.rows as usize + meshes[inst.mesh as usize].sect_count as usize;
-            for row in rows[at.clone()].iter_mut().filter(|row| row[2] != scene::NO_EMITTER) {
-                row[2] = row[2] - was + first;
-            }
-            if !at.is_empty() {
-                up.words.write(&self.g.queue, Stream::Rows, (at.start * 16) as u64, bytemuck::cast_slice(&rows[at]));
-            }
-            self.emitters_reweigh = true;
+            let (to, _) = scene::placed_world(world.world_matrix(k), self.sc.instances[i.instance as usize].world.w_axis.truncate());
+            started.push((i.instance, to));
+        }
+        for (r, to) in started {
+            self.emitters_start_moving(r, to);
         }
         true
+    }
+
+    /// Instance `r`'s emitters become moving ones, where it has some that are not: a new run of the light list, placed
+    /// by `to` (where this commit moves the instance); the light tree keeps the old one where it stood, at no weight.
+    fn emitters_start_moving(&mut self, r: u32, to: glam::Mat4) {
+        let LoadedScene { tables, instances, pool_tris, meshes, rows, up, edit, .. } = &mut self.sc;
+        let old = emitter_run(&tables.emitter_tris, instances, r);
+        if old.is_empty() || tables.emitter_tris[old.clone()].iter().all(|e| e.moves) {
+            return;
+        }
+        let (was, first) = (old.start as u32, tables.emitter_tris.len() as u32);
+        let inst = &mut instances[r as usize];
+        for j in old {
+            let e = crate::EmitterTri { moves: true, in_tree: false, ..tables.emitter_tris[j] };
+            tables.emitter_tris[j].area = 0.0;
+            let w = pool_tris[e.tri as usize - edit.pool_first].map(|v| glam::Vec3A::from(to.transform_point3(v.into())));
+            self.pending_emitters.push((tables.emitter_tris.len() as u32, crate::GpuEmitterTri::of(&e, w, 0)));
+            tables.emitter_tris.push(e);
+        }
+        inst.first_emitter = first;
+        // (Its rows say where its sections' emitters start: where the run is now.)
+        let at = inst.rows as usize..inst.rows as usize + meshes[inst.mesh as usize].sect_count as usize;
+        for row in rows[at.clone()].iter_mut().filter(|row| row[2] != scene::NO_EMITTER) {
+            row[2] = row[2] - was + first;
+        }
+        if !at.is_empty() {
+            up.words.write(&self.g.queue, Stream::Rows, (at.start * 16) as u64, bytemuck::cast_slice(&rows[at]));
+        }
+        self.emitters_reweigh = true;
     }
 
     /// An object shown or hidden by its `visible`, in place: the meshes and still models under it (itself, if it is one) each by its
@@ -1065,7 +1074,7 @@ impl LiveCore {
             let Some(o) = world.objects.get(id) else { continue };
             let of: Vec<u32> = match &p.draw {
                 scene::Draw::Instance(i) => vec![i.instance],
-                scene::Draw::Rigid(r) => r.instances.iter().map(|&(_, i)| i).collect(),
+                scene::Draw::Rigid(r) => r.records(),
                 scene::Draw::Instanced(c) if c.mesh.is_some() => (c.first..c.first + c.capacity).collect(),
                 _ => vec![],
             };
@@ -1139,7 +1148,7 @@ impl LiveCore {
                 .values()
                 .flat_map(|p| match &p.draw {
                     scene::Draw::Instance(i) => vec![i.instance],
-                    scene::Draw::Rigid(r) => r.instances.iter().map(|&(_, i)| i).collect(),
+                    scene::Draw::Rigid(r) => r.records(),
                     scene::Draw::Instanced(c) if c.mesh.is_some() => (c.first..c.first + c.capacity).collect(),
                     _ => vec![],
                 })
@@ -1581,14 +1590,17 @@ impl LiveCore {
     }
 
     /// Posed rigid models (`scene::RigidModel`): each moving node's instance takes object x node transform from the clip
-    /// (previous rows kept for motion vectors) and their flattened triangles are re-transformed in place; the commit
-    /// builds the dynamic BLASes (if they have such triangles) and the TLAS. False when it cannot (no hardware RT, a
-    /// model hidden or changed): the caller rebuilds.
+    /// (previous rows kept for motion vectors), the instance of the nodes left alone the object's where the object
+    /// moved (its emitters moving ones from its first move, `emitters_start_moving`), and their flattened triangles
+    /// are re-transformed in place; the commit builds the dynamic BLASes (if they have such triangles) and the TLAS.
+    /// False when it cannot (no hardware RT, a model hidden or changed): the caller rebuilds.
     pub(super) fn repose_rigid(&mut self, world: &World, ids: &[u32], build: &mut gpu::TopBuild) -> Result<bool> {
         if self.sc.up.accel.is_none() {
             return Ok(false);
         }
         let mut placements: Vec<(u32, glam::Mat4)> = vec![];
+        // (Object, where it stands now, and the instance of its nodes left alone if this is its first move.)
+        let mut worlds: Vec<(u32, glam::Mat4, Option<u32>)> = vec![];
         let (mut lo, mut hi) = (usize::MAX, 0usize);
         for id in ids {
             let Some(o) = world.objects.get(id) else { return Ok(false) };
@@ -1599,14 +1611,20 @@ impl LiveCore {
             let globals = scene::model_gltf(uri, &self.assets)?.node_globals(animation.as_ref())?;
             let m = world.world_matrix(*id);
             let r = self.sc.tables.retained.rigid(*id).expect("a rigid model (`commit`)");
+            // (The nodes its clip leaves alone move with the object alone.)
+            let moved = m != r.world;
             placements.extend(r.instances.iter().map(|&(node, i)| (i, m * globals[node])));
+            if moved {
+                placements.extend(r.still.map(|i| (i, m)));
+                worlds.push((*id, m, r.still.filter(|_| !r.still_moves)));
+            }
             let d = &r.rest;
             if d.finals.len() != d.mats.len() {
                 return Ok(false);
             }
             let (first, verts, attrs, blas) = &mut self.sc.dynamic;
             for (j, (node, p, n, uv, tg)) in r.rest_local.iter().enumerate() {
-                let (pw, nw, uvw, tw) = scene::placed_tri(m * globals[*node], p, n, uv, *tg);
+                let (pw, nw, uvw, tw) = scene::placed_tri(scene::RigidModel::part_world(m, *node, &globals), p, n, uv, *tg);
                 let a = scene::tri_attr(pw, nw, uvw, tw, d.mats[j]);
                 let k = d.finals[j] as usize - *first;
                 let (e1, e2) = (pw[1] - pw[0], pw[2] - pw[0]);
@@ -1619,6 +1637,15 @@ impl LiveCore {
             let pivot = m.transform_point3(glam::Vec3::ZERO);
             let o = &mut self.sc.tables.objects[d.object as usize * self.sc.tables.stride];
             (o[0], o[1], o[2]) = (pivot.x, pivot.y, pivot.z);
+        }
+        for (id, m, first_move) in worlds {
+            if let Some(scene::Draw::Rigid(r)) = self.sc.tables.retained.proxies.get_mut(&id).map(|p| &mut p.draw) {
+                (r.world, r.still_moves) = (m, true);
+            }
+            if let Some(still) = first_move {
+                let (to, _) = scene::placed_world(m, self.sc.instances[still as usize].world.w_axis.truncate());
+                self.emitters_start_moving(still, to);
+            }
         }
         // The instances: rows, previous rows (motion vectors), TLAS transforms.
         let size = std::mem::size_of::<scene::GpuInstance>() as u64;
