@@ -228,7 +228,8 @@ pub struct TopBuild {
     pub instances: bool,
     /// The dynamic groups' BLASes: their triangles were re-transformed.
     pub dynamic: bool,
-    /// Instanced meshes' BLASes: new meshes, a skinned model's new pose.
+    /// Instanced meshes' BLASes: new meshes, a skinned model's new pose. (Software traversal: their trees are written
+    /// by then; the top tree is made over their bounds.)
     pub meshes: Vec<u32>,
     /// Procedural BLASes an edit made.
     pub procs: Vec<PendingProc>,
@@ -765,6 +766,8 @@ pub struct SkinGpu {
     /// Each source's first triangle among the corners (`Scene::skin_sources`), and the palette's matrices in use.
     source_first: Vec<u32>,
     palette_end: u32,
+    /// Software traversal: what stands at the BLAS input's binding (the pass writes none there).
+    no_blas: Option<wgpu::Buffer>,
 }
 
 impl SkinGpu {
@@ -2363,7 +2366,8 @@ impl Gpu {
         timings.push(("vcolor_mb".into(), if scene.gpu_vcolors.is_empty() { 0.0 } else { (scene.gpu_vcolors.len() * 4 + room.tris * 12) as f64 / (1 << 20) as f64 }));
         let b_attrs = buf_room("attrs", bytemuck::cast_slice(&scene.attrs), room.tris * std::mem::size_of::<crate::scene::GpuTriAttr>(), edit);
         // (With units, edits write trees into it: units.rs.)
-        let b_nodes = buf("nodes", nodes, if scene.units.is_some() { st | wgpu::BufferUsages::COPY_DST } else { st });
+        // (COPY_SRC: read back by the test that holds a refit tree to its triangles.)
+        let b_nodes = buf("nodes", nodes, if scene.units.is_some() { st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC } else { st });
         // What the triangles hold on the GPU besides their BLASes: vertices (a, e1, e2), attributes, the software BVH's nodes
         // (ROADMAP § 6 step 2's table: a meshed representation against voxel data).
         timings.push(("tri_data_mb".into(), (std::mem::size_of_val(tri_verts) + std::mem::size_of_val(&scene.attrs[..]) + nodes.len()) as f64 / (1 << 20) as f64));
@@ -2760,9 +2764,12 @@ impl Gpu {
             }
             _ => None,
         };
-        // The skinning pass (hardware RT: it writes the BLASes' input), a job each mesh that deforms.
-        let skin = match &accel {
-            Some(a) if !scene.retained.skinned.is_empty() => Some(self.skin_pass(scene, a.pool_first, &b_verts, &b_attrs, &a.verts)),
+        // The skinning pass, a job each mesh that deforms: under hardware traversal (it writes the BLASes' input too),
+        // and under software traversal where such a mesh is a unit.
+        let skin = match (&accel, &scene.units) {
+            _ if scene.retained.skinned.is_empty() => None,
+            (Some(a), _) => Some(self.skin_pass(scene, a.pool_first, &b_verts, &b_attrs, Some(&a.verts))),
+            (None, Some(_)) => Some(self.skin_pass(scene, groups.iter().sum(), &b_verts, &b_attrs, None)),
             _ => None,
         };
         self.queue.submit([]);
@@ -3439,10 +3446,16 @@ impl Gpu {
     }
 
     /// The bind groups that hold the scene's buffers again, from `up`'s as they are now (one that grew: the tables,
-    /// live/edits.rs): the kernel's, the light list's fills' and the particle passes'.
+    /// live/edits.rs): the kernel's, the light list's fills', the skinning pass's and the particle passes'.
     pub fn rebind_scene(&self, up: &mut Uploaded) {
         for f in [&mut up.fills.moved, &mut up.fills.particles].into_iter().flatten() {
             f.bg = self.emitter_fill_bind_group(&f.runs, &up.verts, &up.heap);
+        }
+        if let Some(k) = &mut up.skin {
+            // (The BLASes' input, or what stands there under software traversal.)
+            if let Some(blas) = up.accel.as_ref().map(|a| &a.verts).or(k.no_blas.as_ref()) {
+                k.bg = skin_bind_group(&self.device, &k.pipeline, [&k.params, &k.blocks, &k.table, &k.corners, &k.palette], &up.verts, &up.attrs, blas);
+            }
         }
         up.bg = self.scene_bind_group(&SceneBuffers { params: &up.params, verts: &up.verts, attrs: &up.attrs, heap: &up.heap, words: &up.words, prev_verts: &up.prev_verts, accum: &up.accum, parts: &up.bg_parts, accel: up.accel.as_ref(), uniform: up.uniform.as_ref() });
         let Some(a) = &up.accel else { return };
@@ -3453,17 +3466,17 @@ impl Gpu {
         if let Some(p) = &mut up.gpu_particles {
             p.bg = particle_bind_group(&self.device, &p.pipeline, "gpu particles", &[(0, &p.params), (1, &p.table), (7, &p.last), (8, &p.state), (9, &p.spawns), (10, &p.grid)], &written);
         }
-        if let Some(k) = &mut up.skin {
-            k.bg = skin_bind_group(&self.device, &k.pipeline, [&k.params, &k.blocks, &k.table, &k.corners, &k.palette], &up.verts, &up.attrs, &a.verts);
-        }
     }
 
     /// The skinning pass of `scene`: its pipeline, the models' corners, a job each skinned model, and room for a frame's
     /// work and every job's palette.
-    fn skin_pass(&self, scene: &Scene, pool_first: usize, verts: &wgpu::Buffer, attrs: &wgpu::Buffer, blas_verts: &wgpu::Buffer) -> SkinGpu {
+    fn skin_pass(&self, scene: &Scene, pool_first: usize, verts: &wgpu::Buffer, attrs: &wgpu::Buffer, blas_verts: Option<&wgpu::Buffer>) -> SkinGpu {
         let d = &self.device;
         let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("skin"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skin.wgsl").into()) });
-        let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("skin"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: self.cache() });
+        let blas = [("BLAS", if blas_verts.is_some() { 1.0 } else { 0.0 })];
+        let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("skin"), layout: None, module: &module, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions { constants: &blas, ..Default::default() }, cache: self.cache() });
+        let no_blas = blas_verts.is_none().then(|| d.create_buffer(&wgpu::BufferDescriptor { label: Some("skin no blas"), size: 64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false }));
+        let blas_verts = blas_verts.or(no_blas.as_ref()).unwrap();
         let mut source_first = vec![];
         let mut at = 0u32;
         for source in &scene.skin_sources {
@@ -3486,7 +3499,7 @@ impl Gpu {
         let params = room("skin params", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let (b_blocks, palette) = (room("skin blocks", blocks as u64 * 8, storage), room("skin palette", matrices as u64 * 48, storage));
         let bg = skin_bind_group(d, &pipeline, [&params, &b_blocks, &b_table, &b_corners, &palette], verts, attrs, blas_verts);
-        SkinGpu { pipeline, bg, params, blocks: b_blocks, table: b_table, corners: b_corners, palette, jobs, source_first, palette_end: matrices }
+        SkinGpu { pipeline, bg, params, blocks: b_blocks, table: b_table, corners: b_corners, palette, jobs, source_first, palette_end: matrices, no_blas }
     }
 
     /// Skins the meshes of `work` (a job and its pose's palette each) on the GPU: their triangles, shading attributes
@@ -3576,7 +3589,12 @@ impl Gpu {
 
     /// A mesh tree's nodes into the node buffer at its root (`Units::add_tree` placed it).
     pub fn write_tree(&self, nodes: &wgpu::Buffer, root: u32, tree: &crate::units::MeshTree) {
-        self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(&tree.nodes));
+        self.write_nodes(nodes, root, &tree.nodes);
+    }
+
+    /// A tree's nodes written again where they lie (its boxes taken again, `units::refit`: as many, the same shape).
+    pub fn write_nodes(&self, nodes: &wgpu::Buffer, root: u32, tree: &[crate::bvh::GpuNode]) {
+        self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(tree));
     }
 
     /// A freed mesh tree's nodes (`Units::drop_tree`: its root and length) are room again: leaves that end a walk

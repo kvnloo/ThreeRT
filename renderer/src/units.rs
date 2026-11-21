@@ -249,6 +249,34 @@ pub fn mesh_tree(tris: &[[Vec3A; 3]]) -> Result<MeshTree, String> {
     Ok(MeshTree { nodes, order, depth, lo, hi })
 }
 
+/// A tree's boxes taken again from its triangles as they are now (`tri`: a triangle of the mesh, in the tree's
+/// order), its shape kept: a mesh that deforms, at a new pose. A leaf's box is its triangles' (a corner that is not
+/// finite is in none), an interior node's its children's, which lie after it. The mesh's bounds.
+pub fn refit(nodes: &mut [GpuNode], tri: impl Fn(usize) -> [Vec3A; 3]) -> (Vec3A, Vec3A) {
+    for k in (0..nodes.len()).rev() {
+        let n = nodes[k];
+        let (mut lo, mut hi) = (Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NEG_INFINITY));
+        if n.count > 0 {
+            for i in n.left_or_first..n.left_or_first + n.count {
+                for v in tri(i as usize) {
+                    if v.is_finite() {
+                        (lo, hi) = (lo.min(v), hi.max(v));
+                    }
+                }
+            }
+            // (A leaf of nothing finite: a point, which no ray meets through a triangle that is not there.)
+            if lo.x > hi.x {
+                (lo, hi) = (Vec3A::ZERO, Vec3A::ZERO);
+            }
+        } else {
+            let (a, b) = (nodes[n.left_or_first as usize], nodes[n.left_or_first as usize + 1]);
+            (lo, hi) = (Vec3A::from(a.bmin).min(b.bmin.into()), Vec3A::from(a.bmax).max(b.bmax.into()));
+        }
+        (nodes[k].bmin, nodes[k].bmax) = (lo.into(), hi.into());
+    }
+    (nodes[0].bmin.into(), nodes[0].bmax.into())
+}
+
 /// A unit for the top tree: its record, and its mesh's model-space bounds under its world transform.
 #[derive(Clone, Copy, Debug)]
 pub struct UnitBox {
@@ -598,8 +626,8 @@ pub struct Tree {
 #[derive(Clone, Debug)]
 pub struct Units {
     pub layout: Layout,
-    /// By instanced mesh (the scene's `meshes` index): its tree. None: no tree (a mesh that deforms or has no
-    /// triangle, or one an edit freed).
+    /// By instanced mesh (the scene's `meshes` index): its tree. None: no tree (a mesh without a triangle, or one an
+    /// edit freed).
     pub trees: Vec<Option<Tree>>,
     /// By kernel record: the unit there, if the record is one's.
     pub slots: Vec<Option<Unit>>,
@@ -691,6 +719,13 @@ impl Units {
         }
         self.trees[k as usize] = Some(Tree { root, len: tree.nodes.len() as u32, lo: tree.lo, hi: tree.hi });
         Some(root)
+    }
+
+    /// Mesh `k`'s bounds, its tree's boxes taken again where they lie (`refit`): what the top tree places its units by.
+    pub fn set_bounds(&mut self, k: u32, lo: Vec3A, hi: Vec3A) {
+        if let Some(t) = self.trees.get_mut(k as usize).and_then(|t| t.as_mut()) {
+            (t.lo, t.hi) = (lo, hi);
+        }
     }
 
     /// Mesh `k`'s tree given back: its root and length (the caller fills them with `FILL`), if it had one.
@@ -1813,6 +1848,62 @@ mod tests {
         assert!(top[0].bmin[1] <= 12.0 && top[0].bmin[1] > 11.0 && top[0].bmax[1] >= 13.0, "{:?}", top[0]);
     }
 
+    /// A mesh that deforms keeps its tree's shape and takes its boxes again (`refit`): the links are as built, a leaf's
+    /// box is its triangles' as they are now, an interior node's its two children's, and the tree passes the mesh
+    /// trees' check as before. The bounds returned are the triangles', and the unit's box in the top tree is theirs
+    /// once they are set. A corner that is not finite is in no box; a leaf with none that is finite is a point.
+    #[test]
+    fn a_deforming_meshs_tree_takes_its_boxes_again() {
+        let mut rng = Rng(11);
+        let rest = rng.tris(300, 4.0, 0.3);
+        let t = mesh_tree(&rest).unwrap();
+        assert!(t.nodes.iter().filter(|n| n.count > 1).count() > 8, "leaves of several triangles");
+        // The mesh's triangles in the tree's order, bent: each corner moved by where it is.
+        let bend = |v: Vec3A| Vec3A::new(v.x + 0.5 * (v.y * 1.3).sin(), v.y * 1.2 + 0.3 * v.z, v.z - 0.4 * v.x * v.x + 7.0);
+        let posed: Vec<[Vec3A; 3]> = t.order.iter().map(|&i| rest[i as usize].map(bend)).collect();
+        let exact = |tris: &[[Vec3A; 3]]| tris.iter().flatten().filter(|v| v.is_finite()).fold((Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NEG_INFINITY)), |(a, b), v| (a.min(*v), b.max(*v)));
+        let holds = |what: &str, nodes: &[GpuNode], tris: &[[Vec3A; 3]]| {
+            for (k, (n, was)) in nodes.iter().zip(&t.nodes).enumerate() {
+                assert_eq!((n.left_or_first, n.count), (was.left_or_first, was.count), "{what}: node {k}'s links are as built");
+                let want = if n.count > 0 {
+                    let (a, b) = exact(&tris[n.left_or_first as usize..(n.left_or_first + n.count) as usize]);
+                    if a.x > b.x { (Vec3A::ZERO, Vec3A::ZERO) } else { (a, b) }
+                } else {
+                    let (a, b) = (nodes[n.left_or_first as usize], nodes[n.left_or_first as usize + 1]);
+                    (Vec3A::from(a.bmin).min(b.bmin.into()), Vec3A::from(a.bmax).max(b.bmax.into()))
+                };
+                assert_eq!((Vec3A::from(n.bmin), Vec3A::from(n.bmax)), want, "{what}: node {k}'s box ({} triangles)", n.count);
+            }
+            assert_eq!(check_mesh(nodes, tris.len()), Ok(t.depth), "{what}: the tree is a mesh's still");
+        };
+        let mut nodes = t.nodes.clone();
+        let (lo, hi) = refit(&mut nodes, |i| posed[i]);
+        holds("bent", &nodes, &posed);
+        assert_eq!((lo, hi), exact(&posed), "the bounds are the triangles'");
+        assert!(lo.z > t.hi.z, "the bent mesh is out of its first bounds");
+        // Its unit in the top tree: by the bounds it has, once they are set.
+        let mut u = Units { layout: Layout::new(1, t.nodes.len() + 8, 2), trees: vec![], slots: vec![], count: 0, records: 2, kept: Default::default() };
+        u.add_tree(0, &t).unwrap();
+        u.set(0, u.unit(0, Mat4::IDENTITY, false));
+        let top = u.top().unwrap();
+        assert!(top[0].bmax[2] < lo.z, "{:?}", top[0]);
+        u.set_bounds(0, lo, hi);
+        let top = u.top().unwrap();
+        assert!((0..3).all(|k| top[0].bmin[k] <= lo[k] && top[0].bmax[k] >= hi[k] && top[0].bmax[k] - top[0].bmin[k] < (hi[k] - lo[k]) * 1.01 + 1e-3), "{:?} holds {lo} .. {hi}", top[0]);
+        // Corners that are not finite: one of a triangle, and every corner of a leaf's triangles.
+        let leaf = *t.nodes.iter().filter(|n| n.count > 1).nth(3).unwrap();
+        let other = (0..posed.len()).find(|i| !(leaf.left_or_first as usize..(leaf.left_or_first + leaf.count) as usize).contains(i)).unwrap();
+        let mut broken = posed.clone();
+        broken[other][1] = Vec3A::new(f32::NAN, 0.0, 1.0);
+        for i in leaf.left_or_first..leaf.left_or_first + leaf.count {
+            broken[i as usize] = [Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NAN), Vec3A::new(0.0, f32::NEG_INFINITY, 0.0)];
+        }
+        let mut nodes = t.nodes.clone();
+        let (lo, hi) = refit(&mut nodes, |i| broken[i]);
+        holds("with corners that are not finite", &nodes, &broken);
+        assert!(lo.is_finite() && hi.is_finite() && nodes.iter().all(|n| n.bmin.iter().chain(&n.bmax).all(|v| v.is_finite())), "every box is finite");
+    }
+
     /// Units that only move keep their top tree, its boxes theirs again (each leaf's its unit's box, each node's what
     /// holds its children's), while it costs a ray no more than `REFIT_SLACK` of what it did when built; a unit that
     /// goes far, comes, goes, is hidden or shown has it built again. A kept tree is one a build could have made: the
@@ -1978,5 +2069,61 @@ mod tests {
         assert!(!shifted(Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))), "a mirror");
         assert_eq!((rec(Mat4::IDENTITY).n[0][3].to_bits(), rec(Mat4::IDENTITY).n[1][3].to_bits() & UNIT_SHADOW), (9, 1));
         assert_eq!(rec(Mat4::IDENTITY).n[2][3].to_bits(), 0, "the third word is not the unit's");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// What a posed skinned model's tree costs a new pose (THREERT_SKIN_GLB: the model): made again, or its boxes
+    /// taken again in the tree of an earlier pose (the bind pose's, the clip's first), and how much worse the walk of
+    /// such a tree is (its surface-area cost against the new tree's).
+    #[test]
+    #[ignore]
+    fn deforming_tree_cost() {
+        let path = std::env::var("THREERT_SKIN_GLB").unwrap();
+        let m = crate::skin::Model::new(gltf::import(&path).unwrap()).unwrap();
+        let area = |n: &GpuNode| {
+            let d = Vec3A::from(n.bmax) - Vec3A::from(n.bmin);
+            2.0 * (d.x * d.y + d.y * d.z + d.z * d.x) as f64
+        };
+        // (A walk's expected cost: each node's chance of being entered, an interior node a step, a leaf a test a triangle.)
+        let cost = |nodes: &[GpuNode]| nodes.iter().map(|n| area(n) * if n.count == 0 { 1.0 } else { n.count as f64 }).sum::<f64>() / area(&nodes[0]);
+        // The boxes again, the tree's shape and its triangles' order kept.
+        let refit = |nodes: &mut [GpuNode], tris: &[[Vec3A; 3]], order: &[u32]| {
+            super::refit(nodes, |i| tris[order[i] as usize]);
+        };
+        let pose = |clip: &str, time: f32| crate::desc::Animation { clip: clip.into(), time, r#loop: true, nodes: Default::default() };
+        let tris_of = |a: Option<&crate::desc::Animation>| -> Vec<[Vec3A; 3]> { m.triangles(glam::Mat4::IDENTITY, None, a).unwrap().iter().map(|t| t.p.map(Vec3A::from)).collect() };
+        let bind = mesh_tree(&tris_of(None)).unwrap();
+        for clip in std::env::var("THREERT_SKIN_CLIPS").unwrap_or_else(|_| m.clip_names()[0].clone()).split(',') {
+            let first = mesh_tree(&tris_of(Some(&pose(clip, 0.0)))).unwrap();
+            let (mut skin, mut build, mut fit) = (0.0, 0.0, 0.0);
+            let (mut worst, mut mean) = ([0.0f64; 2], [0.0f64; 2]);
+            let poses = 40;
+            for k in 0..poses {
+                let a = pose(clip, 0.05 + k as f32 * 0.07);
+                let t0 = web_time::Instant::now();
+                let tris = tris_of(Some(&a));
+                skin += t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = web_time::Instant::now();
+                let fresh = mesh_tree(&tris).unwrap();
+                build += t0.elapsed().as_secs_f64() * 1e3;
+                for (j, kept) in [&bind, &first].into_iter().enumerate() {
+                    let mut nodes = kept.nodes.clone();
+                    let t0 = web_time::Instant::now();
+                    refit(&mut nodes, &tris, &kept.order);
+                    fit += t0.elapsed().as_secs_f64() * 1e3 / 2.0;
+                    let r = cost(&nodes) / cost(&fresh.nodes);
+                    (worst[j], mean[j]) = (worst[j].max(r), mean[j] + r / poses as f64);
+                }
+            }
+            let n = poses as f64;
+            eprintln!(
+                "{clip}: {} triangles, {} nodes; a pose: skin {:.2} ms, tree made again {:.2} ms, boxes taken again {:.3} ms; a kept tree's walk against a new one's: the bind pose's x{:.2} (worst x{:.2}), the clip's first x{:.2} (worst x{:.2})",
+                first.order.len(), first.nodes.len(), skin / n, build / n, fit / n, mean[0], worst[0], mean[1], worst[1]
+            );
+        }
     }
 }

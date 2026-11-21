@@ -1075,7 +1075,7 @@ impl LiveCore {
                         continue;
                     }
                     let Some(mut top) = gpu::Top::of(&mut self.sc.up.accel, &mut self.sc.up.units) else { return false };
-                    // (Software traversal has a skinned model's triangles in its still tree: no instance to mask.)
+                    // (Software traversal: a mesh that deforms and has no tree is in the still tree, no instance to mask.)
                     if !top.has_mesh(inst.mesh) {
                         return false;
                     }
@@ -1874,13 +1874,16 @@ impl LiveCore {
     }
 
     /// Posed skinned models (`scene::Skinned`): each whose pose changed is skinned in its own space by the skinning
-    /// pass (gpu.rs `skin`: the CPU sends its pose's matrices); the commit builds their BLASes and the TLAS over their
-    /// new bounds. One that is hidden keeps the pose its mesh has: it is skinned when it is shown (`show_meshes`).
-    /// False when one is another model now, or its new pose mirrors other primitives than the one its mesh was made
-    /// for: the caller rebuilds. (The CPU keeps no triangles of such a pose: `LiveCore::mesh_tris` skins it when asked.)
+    /// pass (gpu.rs `skin`: the CPU sends its pose's matrices). Hardware traversal: the commit builds their BLASes
+    /// and the TLAS over their new bounds. Software traversal: each mesh's tree keeps its shape and takes its boxes
+    /// again on the CPU, from the model's corners placed by the pose (`units::refit`), and the commit makes the top
+    /// tree over the units' new bounds. One that is hidden keeps the pose its mesh has: it is skinned when it is
+    /// shown (`show_meshes`). False when one is another model now, its new pose mirrors other primitives than the one
+    /// its mesh was made for, or (software traversal) its mesh is no unit: the caller rebuilds. (The CPU keeps no
+    /// triangles of such a pose: `LiveCore::mesh_tris` skins it when asked.)
     pub(super) fn repose_skinned(&mut self, world: &World, ids: &[u32], build: &mut gpu::TopBuild) -> Result<bool> {
         use rayon::prelude::*;
-        if self.sc.up.accel.is_none() || self.sc.up.skin.is_none() {
+        if self.sc.up.skin.is_none() || (self.sc.up.accel.is_none() && self.sc.up.units.is_none()) {
             return Ok(false);
         }
         let r = &self.sc.tables.retained;
@@ -1919,6 +1922,27 @@ impl LiveCore {
             let Some(rows) = rows? else { return Ok(false) };
             work.push((*g, rows));
         }
+        // Software traversal: the meshes' trees, their boxes taken again from the corners placed by the poses (the
+        // models in parallel). Nothing is written unless every one is a unit with such a tree.
+        let mut trees: Vec<(u32, u32, Vec<crate::bvh::GpuNode>, (glam::Vec3A, glam::Vec3A))> = vec![];
+        if let Some(units) = &self.sc.up.units {
+            let (sources, shapes) = (&self.sc.skin_sources, &self.sc.skin_trees);
+            let made: Vec<Option<(u32, u32, Vec<crate::bvh::GpuNode>, (glam::Vec3A, glam::Vec3A))>> = work
+                .par_iter()
+                .map(|(g, rows)| {
+                    let sk = &r.skinned[*g as usize];
+                    let (corners, shape) = (sources.get(sk.source as usize)?, shapes.get(sk.source as usize)?);
+                    let tree = units.trees.get(sk.mesh as usize).copied().flatten().filter(|t| t.len as usize == shape.len() && !shape.is_empty() && corners.len() == sk.order.len())?;
+                    let mut nodes = shape.clone();
+                    let bounds = crate::units::refit(&mut nodes, |i| corners[i].map(|c| glam::Vec3A::from(crate::skin::skin_corner(&c, rows).0)));
+                    Some((sk.mesh, tree.root, nodes, bounds))
+                })
+                .collect();
+            for m in made {
+                let Some(m) = m else { return Ok(false) };
+                trees.push(m);
+            }
+        }
         self.cpu_skin_ms += t_skin.elapsed().as_secs_f32() * 1000.0;
         let t_up = Instant::now();
         // Motion vectors: the GPU still holds the previous pose of these meshes (and of the last re-skin's, if others):
@@ -1940,6 +1964,13 @@ impl LiveCore {
             let sk = &mut self.sc.tables.retained.skinned[g as usize];
             sk.animation = a;
             build.meshes.push(sk.mesh);
+        }
+        // (Software traversal: the trees where they lie, and the units' bounds for the top tree.)
+        for (mesh, root, nodes, (lo, hi)) in trees {
+            self.g.write_nodes(&self.sc.up.bg_parts.nodes, root, &nodes);
+            if let Some(units) = self.sc.up.units.as_mut() {
+                units.set_bounds(mesh, lo, hi);
+            }
         }
         self.cpu_upload_ms += t_up.elapsed().as_secs_f32() * 1000.0;
         Ok(true)
@@ -2273,8 +2304,8 @@ impl LiveCore {
             }
             emitters_changed |= release(*id, tables, instances);
             // (A still model the build placed, whose instance is all of it, is taken out by it too; and a posed skinned
-            // model, an instance of its own mesh, where there is such an instance: software traversal has its triangles
-            // in the still tree. Its mesh's triangles and its skinning job stay until the next rebuild, as the build's do.)
+            // model, an instance of its own mesh, where its mesh is one the rays reach by its instance. Its mesh's
+            // triangles and its skinning job stay until the next rebuild, as the build's do.)
             let its_own = |i: &scene::InstanceRef| whole(i, instances, meshes) || (matches!(i.mesh, scene::MeshKind::Skinned(_)) && instances.get(i.instance as usize).is_some_and(|x| top.has_mesh(x.mesh)));
             let at = slot_of(*id, edit, tables).or_else(|| tables.retained.instance(*id).filter(|i| its_own(i)).map(|i| (inst_base + i.instance as usize, i.instance as usize)));
             // Drawn, and not at a record an edit can clear (a model with triangles flattened beside its instance,
@@ -2440,7 +2471,9 @@ impl LiveCore {
                         // triangles are skinned here once, for the pose it comes in; the pass skins it from its next
                         // pose on, from the corners the scene's others of the model are skinned from.
                         if top.sw() {
-                            return Err("a skinned model (software traversal has its triangles in the still tree)".into());
+                            // (Its triangles and its tree need room, which software traversal's scenes have only
+                            // with geometry of their own to edit, and which does not grow there.)
+                            return Err("a skinned model added (software traversal)".into());
                         }
                         if at.is_some() {
                             return Err("a skinned model placed again".into());

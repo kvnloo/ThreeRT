@@ -2548,9 +2548,6 @@ fn posed_skinned_models_are_meshes_of_their_own() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    if !live.g.hwrt {
-        return eprintln!("skipped: no hardware ray tracing");
-    }
     let of = |c: &LiveCore, id: u32| c.sc.tables.retained.skinned.iter().find(|s| s.object == id).expect("a posed skinned model").clone();
     let (a, b) = (of(&live, 30), of(&live, 31));
     assert_eq!((live.sc.tables.retained.skinned.len(), a.mesh != b.mesh, a.source == b.source, live.sc.meshes[a.mesh as usize].sect_count), (2, true, true, 2), "two meshes of two sections, skinned from the model's one copy of its corners");
@@ -2578,8 +2575,8 @@ fn posed_skinned_models_are_meshes_of_their_own() {
 }
 
 /// A posed skinned model is hidden and shown in place: hidden, no ray sees its instance and a new pose skins
-/// nothing; shown, it is skinned as it is posed then, where it stands. The picture is a build's each time. (Under
-/// software traversal, by a rebuild.)
+/// nothing; shown, it is skinned as it is posed then, where it stands. The picture is a build's each time, under
+/// either traversal.
 #[test]
 fn a_posed_skinned_model_is_hidden_and_shown_in_place() {
     let presets = crate::default_presets_dir();
@@ -2604,18 +2601,6 @@ fn a_posed_skinned_model_is_hidden_and_shown_in_place() {
         a
     };
     let loaded = against_a_build("as loaded", &mut live, &w);
-    // Software traversal has a skinned model's triangles in its still tree, and no instance to mask: a rebuild's.
-    if !live.g.hwrt {
-        w.set_visible(31, false).unwrap();
-        assert!(live.commit(&mut w).unwrap(), "hidden under software traversal: a rebuild");
-        let hidden = against_a_build("hidden under software traversal", &mut live, &w);
-        assert!(apart(&loaded, &hidden) > 0.5, "it is out of the picture ({:.2} steps)", apart(&loaded, &hidden));
-        w.set_visible(31, true).unwrap();
-        assert!(live.commit(&mut w).unwrap(), "shown under software traversal: a rebuild");
-        let shown = against_a_build("shown under software traversal", &mut live, &w);
-        assert!(apart(&hidden, &shown) > 0.5, "it is in the picture again ({:.2} steps)", apart(&hidden, &shown));
-        return;
-    }
     let record = of(&live, 31).instance;
     w.set_visible(31, false).unwrap();
     assert!(!live.commit(&mut w).unwrap(), "hidden: in place ({:?})", live.fallback);
@@ -3002,8 +2987,7 @@ fn a_posed_skinned_model_added_beside_particles_is_a_rebuilds() {
 }
 
 /// A posed skinned model is removed in place: its instance is no object's and no ray sees it, the others are posed
-/// on as ever, and the picture is a build's. One that is hidden is removed in place too. (Under software traversal,
-/// where it has no instance, by a rebuild.)
+/// on as ever, and the picture is a build's. One that is hidden is removed in place too. Under either traversal.
 #[test]
 fn a_posed_skinned_model_is_removed_in_place() {
     let presets = crate::default_presets_dir();
@@ -3027,13 +3011,6 @@ fn a_posed_skinned_model_is_removed_in_place() {
         a
     };
     let loaded = against_a_build("as loaded", &mut live, &w);
-    if !live.g.hwrt {
-        w.remove(31);
-        assert!(live.commit(&mut w).unwrap(), "removed under software traversal: a rebuild");
-        let removed = against_a_build("removed under software traversal", &mut live, &w);
-        assert!(apart(&loaded, &removed) > 0.5, "it is out of the picture ({:.2} steps)", apart(&loaded, &removed));
-        return;
-    }
     let record = |c: &LiveCore, id: u32| c.sc.tables.retained.instance(id).expect("a posed skinned model").instance;
     let (r30, r31, r32) = (record(&live, 30), record(&live, 31), record(&live, 32));
     w.remove(31);
@@ -3071,7 +3048,9 @@ fn a_posed_skinned_model_is_removed_in_place() {
 /// triangles, shading attributes and BLAS input of each mesh are its model's triangles for the pose, the previous
 /// frame's vertices are the pose before, and the CPU has the mesh as it is now when asked. One posed alone leaves
 /// the others' as they were. Also after the scene's buffers were made again larger, and a pose that mirrors other
-/// primitives than the mesh was made for is a rebuild's.
+/// primitives than the mesh was made for is a rebuild's. Under software traversal there is no BLAS input: each mesh's
+/// tree keeps its model's shape and has the pose's boxes, and the top tree its unit by them. The motion vectors of a
+/// pose are no longer than its corners went, under either.
 #[test]
 fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
     let presets = crate::default_presets_dir();
@@ -3092,9 +3071,7 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    if !live.g.hwrt {
-        return eprintln!("skipped: no hardware ray tracing");
-    }
+    let hw = live.g.hwrt;
     assert!(live.sc.edit.pool_first > 0, "a mesh's first triangle on the GPU is not its first in the pool");
     {
         let g = live.sc.tables.retained.skinned.iter().find(|g| g.uri.ends_with("skin-blend.glb")).expect("the model's mesh");
@@ -3142,7 +3119,39 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         // (Its previous vertices: where its instance's record says, on the CPU and on the GPU.)
         let prev = c.sc.instances[*instance as usize].prev;
         assert_eq!(c.sc.gpu_instances[*instance as usize].n[2][3].to_bits(), prev, "the record has where the mesh's previous vertices are");
-        (read(c, &up.verts, k * 48, n * 48), read(c, &up.attrs, k * 96, n * 96), read(c, &up.accel.as_ref().unwrap().verts, k * 36, n * 36), read(c, &up.prev_verts, prev as u64 * 48, n * 48))
+        (read(c, &up.verts, k * 48, n * 48), read(c, &up.attrs, k * 96, n * 96), up.accel.as_ref().map(|a| read(c, &a.verts, k * 36, n * 36)), read(c, &up.prev_verts, prev as u64 * 48, n * 48))
+    };
+    // Software traversal: a mesh's tree on the GPU has its model's tree's shape (the links, word for word) and the
+    // pose's boxes: a leaf's its triangles' (`corners`: the CPU skin's, nine numbers a triangle), an interior node's
+    // its two children's. The mesh's bounds are the root's, and the top tree's leaf of its unit is those, placed.
+    let tree = |what: &str, c: &LiveCore, g: usize, corners: &[f32]| {
+        let Some(units) = &c.sc.up.units else { return };
+        let sk = &c.sc.tables.retained.skinned[g];
+        let (t, shape) = (units.trees[sk.mesh as usize].expect("a unit's tree"), &c.sc.skin_trees[sk.source as usize]);
+        assert!(t.len as usize == shape.len() && t.len > 0, "{what}: its tree is as long as its model's ({} nodes, {})", t.len, shape.len());
+        let words = read(c, &c.sc.up.bg_parts.nodes, t.root as u64 * 32, t.len as u64 * 32);
+        let nodes: &[crate::bvh::GpuNode] = bytemuck::cast_slice(&words);
+        let (mut leaves, mut seen) = (0, vec![false; corners.len() / 9]);
+        for (k, (n, m)) in nodes.iter().zip(shape).enumerate() {
+            assert_eq!((n.left_or_first, n.count), (m.left_or_first, m.count), "{what}: node {k} is linked as its model's");
+            let (lo, hi) = (Vec3::from(n.bmin), Vec3::from(n.bmax));
+            if n.count > 0 {
+                let own = &corners[n.left_or_first as usize * 9..(n.left_or_first + n.count) as usize * 9];
+                let (a, b) = own.chunks_exact(3).fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(a, b), p| (a.min(Vec3::from_slice(p)), b.max(Vec3::from_slice(p))));
+                assert!((lo - a).abs().max_element() <= 2e-5 * a.abs().max_element().max(1.0) && (hi - b).abs().max_element() <= 2e-5 * b.abs().max_element().max(1.0), "{what}: leaf {k}'s box is {lo} .. {hi}; its triangles', {a} .. {b}");
+                (n.left_or_first..n.left_or_first + n.count).for_each(|i| seen[i as usize] = true);
+                leaves += 1;
+            } else {
+                let (x, y) = (nodes[n.left_or_first as usize], nodes[n.left_or_first as usize + 1]);
+                assert_eq!((lo, hi), (Vec3::from(x.bmin).min(y.bmin.into()), Vec3::from(x.bmax).max(y.bmax.into())), "{what}: node {k}'s box is its children's");
+            }
+        }
+        // (A leaf holds 16 triangles at most: the larger model's tree has interior nodes.)
+        assert!((leaves > 1 || seen.len() <= 16) && seen.iter().all(|&s| s), "{what}: every triangle is in a leaf ({leaves} leaves)");
+        assert_eq!((Vec3::from(t.lo), Vec3::from(t.hi)), (nodes[0].bmin.into(), nodes[0].bmax.into()), "{what}: the mesh's bounds are its root's");
+        let unit = crate::units::UnitBox::new(sk.instance, c.sc.instances[sk.instance as usize].world, t.lo, t.hi);
+        let leaf = units.kept.nodes.iter().find(|n| n.count > 0 && n.left_or_first == sk.instance).expect("the unit's leaf of the top tree");
+        assert_eq!((leaf.bmin, leaf.bmax), (unit.lo.into(), unit.hi.into()), "{what}: the top tree has the unit by its mesh's bounds, placed");
     };
     let check_one = |what: &str, c: &LiveCore, g: usize, now: &crate::desc::Animation, before: &crate::desc::Animation| {
         let what = format!("{what}, {} (object {})", deforming(c)[g].0, deforming(c)[g].3);
@@ -3150,7 +3159,10 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         same(&format!("{what}: the vertices"), &v, &cv, &[3], 12);
         // (An attribute's words: the section in `uv.w` (15), the rank in `x.w` (23), the object and a spare beside.)
         same(&format!("{what}: the attributes"), &at, &cat, &[15, 21, 22, 23], 24);
-        same(&format!("{what}: the BLAS input"), &b, &cb, &[], 9);
+        if let Some(b) = b {
+            same(&format!("{what}: the BLAS input"), &b, &cb, &[], 9);
+        }
+        tree(&what, c, g, &cb);
         same(&format!("{what}: the previous frame's vertices"), &prev, &cpu(c, g, before).0, &[3], 12);
         // The CPU's own: the build's pose in the pool, the pose as it is now when asked.
         let (instance, id) = (deforming(c)[g].2, deforming(c)[g].3);
@@ -3221,11 +3233,35 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
     w.set_geometry(7, Geometry { normals: [0.0, 0.0, 1.0].repeat(corners), uvs: vec![0.0; corners * 2], positions, indices, groups: vec![], colors: vec![] }).unwrap();
     w.set_object(40, "sheet".into(), None, Kind::Mesh { geometry: 7, material: 1, own_blas: false, materials: vec![] }, true, false).unwrap();
     w.set_transform(40, Vec3::new(0.0, -80.0, 0.0), glam::Quat::IDENTITY, Vec3::splat(0.001)).unwrap();
-    assert!(!live.commit(&mut w).unwrap(), "a large mesh added: in place ({:?})", live.fallback);
+    // (Software traversal's room does not grow: a rebuild's there.)
+    assert_eq!(live.commit(&mut w).unwrap(), !hw, "a large mesh added: in place under hardware traversal ({:?})", live.fallback);
     assert!(live.sc.up.verts.size() > size, "the triangles' buffer was made again, larger ({} -> {})", size, live.sc.up.verts.size());
+    if !hw {
+        picture(&mut live, 2);
+    }
+    // (Under software traversal this is a build's: the meshes, and their trees, as the build makes them for a pose.)
+    check("after a large mesh was added", &live, &bend(0.9), &bend(0.9));
     all(&mut w, &bend(0.25));
     assert!(!live.commit(&mut w).unwrap(), "posed after the buffers grew: in place ({:?})", live.fallback);
     check("posed after the buffers grew", &live, &bend(0.25), &bend(0.9));
+    // The motion of that pose: no vector is longer than the furthest a corner of a model went (a kernel that takes
+    // another triangle's previous vertices gives vectors as long as the mesh), and some are nearly as long.
+    {
+        (live.fixed_dt, live.frame, live.reset) = (Some(1.0 / 60.0), 16, true);
+        live.render(1, |_, _| {});
+        let m = &live.targets.kernel.motion;
+        let moved = read(&live, &m.buffer, m.offset, m.size);
+        let corners = |v: &[f32]| -> Vec<Vec3> {
+            v.chunks_exact(12).flat_map(|t| { let (p, e1, e2) = (Vec3::new(t[0], t[1], t[2]), Vec3::new(t[4], t[5], t[6]), Vec3::new(t[8], t[9], t[10])); [p, p + e1, p + e2] }).collect()
+        };
+        let far = (0..4).map(|g| {
+            let world = live.sc.instances[deforming(&live)[g].2 as usize].world;
+            corners(&cpu(&live, g, &bend(0.25)).0).iter().zip(corners(&cpu(&live, g, &bend(0.9)).0)).map(|(x, y)| world.transform_vector3(*x - y).length()).fold(0.0f32, f32::max)
+        }).fold(0.0f32, f32::max);
+        let vectors: Vec<f32> = moved.chunks_exact(4).filter(|p| p[3] > 0.5).map(|p| Vec3::new(p[0], p[1], p[2]).length()).collect();
+        let longest = vectors.iter().copied().fold(0.0f32, f32::max);
+        assert!(vectors.iter().filter(|&&l| l > 1e-3).count() > 20 && longest <= far * 1.001 + 1e-4 && longest > far * 0.2, "{} pixels moved; the longest motion vector is {longest}; the furthest a corner went, {far}", vectors.iter().filter(|&&l| l > 1e-3).count());
+    }
     pictured("posed after the buffers grew", &mut live, &w);
     // A pose that mirrors other primitives than the mesh was made for (the clip `flip` turns the badge's node the
     // other way round): its triangles are in another order, a build's to make.
@@ -3256,9 +3292,6 @@ fn models_posed_node_by_node_are_posed_in_place() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    if !live.g.hwrt {
-        return eprintln!("skipped: no hardware ray tracing");
-    }
     assert_eq!(live.sc.tables.retained.skinned.len(), 2, "each a mesh of its own, though in the same pose");
     let before = picture(&mut live, 64);
     for (id, a) in [(30, 0.9), (31, -1.2)] {
