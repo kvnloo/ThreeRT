@@ -2528,11 +2528,12 @@ fn a_posed_rigid_model_with_flattened_triangles_is_hidden_and_removed_by_a_rebui
     assert!(apart(&one, &two) > 0.5, "the second is in the picture ({:.2} steps)", apart(&one, &two));
 }
 
-/// Models in a shared pose posed again in place (tests/render/data/arm.glb: a skinned strip, a dark half and a light
-/// half that a joint swings): their mesh is skinned where it lies, each triangle still in its section. The picture is
-/// a build's.
+/// Posed skinned models are each a mesh of their own, whatever their poses (tests/render/data/arm.glb: a skinned strip,
+/// a dark half and a light half that a joint swings): two in the same pose are two meshes, posed again in place with
+/// each triangle still in its section, and one of them given another pose alone is in place too (a pose two shared
+/// was one mesh, and that was a rebuild). The picture is a build's.
 #[test]
-fn models_in_a_shared_pose_posed_again_keep_their_sections() {
+fn posed_skinned_models_are_meshes_of_their_own() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
     let bend = |time| Some(crate::desc::Animation { clip: "bend".into(), time, r#loop: true, nodes: Default::default() });
@@ -2546,27 +2547,111 @@ fn models_in_a_shared_pose_posed_again_keep_their_sections() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    let groups = &live.sc.tables.retained.pose_groups;
-    assert_eq!((groups.len(), live.sc.meshes[groups[0].mesh as usize].sect_count), (1, 2), "the two share a pose's mesh, of two sections");
+    if !live.g.hwrt {
+        return eprintln!("skipped: no hardware ray tracing");
+    }
+    let of = |c: &LiveCore, id: u32| c.sc.tables.retained.skinned.iter().find(|s| s.object == id).expect("a posed skinned model").clone();
+    let (a, b) = (of(&live, 30), of(&live, 31));
+    assert_eq!((live.sc.tables.retained.skinned.len(), a.mesh != b.mesh, a.source == b.source, live.sc.meshes[a.mesh as usize].sect_count), (2, true, true, 2), "two meshes of two sections, skinned from the model's one copy of its corners");
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 64), picture(&mut fresh, 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let loaded = against_a_build("as loaded", &mut live, &w);
     for id in [30, 31] {
         w.set_animation(id, bend(0.75)).unwrap();
     }
-    let rebuilt = live.commit(&mut w).unwrap();
-    assert!(!(rebuilt && live.g.hwrt), "the pose changed in place ({:?})", live.fallback);
-    let mut fresh = open(&w).unwrap();
-    forget(&mut live);
-    let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
-    assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from a build's", apart(&a, &b));
+    assert!(!live.commit(&mut w).unwrap(), "both posed again: in place ({:?})", live.fallback);
+    let both = against_a_build("both posed again", &mut live, &w);
+    assert!(apart(&loaded, &both) > 0.5, "the pose is in the picture ({:.2} steps)", apart(&loaded, &both));
+    // One alone, and the other's mesh keeps its pose.
+    w.set_animation(31, bend(0.2)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "one of two in the same pose posed alone: in place ({:?})", live.fallback);
+    assert_eq!((of(&live, 30).animation.time, of(&live, 31).animation.time), (0.75, 0.2));
+    let one = against_a_build("one posed alone", &mut live, &w);
+    assert!(apart(&both, &one) > 0.5, "its pose is in the picture ({:.2} steps)", apart(&both, &one));
+}
+
+/// A posed skinned model is hidden and shown in place: hidden, no ray sees its instance and a new pose skins
+/// nothing; shown, it is skinned as it is posed then, where it stands. The picture is a build's each time. (Under
+/// software traversal, by a rebuild.)
+#[test]
+fn a_posed_skinned_model_is_hidden_and_shown_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let bend = |time| Some(crate::desc::Animation { clip: "bend".into(), time, r#loop: true, nodes: Default::default() });
+    let mut w = world();
+    for (id, x) in [(30, -0.7), (31, 0.7)] {
+        w.set_object(id, format!("arm{id}"), None, Kind::Model { uri: "tests/render/data/arm.glb".into(), nodes: None, animation: bend(0.0), functions: vec![] }, true, true).unwrap();
+        w.set_transform(id, Vec3::new(x, -1.0, 0.8), glam::Quat::IDENTITY, Vec3::splat(2.0)).unwrap();
+    }
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let of = |c: &LiveCore, id: u32| c.sc.tables.retained.skinned.iter().find(|s| s.object == id).expect("a posed skinned model").clone();
+    let against_a_build = |what: &str, live: &mut LiveCore, w: &World| {
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 64), picture(&mut fresh, 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        a
+    };
+    let loaded = against_a_build("as loaded", &mut live, &w);
+    // Software traversal has a skinned model's triangles in its still tree, and no instance to mask: a rebuild's.
+    if !live.g.hwrt {
+        w.set_visible(31, false).unwrap();
+        assert!(live.commit(&mut w).unwrap(), "hidden under software traversal: a rebuild");
+        let hidden = against_a_build("hidden under software traversal", &mut live, &w);
+        assert!(apart(&loaded, &hidden) > 0.5, "it is out of the picture ({:.2} steps)", apart(&loaded, &hidden));
+        w.set_visible(31, true).unwrap();
+        assert!(live.commit(&mut w).unwrap(), "shown under software traversal: a rebuild");
+        let shown = against_a_build("shown under software traversal", &mut live, &w);
+        assert!(apart(&hidden, &shown) > 0.5, "it is in the picture again ({:.2} steps)", apart(&hidden, &shown));
+        return;
+    }
+    let record = of(&live, 31).instance;
+    w.set_visible(31, false).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "hidden: in place ({:?})", live.fallback);
+    assert!(!seen_by_rays(&live, record) && seen_by_rays(&live, of(&live, 30).instance), "no ray sees the hidden one; the other is seen");
+    let hidden = against_a_build("hidden", &mut live, &w);
+    assert!(apart(&loaded, &hidden) > 0.5, "it is out of the picture ({:.2} steps)", apart(&loaded, &hidden));
+    // Posed and moved while hidden: nothing is skinned; the other is posed as ever.
+    w.set_animation(31, bend(0.8)).unwrap();
+    w.set_animation(30, bend(0.5)).unwrap();
+    w.set_transform(31, Vec3::new(0.5, -0.8, 0.9), glam::Quat::from_rotation_y(0.4), Vec3::splat(2.0)).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "posed and moved while hidden: in place ({:?})", live.fallback);
+    assert_eq!((of(&live, 31).animation.time, of(&live, 30).animation.time), (0.0, 0.5), "the hidden one's mesh keeps the pose it had; the other's has the new one");
+    against_a_build("posed and moved while hidden", &mut live, &w);
+    // Shown: skinned as it is posed now, where it stands now.
+    w.set_visible(31, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "shown: in place ({:?})", live.fallback);
+    assert!(seen_by_rays(&live, record), "the rays see it again");
+    assert_eq!(of(&live, 31).animation.time, 0.8, "its mesh has the pose it was given while hidden");
+    let shown = against_a_build("shown", &mut live, &w);
+    assert!(apart(&hidden, &shown) > 0.5, "it is in the picture again ({:.2} steps)", apart(&hidden, &shown));
+    // Hidden and shown again with nothing between: as it was.
+    w.set_visible(31, false).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "hidden again: in place ({:?})", live.fallback);
+    w.set_visible(31, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "shown again: in place ({:?})", live.fallback);
+    let again = against_a_build("shown again", &mut live, &w);
+    assert!(apart(&shown, &again) < 0.5, "as before it was hidden ({:.2} steps)", apart(&shown, &again));
 }
 
 /// The skinning pass writes what the CPU skin writes. Two models (tests/render/data/skin-blend.glb: 72 triangles,
 /// vertices two joints hold, weights that do not sum to one, a primitive with tangents and one without normals, a
 /// mesh on a node beside the skin that mirrors it, a joint turned about an axis that is neither the normals' nor the
-/// tangents', its materials in an order a mesh laid out by material does not keep; and arm.glb), two of each in a
-/// pose, in a scene with world-space triangles before the meshes': after each new pose the GPU's triangles, shading attributes and
-/// BLAS input of each mesh are its model's triangles for the pose, the previous frame's vertices are the pose
-/// before, and the CPU has the mesh as it is now when asked. Also after the scene's buffers were made again larger,
-/// and a pose that mirrors other primitives than the mesh was made for is a rebuild's.
+/// tangents', its materials in an order a mesh laid out by material does not keep; and arm.glb), two of each, each
+/// a mesh of its own, in a scene with world-space triangles before the meshes': after each new pose the GPU's
+/// triangles, shading attributes and BLAS input of each mesh are its model's triangles for the pose, the previous
+/// frame's vertices are the pose before, and the CPU has the mesh as it is now when asked. One posed alone leaves
+/// the others' as they were. Also after the scene's buffers were made again larger, and a pose that mirrors other
+/// primitives than the mesh was made for is a rebuild's.
 #[test]
 fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
     let presets = crate::default_presets_dir();
@@ -2592,12 +2677,12 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
     }
     assert!(live.sc.edit.pool_first > 0, "a mesh's first triangle on the GPU is not its first in the pool");
     {
-        let g = live.sc.tables.retained.pose_groups.iter().find(|g| g.uri.ends_with("skin-blend.glb")).expect("the model's mesh");
+        let g = live.sc.tables.retained.skinned.iter().find(|g| g.uri.ends_with("skin-blend.glb")).expect("the model's mesh");
         assert!(g.order.iter().enumerate().any(|(at, &(k, _, _))| at as u32 != k), "the mesh has the model's triangles in another order (by material)");
     }
-    // (A mesh, its first instance and its object, for each deforming mesh of the scene.)
-    let deforming = |c: &LiveCore| c.sc.tables.retained.pose_groups.iter().map(|g| (g.uri.clone(), g.order.clone(), g.members[0].1, g.members[0].0)).collect::<Vec<_>>();
-    assert_eq!(deforming(&live).len(), 2, "two models, each a pose its two placements share");
+    // (A mesh, its instance and its object, for each deforming mesh of the scene.)
+    let deforming = |c: &LiveCore| c.sc.tables.retained.skinned.iter().map(|g| (g.uri.clone(), g.order.clone(), g.instance, g.object)).collect::<Vec<_>>();
+    assert_eq!(deforming(&live).len(), 4, "four models, each a mesh of its own");
     let read = |c: &LiveCore, b: &wgpu::Buffer, at: u64, bytes: u64| -> Vec<f32> {
         let to = c.g.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut e = c.g.device.create_command_encoder(&Default::default());
@@ -2636,21 +2721,24 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         let up = &c.sc.up;
         (read(c, &up.verts, k * 48, n * 48), read(c, &up.attrs, k * 96, n * 96), read(c, &up.accel.as_ref().unwrap().verts, k * 36, n * 36), read(c, &up.prev_verts, (k - c.sc.dynamic.0 as u64) * 48, n * 48))
     };
+    let check_one = |what: &str, c: &LiveCore, g: usize, now: &crate::desc::Animation, before: &crate::desc::Animation| {
+        let what = format!("{what}, {} (object {})", deforming(c)[g].0, deforming(c)[g].3);
+        let ((v, at, b, prev), (cv, cat, cb)) = (gpu(c, g), cpu(c, g, now));
+        same(&format!("{what}: the vertices"), &v, &cv, &[3], 12);
+        // (An attribute's words: the section in `uv.w` (15), the rank in `x.w` (23), the object and a spare beside.)
+        same(&format!("{what}: the attributes"), &at, &cat, &[15, 21, 22, 23], 24);
+        same(&format!("{what}: the BLAS input"), &b, &cb, &[], 9);
+        same(&format!("{what}: the previous frame's vertices"), &prev, &cpu(c, g, before).0, &[3], 12);
+        // The CPU's own: the build's pose in the pool, the pose as it is now when asked.
+        let (instance, id) = (deforming(c)[g].2, deforming(c)[g].3);
+        let inst = &c.sc.instances[instance as usize];
+        let asked: Vec<f32> = c.node_tris(&format!("m{id}")).iter().flatten().flat_map(|p| p.to_array()).collect();
+        let placed: Vec<f32> = cb.chunks_exact(3).flat_map(|p| inst.world.transform_point3(Vec3::new(p[0], p[1], p[2])).to_array()).collect();
+        same(&format!("{what}: the mesh as the CPU has it when asked"), &asked, &placed, &[], 9);
+    };
     let check = |what: &str, c: &LiveCore, now: &crate::desc::Animation, before: &crate::desc::Animation| {
         for g in 0..deforming(c).len() {
-            let what = format!("{what}, {}", deforming(c)[g].0);
-            let ((v, at, b, prev), (cv, cat, cb)) = (gpu(c, g), cpu(c, g, now));
-            same(&format!("{what}: the vertices"), &v, &cv, &[3], 12);
-            // (An attribute's words: the section in `uv.w` (15), the rank in `x.w` (23), the object and a spare beside.)
-            same(&format!("{what}: the attributes"), &at, &cat, &[15, 21, 22, 23], 24);
-            same(&format!("{what}: the BLAS input"), &b, &cb, &[], 9);
-            same(&format!("{what}: the previous frame's vertices"), &prev, &cpu(c, g, before).0, &[3], 12);
-            // The CPU's own: the build's pose in the pool, the pose as it is now when asked.
-            let (instance, id) = (deforming(c)[g].2, deforming(c)[g].3);
-            let inst = &c.sc.instances[instance as usize];
-            let asked: Vec<f32> = c.node_tris(&format!("m{id}")).iter().flatten().flat_map(|p| p.to_array()).collect();
-            let placed: Vec<f32> = cb.chunks_exact(3).flat_map(|p| inst.world.transform_point3(Vec3::new(p[0], p[1], p[2])).to_array()).collect();
-            same(&format!("{what}: the mesh as the CPU has it when asked"), &asked, &placed, &[], 9);
+            check_one(what, c, g, now, before);
         }
     };
     let all = |w: &mut World, a: &crate::desc::Animation| {
@@ -2659,13 +2747,26 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         }
     };
     let (first, second, third) = (bend(0.0), bend(0.75), bend(0.4));
-    let loaded: Vec<Vec<f32>> = (0..2).map(|g| cpu(&live, g, &first).0).collect();
+    let loaded: Vec<Vec<f32>> = (0..4).map(|g| cpu(&live, g, &first).0).collect();
     for (what, now, before) in [("a new pose", &second, &first), ("the next", &third, &second)] {
         all(&mut w, now);
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
         check(what, &live, now, before);
     }
-    assert!((0..2).all(|g| cpu(&live, g, &third).0.iter().zip(&loaded[g]).any(|(a, b)| (a - b).abs() > 0.05)), "the pose moves both meshes");
+    assert!((0..4).all(|g| cpu(&live, g, &third).0.iter().zip(&loaded[g]).any(|(a, b)| (a - b).abs() > 0.05)), "the pose moves every mesh");
+    // One posed alone: its mesh, and the others' as they were (their previous frame's vertices their own pose now).
+    let alone = bend(0.15);
+    w.set_animation(31, Some(alone.clone())).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "one posed alone: in place ({:?})", live.fallback);
+    for g in 0..4 {
+        if deforming(&live)[g].3 == 31 {
+            check_one("one posed alone", &live, g, &alone, &third);
+        } else {
+            check_one("the others, left alone", &live, g, &third, &third);
+        }
+    }
+    w.set_animation(31, Some(third.clone())).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "and back: in place ({:?})", live.fallback);
     // The picture is a build's.
     let pictured = |what: &str, live: &mut LiveCore, w: &World| {
         let mut fresh = open(w).unwrap();
@@ -2735,7 +2836,7 @@ fn models_posed_node_by_node_are_posed_in_place() {
     if !live.g.hwrt {
         return eprintln!("skipped: no hardware ray tracing");
     }
-    assert_eq!(live.sc.tables.retained.pose_groups.len(), 2, "each its own pose, though the same");
+    assert_eq!(live.sc.tables.retained.skinned.len(), 2, "each a mesh of its own, though in the same pose");
     let before = picture(&mut live, 64);
     for (id, a) in [(30, 0.9), (31, -1.2)] {
         w.set_animation(id, turn(a)).unwrap();
