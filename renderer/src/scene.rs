@@ -203,6 +203,9 @@ pub struct Instance {
     /// (`rows_bits`).
     pub rows: u32,
     pub bits: u32,
+    /// An instance of a mesh that deforms: the first triangle of its previous frame's vertices (the kernel's
+    /// `prev_verts`: its motion is its pose's and its transform's). 0 otherwise.
+    pub prev: u32,
 }
 
 /// Kernel record of an instance (`instances` binding): world matrix rows, normal matrix rows (inverse transpose),
@@ -219,14 +222,14 @@ pub struct GpuInstance {
 
 impl Instance {
     /// Kernel record with its mesh's first triangle at `first` in the GPU order. (n0.w is left free: a unit's record
-    /// takes it for its tree's root, units.rs `unit_record`.)
+    /// takes it for its tree's root, units.rs `unit_record`. n1.w: its bits. n2.w: `prev`, as bits.)
     pub fn gpu(&self, first: u32) -> GpuInstance {
         let w = self.world;
         let nm = glam::Mat3::from_mat4(w).inverse().transpose();
         let row = |r: usize| [w.x_axis[r], w.y_axis[r], w.z_axis[r], w.w_axis[r]];
         let nrow = |r: usize, w: f32| [nm.x_axis[r], nm.y_axis[r], nm.z_axis[r], w];
         let bits = f32::from_bits(self.bits | if mirrors(w) { INST_MIRRORED } else { 0 });
-        GpuInstance { m: [row(0), row(1), row(2)], n: [nrow(0, 0.0), nrow(1, bits), nrow(2, 0.0)], info: [first, self.object, lod_offset(w).to_bits(), self.rows], p: [row(0), row(1), row(2)] }
+        GpuInstance { m: [row(0), row(1), row(2)], n: [nrow(0, 0.0), nrow(1, bits), nrow(2, f32::from_bits(self.prev))], info: [first, self.object, lod_offset(w).to_bits(), self.rows], p: [row(0), row(1), row(2)] }
     }
     /// A triangle's attributes as a flattened triangle has them: the material its row names in place of the
     /// section, and no index in it (`rows`: the instance's).
@@ -744,8 +747,12 @@ pub struct Retained {
     pub light_nodes: Vec<u32>,
     /// Atmosphere sun: its colour comes from the sky bake.
     pub sun: Option<u32>,
-    /// Posed skinned models' meshes (`Skinned`: a model's proxy names its own, `MeshKind::Skinned`).
+    /// Posed skinned models' meshes (`Skinned`: a model's proxy names its own, `MeshKind::Skinned`). One an edit took
+    /// out again has no mesh (`u32::MAX`) until the next one placed takes its slot.
     pub skinned: Vec<Skinned>,
+    /// Posed skinned models an edit can place another of: (uri, nodes) -> one of `skinned` that the build placed, with
+    /// the file's own materials (what the pass skins it from, its mesh's sections and rows are the model's).
+    pub skinned_model: HashMap<(String, Option<Vec<String>>), u32>,
     /// Meshes and instanced objects: (geometry, whether by its groups: `by_groups`) -> the shared mesh (objects of the
     /// same geometry share its BLAS, whatever their materials: those are their instances' rows). live/edits.rs
     /// `edit_geometry` keeps it.
@@ -974,8 +981,9 @@ pub struct Skinned {
     pub nodes: Option<Vec<String>>,
     /// The pose the mesh holds.
     pub animation: desc::Animation,
-    /// Per pool triangle of the mesh, in order: its index in the model's triangles, its section and its index in it.
-    pub order: Vec<(u32, u32, u32)>,
+    /// Per pool triangle of the mesh, in order: its index in the model's triangles, its section and its index in it
+    /// (the model's: one list for all its placements).
+    pub order: Arc<Vec<(u32, u32, u32)>>,
     /// Its object, and its instance.
     pub object: u32,
     pub instance: u32,
@@ -1536,7 +1544,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     let mut rigid_parts: HashMap<(String, String), std::rc::Rc<Vec<RigidPart>>> = HashMap::new();
     // What the skinning pass reads, by (model, nodes, the primitives mirrored): shared by the model's placements.
     let mut skin_sources: Vec<Vec<[skin::SkinCorner; 3]>> = vec![];
-    let mut skin_source_of: HashMap<(String, Option<Vec<String>>, Vec<bool>), u32> = HashMap::new();
+    let mut skin_source_of: HashMap<(String, Option<Vec<String>>, Vec<bool>), (u32, Arc<Vec<(u32, u32, u32)>>)> = HashMap::new();
     // Flattened instances' triangle ranges.
     let mut tri_instances: Vec<(u32, u32, u32)> = vec![];
     // Instance colours anywhere: object entries of 4 vec4s, and the kernel's F_TINT.
@@ -1589,7 +1597,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     retained.edits_meshes |= *own_blas || n.driven;
                     *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: instances.len() as u32, mesh: MeshKind::Own, moves: n.driven || w.movable(*id) }) };
                     let mine = section_rows(meshes[mesh as usize].sections(&sections), if grouped { &gpu_mats } else { std::slice::from_ref(&mat) }, &materials);
-                    instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: unseen, masked: unseen, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine) });
+                    instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: unseen, masked: unseen, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0 });
                     rows.extend(mine);
                 }
             }
@@ -1647,7 +1655,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         for (i, &(wm, hidden)) in placed.iter().enumerate() {
                             let (lo, hi) = meshes[mesh as usize].placed_bounds(wm);
                             objects.extend_from_slice(&copy_row(entry(i, wm, Vec3::from(hi - lo)), emits && hidden)[..stride]);
-                            instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine) });
+                            instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0 });
                             rows.extend(mine.iter().copied());
                         }
                     }
@@ -1822,7 +1830,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                             } else {
                                 rigid.instances.push((part.node, i));
                             }
-                            instances.push(Instance { mesh, world: w_n, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine) });
+                            instances.push(Instance { mesh, world: w_n, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0 });
                             rows.extend(mine);
                         }
                         for (p, nn, uv, tg, mat) in &part.rest {
@@ -1867,13 +1875,14 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         let mirrors = glb.mirrored(Some(a))?;
                         let file = if functions.is_empty() { uri.clone() } else { format!("{uri}\u{0}{functions:?}") };
                         let skey = (file, nodes.clone(), mirrors.clone());
-                        let source = match skin_source_of.get(&skey) {
-                            Some(k) => *k,
+                        let (source, tri_order) = match skin_source_of.get(&skey) {
+                            Some(s) => s.clone(),
                             None => {
                                 let corners = glb.skin_source(nodes.as_deref(), Some(a))?;
                                 skin_sources.push(order.iter().map(|&(k, _, _)| corners[k]).collect());
-                                skin_source_of.insert(skey, skin_sources.len() as u32 - 1);
-                                skin_sources.len() as u32 - 1
+                                let s = (skin_sources.len() as u32 - 1, Arc::new(order.iter().map(|&(k, section, rank)| (k as u32, section, rank)).collect::<Vec<_>>()));
+                                skin_source_of.insert(skey, s.clone());
+                                s
                             }
                         };
                         let first = pool_tris.len() as u32;
@@ -1887,7 +1896,6 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                             pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
                             pool_attrs.push(section_attr(t.p, t.n, t.uv, t.tangent, section, rank));
                         }
-                        let tri_order: Vec<(u32, u32, u32)> = order.iter().map(|&(k, section, rank)| (k as u32, section, rank)).collect();
                         // Other poses reach further (a stride, a swing): object bounds a quarter wider each way; one
                         // the game poses may take any pose (lie down): as far as its size each way.
                         let pad = if a.nodes.is_empty() { (hi - lo) * 0.25 } else { Vec3A::splat((hi - lo).length()) };
@@ -1901,10 +1909,13 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         let oi = (objects.len() / stride) as u32;
                         objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
                         let i = instances.len() as u32;
-                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine) });
+                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0 });
                         rows.extend(mine);
                         retained.skinned.push(Skinned { mesh, uri: uri.clone(), nodes: nodes.clone(), animation: a.clone(), order: tri_order, object: *id, instance: i, source, palette_len: glb.palette_len() as u32, mirrors });
                         *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: i, mesh: MeshKind::Skinned(retained.skinned.len() as u32 - 1), moves: true }) };
+                        if functions.is_empty() {
+                            retained.skinned_model.entry((uri.clone(), nodes.clone())).or_insert(retained.skinned.len() as u32 - 1);
+                        }
                         continue;
                     }
                 }
@@ -1973,7 +1984,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
                         retained.proxy(*id).object = Some(oi);
                         let mine = retained.mesh_rows[&mesh].clone();
-                        let inst = Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine) };
+                        let inst = Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0 };
                         rows.extend(mine);
                         // Its glass / function triangles as ordinary world-space ones (same object).
                         for k in im.rest_first..im.rest_first + im.rest_count {
@@ -2809,7 +2820,7 @@ mod instance_tests {
         let local = tri_attr(p, n, uv, None, 7);
         for (w, mirrored) in [(keeps, false), (keeps * Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)), true)] {
             assert_eq!(mirrors(w), mirrored);
-            let inst = Instance { mesh: 0, world: w, object: 3, cast_shadow: true, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0 };
+            let inst = Instance { mesh: 0, world: w, object: 3, cast_shadow: true, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0 };
             assert_eq!(inst.gpu(0).n[1][3].to_bits(), if mirrored { INST_MIRRORED } else { 0 }, "the record says whether it mirrors");
             let (placed, got, got_colors) = inst.flat(&[p[0].into(), p[1].into(), p[2].into()], &local, Some(colors));
             // The world-space triangle: its vertices in the order the build flattens a placement in.
@@ -2844,7 +2855,7 @@ mod instance_tests {
         let mats = [opaque, cutout];
         let p = [Vec3::ZERO, Vec3::X, Vec3::Y];
         let a = |m: u32| tri_attr(p, [Vec3::Z; 3], [Vec2::ZERO, Vec2::X, Vec2::Y], None, m);
-        let inst = |shadow: bool| Instance { mesh: 0, world: Mat4::IDENTITY, object: 0, cast_shadow: shadow, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0 };
+        let inst = |shadow: bool| Instance { mesh: 0, world: Mat4::IDENTITY, object: 0, cast_shadow: shadow, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0 };
         assert_eq!(instance_tri_flags(&inst(true), &a(0), &mats), 0);
         assert_eq!(instance_tri_flags(&inst(true), &a(1), &mats), TRI_MASKED);
         assert_eq!(instance_tri_flags(&inst(false), &a(1), &mats), TRI_MASKED | TRI_NO_SHADOW);

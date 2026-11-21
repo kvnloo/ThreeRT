@@ -762,6 +762,58 @@ pub struct SkinGpu {
     palette: wgpu::Buffer,
     /// Per job, and how many matrices its palette is.
     jobs: Vec<(SkinJob, u32)>,
+    /// Each source's first triangle among the corners (`Scene::skin_sources`), and the palette's matrices in use.
+    source_first: Vec<u32>,
+    palette_end: u32,
+}
+
+impl SkinGpu {
+    /// (Tests: the bytes of the jobs' table, the palettes' and the blocks' buffers.)
+    #[cfg(test)]
+    pub fn rooms(&self) -> [u64; 3] {
+        [self.table.size(), self.palette.size(), self.blocks.size()]
+    }
+
+    /// The job of a mesh an edit placed, at `slot` (a new one, or one whose mesh is gone): its triangles from `first`
+    /// in the scene's, skinned from `source`'s corners by a palette of `palette_len` matrices. The pass's buffers
+    /// grow with it (the table written again whole; the palette's and the blocks' contents are a dispatch's, and
+    /// need no copy). True where one was made again: the pass's bind group is then to be (`Gpu::rebind_scene`).
+    pub fn set_job(&mut self, d: &wgpu::Device, q: &wgpu::Queue, slot: usize, first: u32, count: u32, source: u32, palette_len: u32) -> bool {
+        let room = |label: &str, size: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut grew = false;
+        // Its palette: the slot's own where that is as long, else new room at the end.
+        let palette = match self.jobs.get(slot) {
+            Some((j, len)) if *len == palette_len => j.palette,
+            _ => {
+                self.palette_end += palette_len;
+                self.palette_end - palette_len
+            }
+        };
+        let job = SkinJob { first, count, source: self.source_first[source as usize], palette };
+        if slot < self.jobs.len() {
+            self.jobs[slot] = (job, palette_len);
+        } else {
+            self.jobs.push((job, palette_len));
+        }
+        if self.jobs.len() as u64 * 16 > self.table.size() {
+            self.table = room("skin jobs", self.jobs.len() as u64 * 32);
+            let table: Vec<SkinJob> = self.jobs.iter().map(|j| j.0).collect();
+            q.write_buffer(&self.table, 0, bytemuck::cast_slice(&table));
+            grew = true;
+        } else {
+            q.write_buffer(&self.table, slot as u64 * 16, bytemuck::bytes_of(&job));
+        }
+        if self.palette_end as u64 * 48 > self.palette.size() {
+            self.palette = room("skin palette", self.palette_end as u64 * 96);
+            grew = true;
+        }
+        let blocks: u64 = self.jobs.iter().map(|j| j.0.count.div_ceil(SKIN_BLOCK) as u64).sum();
+        if blocks * 8 > self.blocks.size() {
+            self.blocks = room("skin blocks", blocks * 16);
+            grew = true;
+        }
+        grew
+    }
 }
 
 fn skin_bind_group(d: &wgpu::Device, pipeline: &wgpu::ComputePipeline, own: [&wgpu::Buffer; 5], verts: &wgpu::Buffer, attrs: &wgpu::Buffer, blas_verts: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -1722,6 +1774,10 @@ pub const F_IFUNC: u32 = 1 << 28;
 /// software traversal skips such a triangle of a unit). Compiled out where no instance mixes the two: one that is all
 /// glass is out of a shadow ray's way by its mask (`scene::rows_cast`).
 pub const F_IGLASS: u32 = 1 << 29;
+/// A mesh that deforms among the instances (a posed skinned model's): the first hit's motion takes its previous
+/// frame's vertices from where its instance's record says. Compiled out where no mesh deforms: with the read in every
+/// kernel a scene without one paid for it (a flight over a city: frame GPU +0.6 %, five pairs of five).
+pub const F_DEFORM: u32 = 1 << 30;
 /// Whether a scene with more such lights has the light tiles (`F_LISTS`): `THREERT_LIGHT_TILES=1|0`, else everywhere
 /// but Android. On Adreno 740 they took OpenStrikeRT's Foundry from 31 to 48 ms a frame (249 x 140, one bounce):
 /// there the lights are resampled as in a scene of fewer, unguided (docs/RUNTIME.md "Android").
@@ -1786,7 +1842,7 @@ pub fn environment_features(fog: Option<&crate::desc::Fog>, background: bool, ae
 /// Kernel features of the scene's structure, which parameter edits do not change: F_INST and F_MASKED for the
 /// instanced meshes (cutout triangles among them), F_MEDIA for participating media (F_HMEDIA for homogeneous ones),
 /// F_PEMIT for opaque particles, F_PROC for procedural geometry, F_TINT for instance colours, F_IFUNC for a material
-/// function on an instanced mesh, F_IGLASS for glass on one.
+/// function on an instanced mesh, F_IGLASS for glass on one, F_DEFORM for a mesh that deforms.
 pub fn instance_features(scene: &Scene) -> u32 {
     // (F_GRID also for a volume function that calls `vgrid` on a node without a grid: it reads zeros.)
     let grid = !scene.grids.is_empty() || (!scene.media.is_empty() && scene.volume_fns.iter().any(|(_, code, helpers)| code.contains("vgrid(") || helpers.contains("vgrid(")));
@@ -1803,7 +1859,8 @@ pub fn instance_features(scene: &Scene) -> u32 {
     let ifunc = if scene.rows.iter().any(|r| function(crate::scene::row_material(r))) { F_IFUNC } else { 0 };
     let iglass = if mixed_glass { F_IGLASS } else { 0 };
     let masked = any_row(crate::scene::ROW_CUTOUT);
-    media | particles | ifunc | iglass | F_INST | if masked { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
+    let deform = if scene.meshes.iter().any(|m| m.deforms) { F_DEFORM } else { 0 };
+    media | particles | ifunc | iglass | deform | F_INST | if masked { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
 }
 
 /// `features` from the parts parameter edits change (the materials; `environment`: `environment_features`), and the
@@ -3429,7 +3486,7 @@ impl Gpu {
         let params = room("skin params", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let (b_blocks, palette) = (room("skin blocks", blocks as u64 * 8, storage), room("skin palette", matrices as u64 * 48, storage));
         let bg = skin_bind_group(d, &pipeline, [&params, &b_blocks, &b_table, &b_corners, &palette], verts, attrs, blas_verts);
-        SkinGpu { pipeline, bg, params, blocks: b_blocks, table: b_table, corners: b_corners, palette, jobs }
+        SkinGpu { pipeline, bg, params, blocks: b_blocks, table: b_table, corners: b_corners, palette, jobs, source_first, palette_end: matrices }
     }
 
     /// Skins the meshes of `work` (a job and its pose's palette each) on the GPU: their triangles, shading attributes
@@ -3786,6 +3843,7 @@ mod tests {
             ("F_GLASS", F_GLASS), ("F_COAT", F_COAT), ("F_HUGE", F_HUGE), ("F_INST", F_INST), ("F_MEDIA", F_MEDIA), ("F_PEMIT", F_PEMIT),
             ("F_HMEDIA", F_HMEDIA), ("F_PROC", F_PROC), ("F_TINT", F_TINT), ("F_UNLIT", F_UNLIT), ("F_BACKGROUND", F_BACKGROUND),
             ("F_VCOLOR", F_VCOLOR), ("F_AERIAL", F_AERIAL), ("F_GRID", F_GRID), ("F_LISTS", F_LISTS), ("F_IFUNC", F_IFUNC), ("F_IGLASS", F_IGLASS),
+            ("F_DEFORM", F_DEFORM),
         ];
         let mut seen = 0u32;
         for (name, bit) in all {
