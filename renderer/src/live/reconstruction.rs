@@ -35,9 +35,9 @@ pub enum Method {
     Off,
     /// ThreeRT's denoiser, then FidelityFX Super Resolution 1 (spatial: no history).
     Fsr,
-    /// ThreeRT's denoiser, then the MetalFX temporal scaler (macOS 13+).
+    /// ThreeRT's denoiser, then the MetalFX temporal scaler (macOS 13+, iOS 16+).
     MetalFx,
-    /// The MetalFX temporal denoised scaler: both jobs (macOS 26+, Apple silicon).
+    /// The MetalFX temporal denoised scaler: both jobs (macOS 26+ on Apple silicon, iOS 26+).
     MetalFxDenoised,
     /// ThreeRT's denoiser, then DLSS Super Resolution (DLAA at scale 1; NVIDIA RTX, feature `dlss`).
     Dlss,
@@ -80,7 +80,7 @@ impl Method {
     /// The methods this build could run on its platform, in the order the viewer's key cycles them.
     pub fn platform() -> Vec<Method> {
         let mut m = vec![Self::Builtin];
-        #[cfg(target_os = "macos")]
+        #[cfg(metalfx)]
         m.extend([Self::MetalFxDenoised, Self::MetalFx]);
         #[cfg(dlss)]
         m.extend([Self::DlssRr, Self::Dlss]);
@@ -140,7 +140,7 @@ impl Reconstruction {
             Self::Auto => {
                 #[allow(unused_mut)]
                 let mut m = vec![];
-                #[cfg(target_os = "macos")]
+                #[cfg(metalfx)]
                 m.extend([Method::MetalFxDenoised, Method::MetalFx]);
                 #[cfg(dlss)]
                 m.extend([Method::DlssRr, Method::Dlss]);
@@ -239,6 +239,10 @@ pub trait UpscaleProvider: Send {
     /// which the dynamic-resolution governor steers by.
     fn untimed_gpu_ms(&self) -> f32 { 0.0 }
 
+    /// The render scales (input / output, a side) it takes at the output last prepared, when it knows them (also after
+    /// answering `Unsupported`): dynamic resolution stays within them while it is the method asked for.
+    fn scale_range(&self) -> Option<[f32; 2]> { None }
+
     /// The view was resized: release size-dependent state.
     fn invalidate(&mut self) {}
 }
@@ -249,6 +253,8 @@ pub trait JointProvider: Send {
     /// As [`UpscaleProvider::encode`].
     fn encode(&mut self, frame: ReconstructionFrame<'_>, guides: JointGuides<'_>, encoder: &mut CommandEncoder) -> Result<Option<CommandBuffer>>;
     fn untimed_gpu_ms(&self) -> f32 { 0.0 }
+    /// As [`UpscaleProvider::scale_range`].
+    fn scale_range(&self) -> Option<[f32; 2]> { None }
     fn invalidate(&mut self) {}
 }
 
@@ -267,6 +273,9 @@ impl Provider {
     }
     fn invalidate(&mut self) {
         match self { Self::Upscale(p) => p.invalidate(), Self::Joint(p) => p.invalidate() }
+    }
+    fn scale_range(&self) -> Option<[f32; 2]> {
+        match self { Self::Upscale(p) => p.scale_range(), Self::Joint(p) => p.scale_range() }
     }
 }
 
@@ -370,6 +379,9 @@ pub(super) struct Reconstructor {
     pub(super) active: Active,
     key: Option<(ReconstructionSize, bool)>,
     skipped: Vec<(Method, Skip, String)>,
+    /// The lowest render scale dynamic resolution may go to: the range of the method that runs, or of the first one
+    /// asked for that did not run for the scale alone (the governor raises the scale until it does).
+    scale_floor: Option<f32>,
     fsr: Option<fsr::Fsr>,
     providers: Vec<(Method, Provider)>,
     // Fields drop in declaration order: providers release GPU work before their input/output textures.
@@ -381,7 +393,7 @@ impl Default for Reconstructor {
     fn default() -> Self {
         #[allow(unused_mut)]
         let mut providers: Vec<(Method, Provider)> = vec![];
-        #[cfg(target_os = "macos")]
+        #[cfg(metalfx)]
         providers.extend([
             (Method::MetalFx, Provider::Upscale(Box::new(super::metalfx::MetalFx::upscaler()))),
             (Method::MetalFxDenoised, Provider::Joint(Box::new(super::metalfx::MetalFx::denoiser()))),
@@ -391,7 +403,7 @@ impl Default for Reconstructor {
             (Method::Dlss, Provider::Upscale(Box::new(super::dlss::Dlss::default()))),
             (Method::DlssRr, Provider::Joint(Box::new(super::dlss::DlssRr::default()))),
         ]);
-        Self { requested: Reconstruction::default(), active: Active::Builtin, key: None, skipped: vec![], fsr: None, providers, textures: None, pipes: None }
+        Self { requested: Reconstruction::default(), active: Active::Builtin, key: None, skipped: vec![], scale_floor: None, fsr: None, providers, textures: None, pipes: None }
     }
 }
 
@@ -467,11 +479,26 @@ impl Reconstructor {
         self.active != old
     }
 
+    /// The lowest render scale the governor may go to for this reconstruction (None: its own floor).
+    pub(super) fn scale_floor(&self) -> Option<f32> { self.scale_floor }
+
     fn select(&mut self, g: &gpu::Gpu, targets: &Targets, size: ReconstructionSize) -> Active {
+        self.scale_floor = None;
+        let range_of = |s: &Self, m: &Method| s.providers.iter().find(|(k, _)| k == m).and_then(|(_, p)| p.scale_range());
+        let scale = size.input[0] as f32 / size.output[0].max(1) as f32;
         for m in self.requested.chain() {
             match self.try_method(g, targets, &m, size) {
-                Ok(active) => return active,
+                Ok(active) => {
+                    if size.dynamic && self.scale_floor.is_none() {
+                        self.scale_floor = range_of(self, &m).map(|r| r[0]);
+                    }
+                    return active;
+                }
                 Err((skip, detail)) => {
+                    // (Below the range of a method asked for before the one that runs: the governor goes up to it.)
+                    if size.dynamic && self.scale_floor.is_none() && skip == Skip::Unsupported {
+                        self.scale_floor = range_of(self, &m).filter(|r| scale < r[0] && r[0] <= 1.0).map(|r| r[0]);
+                    }
                     if skip == Skip::ProviderError { eprintln!("live: {} reconstruction failed: {detail}", m.name()); }
                     self.skipped.push((m, skip, detail));
                 }
@@ -496,7 +523,7 @@ impl Reconstructor {
         }
         let Some(i) = self.providers.iter().position(|(k, _)| k == m) else {
             return Err((Skip::Unavailable, match m {
-                Method::MetalFx | Method::MetalFxDenoised => "MetalFX runs on macOS only".into(),
+                Method::MetalFx | Method::MetalFxDenoised => "MetalFX runs on macOS and iOS only".into(),
                 Method::Dlss | Method::DlssRr => "this build has no DLSS (feature `dlss`, x86-64 Windows or Linux)".into(),
                 _ => format!("no provider is registered as {}", m.name()),
             }));
