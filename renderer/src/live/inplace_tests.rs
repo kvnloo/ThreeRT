@@ -807,10 +807,11 @@ fn edits_in_place_leave_what_a_build_does() {
     assert!(!live.commit(&mut w).unwrap() && live.cam == away && live.view.dof.is_some(), "a depth of field and an exposure: the view stays");
     w.set_camera_desc(6, camera(40.0, Some(3.0), manual(2.0))).unwrap();
     assert!(!live.commit(&mut w).unwrap() && live.cam == live.view.camera && live.cam != away, "a lens: the view takes the scene's camera");
-    // A commit that rebuilds (another group: what a build places) and brings another preset with it.
-    w.set_object(13, "more".into(), None, Kind::Group, true, false).unwrap();
+    // A commit that rebuilds (a rect light with a card: its triangles are a build's to place) and brings another
+    // preset with it.
+    w.set_object(13, "card".into(), None, Kind::Light(serde_json::from_value(serde_json::json!({ "type": "rect", "color": [1, 1, 1], "castShadow": true, "intensity": 50, "width": 0.2, "height": 0.2, "visible": true })).unwrap()), true, false).unwrap();
     w.set_settings(Settings { preset: "cinematic".into(), overrides: Some(serde_json::json!({ "post": { "vignette": 0.3 } })), ..w.settings.clone() });
-    assert!(live.commit(&mut w).unwrap(), "another group: a rebuild");
+    assert!(live.commit(&mut w).unwrap(), "a rect light's card: a rebuild");
     let mut fresh = open(&w).unwrap();
     (picture(&mut live, 1), picture(&mut fresh, 1));
     same_state("a rebuild with another preset", &live, &fresh);
@@ -2290,9 +2291,10 @@ fn a_model_of_several_materials_placed_in_place_has_its_rows() {
 }
 
 /// A model with glass among its sections, in a scene where no instance of it casts a shadow: the kernel was built
-/// without what has a shadow ray pass such glass, so the first instance that casts is placed by a rebuild.
+/// without what has a shadow ray pass such glass. The first instance that casts is placed in place and asks for it
+/// (`F_IGLASS`): the picture is a build's.
 #[test]
-fn the_first_caster_with_glass_among_its_sections_is_a_rebuilds() {
+fn the_first_caster_with_glass_among_its_sections_comes_in_place() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
     let model = || Kind::Model { uri: "tests/render/data/frame-pane.glb".into(), nodes: None, animation: None, functions: vec![] };
@@ -2311,7 +2313,7 @@ fn the_first_caster_with_glass_among_its_sections_is_a_rebuilds() {
     // (Upright before the wall, its pane 1 m wide: the pane's shadow is the sun's light through it.)
     w.set_object(31, "caster".into(), None, model(), true, false).unwrap();
     w.set_transform(31, Vec3::new(0.5, 0.0, 0.5), glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(2.0)).unwrap();
-    live.commit(&mut w).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "in place ({:?})", live.fallback);
     let mut fresh = open(&w).unwrap();
     forget(&mut live);
     let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
@@ -2328,7 +2330,7 @@ fn the_first_caster_with_glass_among_its_sections_is_a_rebuilds() {
     w.set_geometry(30, Geometry { positions: vec![-1.0, -0.5, 0.0, 0.0, -0.5, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5, 0.0, 0.0, 0.5, 0.0, 1.0, 0.5, 0.0], normals: [0.0, 0.0, 1.0].repeat(6), uvs: vec![0.0; 12], indices: vec![0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4], groups: vec![[0, 6, 0], [6, 6, 1]], colors: vec![] }).unwrap();
     w.set_object(31, "pane".into(), None, Kind::Mesh { geometry: 30, material: 1, own_blas: false, materials: vec![1, 65] }, true, false).unwrap();
     w.set_transform(31, Vec3::new(0.0, 0.0, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
-    live.commit(&mut w).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "in place ({:?})", live.fallback);
     let mut fresh = open(&w).unwrap();
     forget(&mut live);
     let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
@@ -4118,4 +4120,420 @@ fn dynamic_resolution_rises_to_the_range_of_the_method_asked_for() {
     assert!(live.render_scale >= floor, "{} under {floor}", live.render_scale);
     live.render(1, |_, _| {});
     assert_eq!(live.reconstruction(), Method::MetalFxDenoised, "{:?}", live.reconstruction_status().skipped);
+}
+
+/// A world texture of `width` x `height` pixels: a checker of `a` and `b`, `cell` pixels a square.
+fn checker(width: u32, height: u32, cell: u32, a: [u8; 3], b: [u8; 3]) -> crate::world::Texture {
+    let rgba: Vec<u8> = (0..width * height).flat_map(|k| if (k % width / cell + k / width / cell) % 2 == 0 { [a[0], a[1], a[2], 255] } else { [b[0], b[1], b[2], 255] }).collect();
+    crate::world::Texture { source: crate::world::TextureSource::Pixels { width, height, rgba: std::sync::Arc::new(rgba) }, srgb: true, wrap: true, repeat: [1.0, 1.0], offset: [0.0, 0.0] }
+}
+
+/// By world material: the keys of the textures its slots name in the pages (base, normal, roughness, metalness,
+/// emissive, occlusion), None where it names none. Where in the pages a texture lies, and its number, are a view's own.
+fn textures_named(c: &LiveCore) -> std::collections::BTreeMap<u32, Vec<Option<String>>> {
+    let keys = c.g.pages_state().0;
+    let t = &c.sc.tables;
+    t.retained.materials.iter().map(|(id, &mi)| {
+        let m = &t.materials[mi as usize];
+        (*id, [m.tex0[0], m.tex0[1], m.tex0[2], m.tex0[3], m.tex1[0], m.tex1[1]].iter().map(|&s| (s >= 0).then(|| keys[s as usize].0.clone())).collect())
+    }).collect()
+}
+
+/// Textures come and change in place, in a scene that had none: a material given a map, a new material with one, a
+/// second texture of pixels the pages have (the same slot), one of those two replaced (another slot: the other
+/// keeps its pixels), a texture's pixels replaced by as many (over the old ones, in their slot) and by a picture of
+/// another size (another slot), a texture wider than the pages (they get a longer side and a layer more, what they
+/// held copied there). After each: no rebuild, every material names the textures a build of the edited world
+/// names, and the picture is that build's. A texture set again as it is changes nothing.
+#[test]
+fn textures_come_and_change_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let mat = |color: f32, maps: serde_json::Value| -> crate::desc::Material {
+        let mut m = serde_json::json!({ "name": "m", "color": [color, color, color], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(maps.as_object().unwrap().clone());
+        serde_json::from_value(m).unwrap()
+    };
+    let mut w = world();
+    // (The wall and the panel with UVs over them; the panel a mesh the scene edits, with a material of its own.)
+    let quad = |s: f32| Geometry { positions: vec![-s, -s, 0.0, s, -s, 0.0, s, s, 0.0, -s, s, 0.0], normals: [0.0, 0.0, 1.0].repeat(4), uvs: vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], indices: vec![0, 1, 2, 0, 2, 3], groups: vec![], colors: vec![] };
+    w.set_geometry(2, quad(1.0)).unwrap();
+    w.set_geometry(3, quad(0.25)).unwrap();
+    w.set_material(6, mat(0.9, serde_json::json!({})));
+    w.set_object(11, "panel".into(), None, Kind::Mesh { geometry: 3, material: 6, own_blas: true, materials: vec![] }, true, false).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert_eq!((live.sc.up.kernel.features & gpu::F_TEX, live.g.pages_state().0.len()), (0, 0), "a scene without a texture");
+    let mut last = picture(&mut live, 24);
+    let mut check = |what: &str, live: &mut LiveCore, w: &mut World| {
+        assert!(!live.commit(w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        let mut fresh = open(w).unwrap();
+        assert_eq!(textures_named(live), textures_named(&fresh), "{what}: the textures the materials name");
+        assert_eq!(live.sc.up.kernel.features, fresh.sc.up.kernel.features, "{what}: the kernel's features");
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last, &b) > 0.2, "{what}: the picture is {:.2} steps from the one before", apart(&last, &b));
+        last = b;
+    };
+    // The wall's material given a map.
+    w.set_texture(30, checker(64, 40, 8, [255, 40, 40], [40, 40, 255])).unwrap();
+    w.set_material(1, mat(0.8, serde_json::json!({ "map": 30 })));
+    check("a material given a map", &mut live, &mut w);
+    assert_ne!(live.sc.up.kernel.features & gpu::F_TEX, 0);
+    let slot = |live: &LiveCore, texture: u32| live.sc.tables.retained.textures.get(&(texture, true)).copied();
+    let (keys, side, layers, places) = live.g.pages_state();
+    assert_eq!((keys.len(), side, layers, slot(&live, 30)), (1, 256, 1, Some(0)), "the first texture: slot 0 of one page");
+    // A new material with a map of its own, on the panel.
+    w.set_texture(31, checker(100, 60, 10, [30, 220, 30], [240, 240, 30])).unwrap();
+    w.set_material(8, mat(0.9, serde_json::json!({ "map": 31 })));
+    w.set_object(11, "panel".into(), None, Kind::Mesh { geometry: 3, material: 8, own_blas: true, materials: vec![] }, true, false).unwrap();
+    check("a new material with a map", &mut live, &mut w);
+    assert_eq!((live.g.pages_state().0.len(), live.g.pages_state().3[0]), (2, places[0]), "a second texture beside the first, which stays where it is");
+    // Another texture of the same pixels, on a tile of its own: the slot the pages have for them.
+    w.set_texture(33, checker(100, 60, 10, [30, 220, 30], [240, 240, 30])).unwrap();
+    w.set_material(9, mat(0.9, serde_json::json!({ "map": 33 })));
+    w.set_object(13, "tile".into(), None, Kind::Mesh { geometry: 3, material: 9, own_blas: true, materials: vec![] }, true, false).unwrap();
+    w.set_transform(13, Vec3::new(0.45, -0.5, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    check("a texture of pixels the pages have", &mut live, &mut w);
+    assert_eq!((live.g.pages_state().0.len(), slot(&live, 31), slot(&live, 33)), (2, Some(1), Some(1)), "one slot for both");
+    // The first of the two given other pixels: the slot is the other's too, so it takes another.
+    w.set_texture(31, checker(100, 60, 10, [230, 30, 200], [20, 20, 20])).unwrap();
+    check("one of two textures in a slot replaced", &mut live, &mut w);
+    assert_eq!((live.g.pages_state().0.len(), slot(&live, 31), slot(&live, 33)), (3, Some(2), Some(1)), "another slot; the other texture keeps its own");
+    // The same texture again: nothing to do. Its pixels replaced by as many: over the old ones.
+    w.set_texture(30, checker(64, 40, 8, [255, 40, 40], [40, 40, 255])).unwrap();
+    assert!(!w.changes.any(), "a texture set again as it is changes nothing");
+    w.set_texture(30, checker(64, 40, 8, [20, 230, 230], [230, 20, 230])).unwrap();
+    check("a texture's pixels replaced", &mut live, &mut w);
+    assert_eq!((live.g.pages_state().0.len(), slot(&live, 30)), (3, Some(0)), "written over the old ones, in their slot");
+    assert_ne!(live.g.pages_state().0[0].0, keys[0].0, "the slot holds the new pixels' key");
+    // A picture of another size: another slot; the material names it.
+    w.set_texture(30, checker(128, 128, 16, [250, 250, 250], [10, 10, 10])).unwrap();
+    check("a texture replaced by one of another size", &mut live, &mut w);
+    assert_eq!((live.g.pages_state().0.len(), slot(&live, 30)), (4, Some(3)));
+    let (_, side, layers, before) = live.g.pages_state();
+    assert!(side == 256 && layers == 2 && before[3].layer == 1, "the first page was full: the wall's texture lies on a second ({layers} layers of {side})");
+    // A texture wider than the pages, on the panel: a longer side and a layer more, what they held copied there
+    // (the wall's and the tile's are drawn from the copy).
+    w.set_texture(32, checker(2048, 2048, 256, [250, 120, 20], [20, 120, 250])).unwrap();
+    w.set_material(8, mat(0.9, serde_json::json!({ "map": 32 })));
+    check("a texture wider than the pages", &mut live, &mut w);
+    let (keys, side, layers, now) = live.g.pages_state();
+    assert_eq!((keys.len(), side, layers, now[4].layer, now[4].size), (5, 2048, 3, 2, (2016, 2016)), "the pages grew by a side and a layer");
+    assert_eq!(now[..4], before[..], "the textures there stay where they are");
+    // A material that drops its map.
+    w.set_material(1, mat(0.8, serde_json::json!({})));
+    check("a material without its map", &mut live, &mut w);
+}
+
+/// By model file and material of it (`Retained::asset_materials`): the keys of the textures its slots name in the
+/// pages, as `textures_named` has a world's materials'.
+fn model_textures_named(c: &LiveCore) -> std::collections::BTreeMap<(String, usize), Vec<Option<String>>> {
+    let keys = c.g.pages_state().0;
+    let t = &c.sc.tables;
+    t.retained.asset_materials.iter().map(|(k, &mi)| {
+        let m = &t.materials[mi as usize];
+        (k.clone(), [m.tex0[0], m.tex0[1], m.tex0[2], m.tex0[3], m.tex1[0], m.tex1[1]].iter().map(|&s| (s >= 0).then(|| keys[s as usize].0.clone())).collect())
+    }).collect()
+}
+
+/// A still model the scene has not got comes in place (tests/render/data/textured-quads.glb: a quad with a picture
+/// and a plain one, two materials of the file): its materials are entries after the scene's, its picture is placed
+/// in the pages, its mesh is made in the room; no rebuild, and the view draws what a build of the edited world
+/// draws. Another of it is another instance of that mesh. With the last of them gone the mesh is given back, and the
+/// model comes again in place, its materials and its picture the ones there were.
+#[test]
+fn a_model_the_scene_has_not_got_comes_in_place() {
+    let presets = crate::default_presets_dir();
+    let open_at_root = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    const FILE: &str = "tests/render/data/textured-quads.glb";
+    let model = || Kind::Model { uri: FILE.into(), nodes: None, animation: None, functions: vec![] };
+    let mut w = world();
+    let mut live = match open_at_root(&w) {
+        Ok(c) if c.g.hwrt => c,
+        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let mut last = picture(&mut live, 24);
+    let (materials, meshes) = (live.sc.tables.materials.len(), live.sc.meshes.len());
+    assert_eq!((live.sc.up.kernel.features & gpu::F_TEX, live.g.pages_state().0.len()), (0, 0), "a scene without a texture");
+    let mut check = |what: &str, live: &mut LiveCore, w: &mut World| {
+        assert!(!live.commit(w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        let mut fresh = open_at_root(w).unwrap();
+        // (A material of a model that has gone stays in the view: it names what a build's names where a build has it.)
+        let named = model_textures_named(live);
+        for (k, v) in model_textures_named(&fresh) {
+            assert_eq!(named.get(&k), Some(&v), "{what}: the textures the model's material {k:?} names");
+        }
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last, &b) > 0.5, "{what}: the picture is {:.2} steps from the one before", apart(&last, &b));
+        last = b;
+    };
+    let place = |w: &mut World, id: u32, at: Vec3| {
+        w.set_object(id, format!("quads{id}"), None, model(), true, false).unwrap();
+        w.set_transform(id, at, glam::Quat::from_rotation_y(0.3), Vec3::ONE).unwrap();
+    };
+    place(&mut w, 40, Vec3::new(-0.3, 0.2, 0.7));
+    check("a model the scene has not got", &mut live, &mut w);
+    let key = (FILE.to_string(), None);
+    let mesh = *live.sc.tables.retained.model_mesh.get(&key).expect("the model's mesh");
+    assert_eq!((live.sc.tables.materials.len(), live.sc.meshes.len(), live.g.pages_state().0.len()), (materials + 2, meshes + 1, 1), "two materials, a mesh and a picture more");
+    assert_ne!(live.sc.up.kernel.features & gpu::F_TEX, 0, "the kernel's variant that samples textures");
+    assert_eq!(live.sc.meshes[mesh as usize].sections(&live.sc.sections).len(), 2, "a section a material of the file");
+    // Another of it: an instance of that mesh; nothing else is made.
+    place(&mut w, 41, Vec3::new(0.3, -0.5, 0.9));
+    check("another of the model", &mut live, &mut w);
+    assert_eq!((live.sc.tables.materials.len(), live.sc.meshes.len(), live.sc.edit.users.get(&mesh)), (materials + 2, meshes + 1, Some(&2)));
+    // Both gone: the mesh is given back.
+    w.remove(40);
+    w.remove(41);
+    check("the models removed", &mut live, &mut w);
+    assert!(!live.sc.tables.retained.model_mesh.contains_key(&key) && !live.sc.tables.retained.mesh_rows.contains_key(&mesh), "the mesh is no model's any more");
+    // It comes again: its mesh made again (in the slot the other left), its materials and its picture there still.
+    place(&mut w, 42, Vec3::new(0.2, 0.1, 0.8));
+    check("the model again", &mut live, &mut w);
+    assert_eq!((live.sc.tables.materials.len(), live.sc.meshes.len(), live.g.pages_state().0.len()), (materials + 2, meshes + 1, 1), "nothing made twice");
+    // Another model the scene has not got, one of whose materials only emits (tests/render/data/panel.glb): its
+    // emitters light the scene as a build's (the lamp away: the panel is what lights it).
+    w.set_visible(12, false).unwrap();
+    w.set_object(43, "panel43".into(), None, Kind::Model { uri: "tests/render/data/panel.glb".into(), nodes: None, animation: None, functions: vec![] }, true, false).unwrap();
+    w.set_transform(43, Vec3::new(-0.5, -0.4, 0.6), glam::Quat::from_rotation_y(0.4), Vec3::splat(0.05)).unwrap();
+    check("a model that emits", &mut live, &mut w);
+    list_is_its_triangles("a model that emits", &live);
+}
+
+/// A kernel variant the device has not is made on another thread while the frames go on: the frame after the edit
+/// that brings a feature (a material that is glass) runs the kernel the view had, and the view takes the scene's
+/// once it is made. In lockstep a frame is its world's alone: it makes its kernel itself.
+#[test]
+fn a_new_kernel_variant_is_made_while_the_frames_go_on() {
+    let presets = crate::default_presets_dir();
+    let mat = |extra: serde_json::Value| -> crate::desc::Material {
+        let mut m = serde_json::json!({ "name": "m", "color": [0.5, 0.5, 0.5], "opacity": 1, "metalness": 0, "roughness": 0.2, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true });
+        m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(m).unwrap()
+    };
+    let mut w = world();
+    let mut live = match gpu::Gpu::new().and_then(|g| LiveCore::new(g, &w, Path::new("."), &presets, 96, 54)) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    live.render(1, |_, _| {});
+    let key = |k: &gpu::Kernel| (k.features, k.hash);
+    let had = key(live.kernel.as_ref().expect("the view's kernel"));
+    assert_eq!((had, had.0 & (gpu::F_GLASS | gpu::F_COAT)), (key(&live.sc.up.kernel), 0), "the scene's kernel, without glass or a clear coat");
+    w.set_material(7, mat(serde_json::json!({ "transmission": 1 })));
+    assert!(!live.commit(&mut w).unwrap(), "a new material: in place ({:?})", live.fallback);
+    let wanted = key(&live.sc.up.kernel);
+    assert_ne!(wanted.0 & gpu::F_GLASS, 0, "the scene's kernel has glass now");
+    live.render(1, |_, _| {});
+    assert_eq!(key(live.kernel.as_ref().unwrap()), had, "the frame after the edit ran the kernel the view had");
+    let t = Instant::now();
+    while key(live.kernel.as_ref().unwrap()) != wanted {
+        assert!(t.elapsed().as_secs() < 120, "the scene's kernel was never taken");
+        live.render(1, |_, _| {});
+    }
+    // In lockstep the next frame runs the scene's kernel, whatever it has to make for it.
+    live.fixed_dt = Some(1.0 / 60.0);
+    w.set_material(8, mat(serde_json::json!({ "clearcoat": 1 })));
+    assert!(!live.commit(&mut w).unwrap(), "another new material: in place ({:?})", live.fallback);
+    assert_ne!(live.sc.up.kernel.features & gpu::F_COAT, 0);
+    live.render(1, |_, _| {});
+    assert_eq!(key(live.kernel.as_ref().unwrap()), key(&live.sc.up.kernel), "in lockstep the frame ran the scene's kernel");
+}
+
+/// Material functions come and change in place, in a scene that had none: a function and a new material of it on an
+/// instance (the kernel's code, `F_FUNC`, and the placement of a function's inputs by an instance, `F_IFUNC`), the
+/// function's code changed, a second function whose name sorts before the first (a build numbers them by name, the
+/// view in the order they came), a material that drops its function. After each: no rebuild, the kernel's features
+/// are a build's, and the picture is that build's.
+#[test]
+fn material_functions_come_and_change_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let mat = |function: Option<&str>| -> crate::desc::Material {
+        let shader = function.map(|id| serde_json::json!({ "id": id, "params": [], "textures": [] }));
+        serde_json::from_value(serde_json::json!({ "name": "m", "color": [0.8, 0.8, 0.8], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true, "shader": shader })).unwrap()
+    };
+    let function = |name: &str, rgb: &str| format!("fn mf_{name}(i: MatIn, m: Material, base: MatOut) -> MatOut {{\n    var o = base;\n    o.base = vec3<f32>({rgb});\n    return o;\n}}\n");
+    let mut w = world();
+    w.set_material(6, mat(None));
+    w.set_object(11, "panel".into(), None, Kind::Mesh { geometry: 3, material: 6, own_blas: true, materials: vec![] }, true, false).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert_eq!(live.sc.up.kernel.features & (gpu::F_FUNC | gpu::F_IFUNC), 0, "a scene without a function");
+    let mut last = picture(&mut live, 24);
+    let mut check = |what: &str, live: &mut LiveCore, w: &mut World| {
+        assert!(!live.commit(w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        let mut fresh = open(w).unwrap();
+        // (An instance of a function's material: under hardware traversal and with units. A view keeps the feature
+        // once it has it.)
+        let unkept = !(gpu::F_IFUNC | gpu::F_FUNC);
+        assert_eq!(live.sc.up.kernel.features & unkept, fresh.sc.up.kernel.features & unkept, "{what}: the kernel's features");
+        assert_eq!(fresh.sc.up.kernel.features & !live.sc.up.kernel.features, 0, "{what}: the view's kernel has what a build's has");
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last, &b) > 0.5, "{what}: the picture is {:.2} steps from the one before", apart(&last, &b));
+        last = b;
+    };
+    // A function, and a new material of it on the wall.
+    w.set_shader("zz_red", function("zz_red", "0.9, 0.05, 0.05"), String::new());
+    w.set_material(7, mat(Some("zz_red")));
+    w.set_object(10, "wall".into(), None, Kind::Mesh { geometry: 2, material: 7, own_blas: true, materials: vec![] }, true, false).unwrap();
+    check("a function and a material of it", &mut live, &mut w);
+    assert_ne!(live.sc.up.kernel.features & gpu::F_FUNC, 0, "the kernel has functions");
+    let first = live.sc.up.kernel.hash;
+    // The same function again: nothing. Other code: another kernel.
+    w.set_shader("zz_red", function("zz_red", "0.9, 0.05, 0.05"), String::new());
+    assert!(!w.changes.any(), "a function set again as it is changes nothing");
+    w.set_shader("zz_red", function("zz_red", "0.05, 0.05, 0.9"), String::new());
+    check("the function's code changed", &mut live, &mut w);
+    assert_ne!(live.sc.up.kernel.hash, first, "another module");
+    // A second function, before the first by name: the panel's material given it.
+    w.set_shader("aa_green", function("aa_green", "0.05, 0.9, 0.05"), String::new());
+    w.set_material(6, mat(Some("aa_green")));
+    check("a second function, on a material the scene had", &mut live, &mut w);
+    assert_eq!((live.sc.tables.retained.shaders.get("zz_red"), live.sc.tables.retained.shaders.get("aa_green")), (Some(&0), Some(&1)), "numbered in the order they came");
+    // A material that drops its function.
+    w.set_material(7, mat(None));
+    check("a material without its function", &mut live, &mut w);
+}
+
+/// Lights come, change and go in place: a point light with a shadow, a spot light without, the point light without
+/// its shadow (another class: the table is sorted again), a rect light without a card, the point light removed, the
+/// directional light removed, every light removed; a group that comes and goes draws nothing. After each: no
+/// rebuild, the view's state (the light table, the kernel's counts of it) is a build's of the edited world, and so
+/// is the picture.
+#[test]
+fn lights_come_and_go_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let light = |v: serde_json::Value| -> crate::desc::Light { serde_json::from_value(v).unwrap() };
+    let point = |shadow: bool| light(serde_json::json!({ "type": "point", "color": [1.0, 0.6, 0.2], "castShadow": shadow, "intensity": 400.0, "radius": 0.02, "range": 0.0 }));
+    let mut w = world();
+    // (The lamp away: the lights light the scene.)
+    w.set_visible(12, false).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    let last = std::cell::RefCell::new(picture(&mut live, 24));
+    let check = |what: &str, live: &mut LiveCore, w: &mut World, lights: usize| {
+        assert!(!live.commit(w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert_eq!((live.sc.tables.lights.len(), live.sc.base.counts[0]), (lights, lights as u32), "{what}: the table's lights and the kernel's count of them");
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        same_state(what, live, &fresh);
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last.borrow(), &b) > 0.1, "{what}: the picture is {:.2} steps from the one before", apart(&last.borrow(), &b));
+        *last.borrow_mut() = b;
+    };
+    w.set_object(40, "point".into(), None, Kind::Light(point(true)), true, false).unwrap();
+    w.set_transform(40, Vec3::new(-0.5, 0.3, 0.8), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    check("a point light", &mut live, &mut w, 2);
+    w.set_object(41, "spot".into(), None, Kind::Light(light(serde_json::json!({ "type": "spot", "color": [0.2, 0.5, 1.0], "castShadow": false, "intensity": 900.0, "radius": 0.02, "range": 0.0, "angle": 0.5, "penumbra": 0.3 }))), true, false).unwrap();
+    w.set_transform(41, Vec3::new(0.5, -0.2, 1.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    check("a spot light without a shadow", &mut live, &mut w, 3);
+    w.set_light(40, point(false)).unwrap();
+    assert!(!w.changes.structural, "a light of another class: its entry's change");
+    check("the point light without its shadow", &mut live, &mut w, 3);
+    w.set_object(42, "rect".into(), None, Kind::Light(light(serde_json::json!({ "type": "rect", "color": [1.0, 1.0, 1.0], "castShadow": true, "intensity": 3000.0, "width": 0.4, "height": 0.4, "visible": false }))), true, false).unwrap();
+    w.set_transform(42, Vec3::new(0.0, 0.7, 1.2), glam::Quat::from_rotation_x(-0.8), Vec3::ONE).unwrap();
+    check("a rect light without a card", &mut live, &mut w, 4);
+    // A group that comes and goes: nothing to do.
+    w.set_object(50, "group".into(), None, Kind::Group, true, false).unwrap();
+    assert!(!w.changes.structural && !live.commit(&mut w).unwrap(), "a new group: nothing rebuilt");
+    w.remove(50);
+    assert!(!w.changes.structural && !live.commit(&mut w).unwrap(), "the group removed: nothing rebuilt");
+    w.remove(40);
+    check("the point light removed", &mut live, &mut w, 3);
+    w.remove(20);
+    check("the directional light removed", &mut live, &mut w, 2);
+    w.remove(41);
+    w.remove(42);
+    check("every light removed", &mut live, &mut w, 0);
+    // One again, in a scene without a light.
+    w.set_object(43, "point".into(), None, Kind::Light(point(true)), true, false).unwrap();
+    w.set_transform(43, Vec3::new(0.3, 0.3, 0.9), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    check("a light in a scene without one", &mut live, &mut w, 1);
+    // As many shadow-casting local lights as the kernel resamples (the light tiles): they come with a rebuild; one
+    // more and one fewer among them are in place again.
+    for k in 0..gpu::RIS_EXACT as u32 {
+        w.set_object(60 + k, format!("p{k}"), None, Kind::Light(point(true)), true, false).unwrap();
+        w.set_transform(60 + k, Vec3::new(-0.8 + 0.2 * k as f32, -0.6, 0.7), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+    }
+    if gpu::light_tiles_on() {
+        assert!(live.commit(&mut w).unwrap() && live.sc.up.kernel.features & gpu::F_LISTS != 0, "the light tiles come with a rebuild ({:?})", live.fallback);
+        *last.borrow_mut() = picture(&mut live, 24);
+        w.set_object(70, "more".into(), None, Kind::Light(point(true)), true, false).unwrap();
+        w.set_transform(70, Vec3::new(0.0, 0.7, 0.8), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        check("a light among those resampled", &mut live, &mut w, gpu::RIS_EXACT + 2);
+        w.remove(62);
+        check("one of them removed", &mut live, &mut w, gpu::RIS_EXACT + 1);
+    }
+}
+
+/// A translucent particle's material given another function, in place: the translucency pass has the functions of
+/// its particles' materials alone, so the kernel is made again with the one the material has now. First a function
+/// the scene had (an opaque material's: no function's code changes), then one that comes with the edit. After
+/// each: no rebuild, and the picture is a build's of the edited world.
+#[test]
+fn a_translucent_particles_material_takes_another_function_in_place() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let glow = |function: &str| -> crate::desc::Material {
+        serde_json::from_value(serde_json::json!({ "name": "glow", "color": [0.5, 0.5, 0.5], "opacity": 0.9, "transparent": true, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true,
+            "shader": { "id": function, "params": [], "textures": [] } })).unwrap()
+    };
+    let function = |name: &str, rgb: &str| format!("fn mf_{name}(i: MatIn, m: Material, base: MatOut) -> MatOut {{\n    var o = base;\n    o.base = vec3<f32>({rgb});\n    o.emissive = vec3<f32>({rgb}) * 40.0;\n    return o;\n}}\n");
+    let mut w = wall_world(3.0, serde_json::json!({ "name": "m", "color": [0.5, 0.5, 0.5], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true, "shader": { "id": "fb", "params": [], "textures": [] } }));
+    let sun = serde_json::from_value(serde_json::json!({ "type": "directional", "color": [1.0, 1.0, 1.0], "castShadow": true, "intensity": 1.0, "angularDiameter": 0.5 })).unwrap();
+    w.set_object(20, "sun".into(), None, Kind::Light(sun), true, false).unwrap();
+    w.set_shader("fa", function("fa", "0.9, 0.05, 0.05"), String::new());
+    w.set_shader("fb", function("fb", "0.05, 0.9, 0.05"), String::new());
+    // (A small mesh of the opaque material with `fb`, out of the particle's way: the scene has both functions.)
+    w.set_object(11, "tile".into(), None, Kind::Mesh { geometry: 1, material: 3, own_blas: false, materials: vec![] }, true, false).unwrap();
+    w.set_transform(11, Vec3::new(-0.8, -0.8, 0.2), glam::Quat::IDENTITY, Vec3::splat(0.1)).unwrap();
+    w.set_material(5, glow("fa"));
+    w.set_particle_fn("card", "fn pf_card(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(0.0, 0.0, 0.5), vec3<f32>(0.5, 0.0, 0.0), vec3<f32>(0.0, 0.5, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(30, "card".into(), None, Kind::Particles { count: 1, emitter: "card".into(), params: vec![], material: 5, emitter_area: 0.0 }, true, false).unwrap();
+    let mut live = match open(&w) {
+        Ok(c) if c.g.hwrt => c,
+        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert!(live.sc.up.translucent.is_some(), "the particle is the translucency pass's");
+    let mut last = picture(&mut live, 24);
+    let mut check = |what: &str, live: &mut LiveCore, w: &mut World| {
+        assert!(!live.commit(w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        let mut fresh = open(w).unwrap();
+        forget(live);
+        let (a, b) = (picture(live, 48), picture(&mut fresh, 48));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        assert!(apart(&last, &b) > 0.5, "{what}: the picture is {:.2} steps from the one before", apart(&last, &b));
+        last = b;
+    };
+    let before = live.sc.up.kernel.hash;
+    w.set_material(5, glow("fb"));
+    assert!(!w.changes.functions && !w.changes.structural, "a material given a function the scene has: the material's change alone");
+    check("a function the scene had", &mut live, &mut w);
+    assert_ne!(live.sc.up.kernel.hash, before, "another kernel: the translucency pass's functions are others");
+    w.set_shader("fc", function("fc", "0.05, 0.05, 0.9"), String::new());
+    w.set_material(5, glow("fc"));
+    check("a function that comes with the edit", &mut live, &mut w);
 }

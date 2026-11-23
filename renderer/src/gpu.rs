@@ -16,6 +16,20 @@ struct Pages {
     info: std::sync::Arc<Vec<[f32; 4]>>,
     /// Stream textures by name: where their pixels go (`Gpu::write_stream`).
     streams: Vec<(String, crate::texpack::Place)>,
+    /// Where each texture is and what the pages have free (`Gpu::place_texture`).
+    atlas: crate::texpack::Atlas,
+    /// By slot: the texture's key, its size and whether it wraps (what `texpack::set_key` is made of).
+    keys: Vec<(String, u32, u32, bool)>,
+}
+
+/// What `Gpu::place_texture` did to the pages.
+pub struct PagesEdit {
+    /// The texture's slot: its index among the scene's textures, its rows in `tex_info`.
+    pub slot: i32,
+    /// Every texture's rows as they are now, where a texture was placed.
+    pub info: Option<std::sync::Arc<Vec<[f32; 4]>>>,
+    /// The pages' view, where they are another texture now (they grew): bind groups hold the old one's.
+    pub view: Option<wgpu::TextureView>,
 }
 
 #[cfg(dlss)]
@@ -48,18 +62,21 @@ pub struct Gpu {
     /// Compiled pipelines kept between runs (`GpuOptions::pipeline_cache`), where the backend has such a cache.
     pipeline_cache: Option<crate::pipeline_cache::PipelineCache>,
     /// Kernel source (hardware or software traversal spliced in); scenes with material functions get their own module.
-    source: String,
+    source: std::sync::Arc<String>,
     /// The kernel as written: a scene without features that change the source or functions of its own.
     module: wgpu::ShaderModule,
     /// The merged binding layout (merged.rs): a browser's, where a stage has eight storage buffers. Natively with
     /// THREERT_MERGED=1 (software traversal, the device held to eight too).
     pub merged: bool,
     /// By (material-function code hash, the features that change the source: `KernelVariant::flags`).
-    modules: std::sync::Mutex<std::collections::HashMap<(u64, u32), wgpu::ShaderModule>>,
+    modules: ModuleCache,
     pipeline_layout: wgpu::PipelineLayout,
     /// Kernel variants by (feature mask, material-function code hash, LIVE): `FEAT` compiles out the features a scene
     /// does not use (they cost registers even when idle); `LIVE` = one fresh sample per dispatch for the viewport.
-    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), wgpu::ComputePipeline>>,
+    pipelines: PipelineMap<(u32, u64, bool, u32)>,
+    /// The kernels being made on another thread (`warm_kernel`): by (features, functions' hash, approximations).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    warming: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u32, u64, u32)>>>,
     layout: wgpu::BindGroupLayout,
     /// Group 1, the live viewport's: primary visibility (texture_2d<u32>), the radiance cache (`CacheBuffers`) and
     /// what the live passes read of a trace (`KernelBufs`). Offline renders bind `no_vis` (1x1 texture `no_vis_view`,
@@ -88,9 +105,9 @@ pub struct Gpu {
     /// are one buffer past Metal's 29 a stage), and `no_vis` made for it.
     pub tl_vis_layout: Option<wgpu::BindGroupLayout>,
     no_vis_tl: Option<wgpu::BindGroup>,
-    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool, u32), TranslucentPipelines>>,
+    tl_pipelines: PipelineMap<(u32, u64, bool, u32), TranslucentPipelines>,
     /// The kernel's passes beside `main` (`kernel_pass`) by kernel variant and entry point.
-    kernel_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str, u32), wgpu::ComputePipeline>>,
+    kernel_passes: PipelineMap<(u32, u64, &'static str, u32)>,
     /// The procedural blobs of the last upload (`upload_procs`).
     proc_cache: std::sync::Mutex<Option<ProcCache>>,
     /// The last upload's procedural BLASes by geometry hash (read-only once built; another upload may share them), with
@@ -1457,6 +1474,109 @@ impl KernelSwitches {
     }
 }
 
+type ModuleCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(u64, u32), wgpu::ShaderModule>>>;
+type PipelineMap<K, V = wgpu::ComputePipeline> = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<K, V>>>;
+
+/// What a kernel variant's module and pipelines are made from and kept in: a device's, cloned to the thread that
+/// makes a variant the frame does not wait for (`Gpu::warm_kernel`). A variant is looked up, made without a lock
+/// held (a compile takes long, and the frame looks its own up meanwhile), then kept; made twice at once, the first
+/// kept stays.
+#[derive(Clone)]
+struct KernelMaker {
+    device: wgpu::Device,
+    source: std::sync::Arc<String>,
+    /// The kernel as written (`Gpu::module`).
+    module: wgpu::ShaderModule,
+    /// The device's part of a variant (its features 0, its guard a kernel's own).
+    variant: KernelVariant,
+    layout: wgpu::PipelineLayout,
+    tl_layout: Option<wgpu::PipelineLayout>,
+    modules: ModuleCache,
+    pipelines: PipelineMap<(u32, u64, bool, u32)>,
+    passes: PipelineMap<(u32, u64, &'static str, u32)>,
+    tl: PipelineMap<(u32, u64, bool, u32), TranslucentPipelines>,
+}
+
+impl KernelMaker {
+    /// The kernel module for a scene: the shared one, or with its material functions spliced in.
+    fn module(&self, k: &Kernel) -> wgpu::ShaderModule {
+        let patches = k.features & F_SOURCE;
+        if patches == 0 && k.functions.is_empty() && k.volume_functions.is_empty() && k.geometry_functions.is_empty() {
+            return self.module.clone();
+        }
+        if let Some(m) = self.modules.lock().unwrap().get(&(k.hash, patches)) {
+            return m.clone();
+        }
+        let splice = |src: &str, marker: &str, code: &str| -> String {
+            if code.is_empty() {
+                return src.to_string();
+            }
+            let (head, rest) = src.split_once(&format!("// @{marker}-begin")).unwrap();
+            let (_, tail) = rest.split_once(&format!("// @{marker}-end")).unwrap();
+            format!("{head}{code}{tail}")
+        };
+        let src = splice(&splice(&splice(&self.source, "material-functions", &k.functions), "volume-functions", &k.volume_functions), "geometry-functions", &k.geometry_functions);
+        // The variant: this device's traversal, switches, layout and loop guard, this scene's features.
+        let v = KernelVariant { features: patches, guard: loop_guard_of(patches & F_UNITS != 0), ..self.variant };
+        // A scene's functions that do not compile (a game's own WGSL) cost the game its functions, not the
+        // app its renderer: the kernel is made without them, and the game's log says why. (A panic here took
+        // the engine down, and ThreeRT for Android then took the device for one without a renderer.)
+        let wgsl = try_kernel_wgsl(&src, &v).unwrap_or_else(|e| {
+            let msg = format!("this scene's material, volume or geometry functions do not compile, so it is drawn without them: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::script::engine_log("error", &msg);
+            #[cfg(target_arch = "wasm32")]
+            eprintln!("{msg}");
+            kernel_wgsl(&self.source, &v)
+        });
+        let m = unsafe { self.device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("pathtrace+functions"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }, kernel_checks()) };
+        self.modules.lock().unwrap().entry((k.hash, patches)).or_insert(m).clone()
+    }
+
+    fn make(&self, k: &Kernel, live: bool, entry: &str, label: &str, layout: Option<&wgpu::PipelineLayout>, cache: Option<&wgpu::PipelineCache>) -> wgpu::ComputePipeline {
+        let (module, constants) = (self.module(k), k.constants(live));
+        self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout,
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
+            cache,
+        })
+    }
+
+    /// The kernel's `main` for `k` (`live`: the viewport's), and whether it was made now.
+    fn pipeline(&self, k: &Kernel, live: bool, cache: Option<&wgpu::PipelineCache>) -> (wgpu::ComputePipeline, bool) {
+        let key = (k.features, k.hash, live, k.approx_of(live));
+        if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let p = self.make(k, live, "main", if live { "pathtrace-live" } else { "pathtrace" }, Some(&self.layout), cache);
+        (self.pipelines.lock().unwrap().entry(key).or_insert(p).clone(), true)
+    }
+
+    /// A live pass of `k` beside `main`, and whether it was made now.
+    fn pass(&self, k: &Kernel, entry: &'static str, cache: Option<&wgpu::PipelineCache>) -> (wgpu::ComputePipeline, bool) {
+        let key = (k.features, k.hash, entry, k.approx);
+        if let Some(p) = self.passes.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let p = self.make(k, true, entry, entry, Some(&self.layout), cache);
+        (self.passes.lock().unwrap().entry(key).or_insert(p).clone(), true)
+    }
+
+    /// The translucency pass's pipelines for `k`, and whether they were made now.
+    fn translucent(&self, k: &Kernel, live: bool, cache: Option<&wgpu::PipelineCache>) -> (TranslucentPipelines, bool) {
+        let key = (k.features, k.hash, live, k.approx_of(live));
+        if let Some(p) = self.tl.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let make = |entry: &str| self.make(k, live, entry, entry, self.tl_layout.as_ref(), cache);
+        let made = TranslucentPipelines { draw: make("translucent"), train: make("volume_train"), up: make("translucent_up") };
+        (self.tl.lock().unwrap().entry(key).or_insert(made).clone(), true)
+    }
+}
+
 /// The kernel's runtime checks: loop bounding alone, wgpu's default for it (every loop has a count its compiler can
 /// see the end of). The kernel's loops end on sound data, which does not promise a compiler that they end; without
 /// the bound, kernels Metal's compiler made lost the state of whole SIMD groups on a scene with cutouts, one build and
@@ -1674,31 +1794,33 @@ impl Kernel {
         if live { self.approx } else { 0 }
     }
 
-    pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
+    /// A scene's material functions and their dispatch (pathtrace.wgsl `material_function` and its kin), as they are
+    /// spliced into the kernel: `shaders` (name, code, helpers) in the order of their numbers; `translucent`: the
+    /// functions of translucent particles' materials.
+    fn material_functions(shaders: &[(String, String, String)], translucent: &std::collections::BTreeSet<i32>) -> String {
         let mut functions = String::new();
-        if !scene.shaders.is_empty() {
+        if !shaders.is_empty() {
             let mut seen = std::collections::HashSet::new();
-            for (_, _, helpers) in &scene.shaders {
+            for (_, _, helpers) in shaders {
                 if !helpers.is_empty() && seen.insert(helpers.clone()) {
                     functions.push_str(helpers);
                     functions.push('\n');
                 }
             }
-            for (_, code, _) in &scene.shaders {
+            for (_, code, _) in shaders {
                 functions.push_str(code);
                 functions.push('\n');
             }
             functions.push_str("fn material_function(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {\n    switch f {\n");
-            for (k, (id, _, _)) in scene.shaders.iter().enumerate() {
+            for (k, (id, _, _)) in shaders.iter().enumerate() {
                 functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
             }
             functions.push_str("        default { return base; }\n    }\n}\n");
             // The translucency pass's (translucent.wgsl): only the functions of its particles' materials. With every
             // function in it, the Metal compiler failed on Tokyo's kernel once the city's ground had one (wetLayer).
-            let used: std::collections::BTreeSet<i32> = scene.trans_attrs.iter().filter_map(|a| scene.materials.get(a.uv[3].to_bits() as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
             functions.push_str("fn translucent_material_function(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {\n    switch f {\n");
-            for k in used {
-                if let Some((id, _, _)) = scene.shaders.get(k as usize) {
+            for &k in translucent {
+                if let Some((id, _, _)) = shaders.get(k as usize) {
                     functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
                 }
             }
@@ -1709,7 +1831,7 @@ impl Kernel {
             // ~0.8 ms on Tokyo, dry).
             for (name, field) in [("alpha_material_function", "opacity"), ("emissive_material_function", "emissive")] {
                 functions.push_str(&format!("fn {name}(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {{\n    switch f {{\n"));
-                for (k, (id, code, _)) in scene.shaders.iter().enumerate() {
+                for (k, (id, code, _)) in shaders.iter().enumerate() {
                     if writes_field(code, field) {
                         functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
                     }
@@ -1717,6 +1839,25 @@ impl Kernel {
                 functions.push_str("        default { return base; }\n    }\n}\n");
             }
         }
+        functions
+    }
+
+    /// This kernel with other material functions (a function added or changed while the scene runs): another module
+    /// (`hash`), the volume and geometry functions as they are.
+    pub fn with_material_functions(&self, shaders: &[(String, String, String)], translucent: &std::collections::BTreeSet<i32>) -> Kernel {
+        use std::hash::{Hash, Hasher};
+        let functions = legacy_wgsl(Kernel::material_functions(shaders, translucent));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        functions.hash(&mut h);
+        self.volume_functions.hash(&mut h);
+        self.geometry_functions.hash(&mut h);
+        Kernel { functions, hash: h.finish(), ..self.clone() }
+    }
+
+    pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
+        // (The translucency pass's functions: those of its particles' materials.)
+        let used: std::collections::BTreeSet<i32> = scene.trans_attrs.iter().filter_map(|a| scene.materials.get(a.uv[3].to_bits() as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
+        let functions = Kernel::material_functions(&scene.shaders, &used);
         let mut volume_functions = String::new();
         if !scene.volume_fns.is_empty() {
             let mut seen = std::collections::HashSet::new();
@@ -2160,7 +2301,7 @@ impl Gpu {
             dlss_sdk,
             #[cfg(dlss)]
             dlss_rr,
-            instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, whole_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, fill: Default::default(), hwrt, pages: Default::default(), streams: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default(),
+            instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, whole_tables, switches, approx, approx_default: approx, pipeline_cache, source: std::sync::Arc::new(src), module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), warming: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, fill: Default::default(), hwrt, pages: Default::default(), streams: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default(),
         })
     }
 
@@ -2198,60 +2339,11 @@ impl Gpu {
 
     /// The path-tracing kernel specialised for a scene (feature mask + material functions), compiled on first use.
     pub fn pipeline(&self, k: &Kernel, live: bool) -> wgpu::ComputePipeline {
-        let mut cache = self.pipelines.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, live, k.approx_of(live)))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = k.constants(live);
-                let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
-                    layout: Some(&self.pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                    cache: self.cache(),
-                });
-                self.save_pipeline_cache();
-                p
-            })
-            .clone()
-    }
-
-    /// The kernel module for a scene: the shared one, or with its material functions spliced in.
-    fn kernel_module(&self, k: &Kernel) -> wgpu::ShaderModule {
-        let patches = k.features & F_SOURCE;
-        if patches == 0 && k.functions.is_empty() && k.volume_functions.is_empty() && k.geometry_functions.is_empty() {
-            return self.module.clone();
+        let (p, made) = self.maker().pipeline(k, live, self.cache());
+        if made {
+            self.save_pipeline_cache();
         }
-        let mut mods = self.modules.lock().unwrap();
-        mods.entry((k.hash, patches))
-            .or_insert_with(|| {
-                let splice = |src: &str, marker: &str, code: &str| -> String {
-                    if code.is_empty() {
-                        return src.to_string();
-                    }
-                    let (head, rest) = src.split_once(&format!("// @{marker}-begin")).unwrap();
-                    let (_, tail) = rest.split_once(&format!("// @{marker}-end")).unwrap();
-                    format!("{head}{code}{tail}")
-                };
-                let src = splice(&splice(&splice(&self.source, "material-functions", &k.functions), "volume-functions", &k.volume_functions), "geometry-functions", &k.geometry_functions);
-                // The variant: this device's traversal, switches, layout and loop guard, this scene's features.
-                let v = KernelVariant { merged: self.merged, uniform_tables: self.uniform_tables, whole_tables: self.whole_tables, guard: loop_guard_of(patches & F_UNITS != 0), ..KernelVariant::new(self.hwrt, self.switches, patches) };
-                // A scene's functions that do not compile (a game's own WGSL) cost the game its functions, not the
-                // app its renderer: the kernel is made without them, and the game's log says why. (A panic here took
-                // the engine down, and ThreeRT for Android then took the device for one without a renderer.)
-                let wgsl = try_kernel_wgsl(&src, &v).unwrap_or_else(|e| {
-                    let msg = format!("this scene's material, volume or geometry functions do not compile, so it is drawn without them: {e}");
-                    #[cfg(not(target_arch = "wasm32"))]
-                    crate::script::engine_log("error", &msg);
-                    #[cfg(target_arch = "wasm32")]
-                    eprintln!("{msg}");
-                    kernel_wgsl(&self.source, &v)
-                });
-                unsafe { self.device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("pathtrace+functions"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }, kernel_checks()) }
-            })
-            .clone()
+        p
     }
 
     /// The entries of the live passes made so far (`kernel_pass`), for tests: which were made, and when.
@@ -2263,50 +2355,76 @@ impl Gpu {
     /// A live pass of a scene's kernel variant beside `main`: `finish` (the pixels a sample's trace left), `media_train`
     /// (the volume voxels) or `media_composite` (camera rays through media, after the trace).
     pub fn kernel_pass(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
-        let mut cache = self.kernel_passes.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, entry, k.approx))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = k.constants(true);
-                let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(entry),
-                    layout: Some(&self.pipeline_layout),
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                    cache: self.cache(),
-                });
-                self.save_pipeline_cache();
-                p
-            })
-            .clone()
+        let (p, made) = self.maker().pass(k, entry, self.cache());
+        if made {
+            self.save_pipeline_cache();
+        }
+        p
     }
 
     /// The translucency pass's pipelines for a scene's kernel variant.
     pub fn translucent_pipelines(&self, k: &Kernel, live: bool) -> TranslucentPipelines {
-        let mut cache = self.tl_pipelines.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, live, k.approx_of(live)))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = k.constants(live);
-                let make = |entry: &str| {
-                    self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(entry),
-                        layout: self.tl_pipeline_layout.as_ref(),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                        cache: self.cache(),
-                    })
-                };
-                let made = TranslucentPipelines { draw: make("translucent"), train: make("volume_train"), up: make("translucent_up") };
-                self.save_pipeline_cache();
-                made
-            })
-            .clone()
+        let (p, made) = self.maker().translucent(k, live, self.cache());
+        if made {
+            self.save_pipeline_cache();
+        }
+        p
     }
+
+    /// What makes this device's kernel modules and pipelines, for whichever thread makes them.
+    fn maker(&self) -> KernelMaker {
+        KernelMaker {
+            device: self.device.clone(),
+            source: self.source.clone(),
+            module: self.module.clone(),
+            variant: KernelVariant { merged: self.merged, uniform_tables: self.uniform_tables, whole_tables: self.whole_tables, ..KernelVariant::new(self.hwrt, self.switches, 0) },
+            layout: self.pipeline_layout.clone(),
+            tl_layout: self.tl_pipeline_layout.clone(),
+            modules: self.modules.clone(),
+            pipelines: self.pipelines.clone(),
+            passes: self.kernel_passes.clone(),
+            tl: self.tl_pipelines.clone(),
+        }
+    }
+
+    /// Whether what a live frame asks of kernel `k` is made: its `main`, the passes named, and the translucency
+    /// pass's pipelines if `translucent`.
+    pub fn kernel_ready(&self, k: &Kernel, passes: &[&'static str], translucent: bool) -> bool {
+        self.pipelines.lock().unwrap().contains_key(&(k.features, k.hash, true, k.approx_of(true)))
+            && passes.iter().all(|e| self.kernel_passes.lock().unwrap().contains_key(&(k.features, k.hash, *e, k.approx)))
+            && (!translucent || self.tl_pipelines.lock().unwrap().contains_key(&(k.features, k.hash, true, k.approx_of(true))))
+    }
+
+    /// Makes what `kernel_ready` asks of `k` on another thread, each pipeline on one of its own (a driver compiles a
+    /// kernel variant for half a second to tens of seconds): the frame goes on with the kernel it has and takes this
+    /// one when it is ready. Nothing if it is ready, or being made.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn warm_kernel(&self, k: &Kernel, passes: &[&'static str], translucent: bool) {
+        if self.kernel_ready(k, passes, translucent) || !self.warming.lock().unwrap().insert((k.features, k.hash, k.approx)) {
+            return;
+        }
+        let (maker, k, passes, warming) = (self.maker(), k.clone(), passes.to_vec(), self.warming.clone());
+        let work = move || {
+            // (The module first: every pipeline is made of it.)
+            let _ = maker.module(&k);
+            std::thread::scope(|s| {
+                s.spawn(|| maker.pipeline(&k, true, None));
+                for entry in &passes {
+                    s.spawn(|| maker.pass(&k, entry, None));
+                }
+                if translucent {
+                    s.spawn(|| maker.translucent(&k, true, None));
+                }
+            });
+            warming.lock().unwrap().remove(&(k.features, k.hash, k.approx));
+        };
+        std::thread::spawn(work);
+    }
+
+    /// (A browser has no thread to give, and its device is one thread's: its frame makes its kernel itself,
+    /// live/frame.rs `choose_kernel`.)
+    #[cfg(target_arch = "wasm32")]
+    pub fn warm_kernel(&self, _: &Kernel, _: &[&'static str], _: bool) {}
 
     /// The translucency pass's bind group (group 2) drawing into `target` (live: the composed image; offline: sums);
     /// `low`: (colour, transmittance) per traced pixel, where a live view draws below full resolution
@@ -2369,19 +2487,8 @@ impl Gpu {
             }
         }
         let t = Instant::now();
-        let d = &self.device;
         let packed = crate::texpack::pack(&scene.textures);
-        let side = packed.side;
-        let tex = d.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture pages"),
-            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: packed.layers.len() as u32 },
-            mip_level_count: crate::texpack::MIPS,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let tex = self.pages_texture(packed.side, packed.layers.len() as u32);
         for (z, chain) in packed.layers.iter().enumerate() {
             for (lvl, img) in chain.iter().enumerate() {
                 self.queue.write_texture(
@@ -2402,8 +2509,99 @@ impl Gpu {
             }
         }
         timings.push(("texture_pages_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
-        *cache = Some(Pages { key, texture: tex, view: view.clone(), info: info.clone(), streams: packed.streams });
+        let keys = scene.textures.iter().map(|t| (t.key.clone(), t.width, t.height, t.wrap)).collect();
+        *cache = Some(Pages { key, texture: tex, view: view.clone(), info: info.clone(), streams: packed.streams, atlas: packed.atlas, keys });
         (view, info)
+    }
+
+    /// The pages' texture: `layers` square layers of `side`, `texpack::MIPS` levels. (A source of copies too: the
+    /// pages grow by a copy on the GPU, `place_texture`.)
+    fn pages_texture(&self, side: u32, layers: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture pages"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+            mip_level_count: crate::texpack::MIPS,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// The slot of texture `t` in the uploaded scene's pages; a texture they have not got is placed in them now
+    /// (`texpack::Atlas::place`) and its pixels written there, every level. Nothing is packed again: where the pages
+    /// have no room they become a texture with a layer more, or a longer side, and what they hold is copied there
+    /// on the GPU. (A texture the scene no longer uses keeps its place until the scene is loaded again.)
+    pub fn place_texture(&self, t: &crate::scene::Texture) -> Result<PagesEdit> {
+        use crate::texpack::{set_key_of, stream_name, MIPS};
+        let mut cache = self.pages.lock().unwrap();
+        let pages = cache.as_mut().ok_or_else(|| anyhow!("no scene's pages to place a texture in"))?;
+        if let Some(slot) = pages.keys.iter().position(|k| k.0 == t.key) {
+            return Ok(PagesEdit { slot: slot as i32, info: None, view: None });
+        }
+        let rows = crate::merged::UNIFORM_TABLES.iter().find(|u| u.table == crate::heap::Table::TexInfo).map_or(u32::MAX, |u| u.len);
+        if self.uniform_tables && (pages.keys.len() as u32 + 1) * 2 > rows {
+            return Err(anyhow!("more textures than this device's texture table holds ({})", rows / 2));
+        }
+        let (side, layers) = (pages.atlas.side, pages.atlas.layers());
+        // (On a copy: one that finds no room leaves the pages' record as it was.)
+        let mut atlas = pages.atlas.clone();
+        let place = atlas.place(t.width, t.height, t.wrap, self.device.limits().max_texture_array_layers).ok_or_else(|| anyhow!("no room in the texture pages"))?;
+        pages.atlas = atlas;
+        let mut view = None;
+        if (pages.atlas.side, pages.atlas.layers()) != (side, layers) {
+            let tex = self.pages_texture(pages.atlas.side, pages.atlas.layers());
+            let mut e = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("texture pages grow") });
+            for level in 0..MIPS {
+                let at = |texture| wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+                let s = (side >> level).max(1);
+                e.copy_texture_to_texture(at(&pages.texture), at(&tex), wgpu::Extent3d { width: s, height: s, depth_or_array_layers: layers });
+            }
+            self.queue.submit([e.finish()]);
+            pages.view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            pages.texture = tex;
+            view = Some(pages.view.clone());
+        }
+        // (A stream shows its last picture, as in pages packed whole.)
+        let last = stream_name(&t.key).and_then(|n| self.streams.lock().unwrap().get(n).cloned());
+        self.write_place(&pages.texture, &place, last.as_deref().unwrap_or(&t.rgba));
+        if let Some(n) = stream_name(&t.key) {
+            pages.streams.push((n.to_string(), place));
+        }
+        pages.keys.push((t.key.clone(), t.width, t.height, t.wrap));
+        pages.key = set_key_of(pages.keys.iter().map(|k| (k.0.as_str(), k.1, k.2, k.3)));
+        pages.info = std::sync::Arc::new(pages.atlas.info());
+        Ok(PagesEdit { slot: pages.keys.len() as i32 - 1, info: Some(pages.info.clone()), view })
+    }
+
+    /// The slot of the texture of `key` (`scene::Texture::key_of`) in the uploaded scene's pages, if they have it.
+    pub fn texture_slot(&self, key: &str) -> Option<i32> {
+        self.pages.lock().unwrap().as_ref()?.keys.iter().position(|k| k.0 == key).map(|s| s as i32)
+    }
+
+    /// New pixels for the texture in `slot`, written over the old ones in the pages: where their size in the pages
+    /// and their wrap are the same. False, and nothing written, where they are not (the texture is then placed as
+    /// another: `place_texture`).
+    pub fn rewrite_texture(&self, slot: i32, t: &crate::scene::Texture) -> bool {
+        let mut cache = self.pages.lock().unwrap();
+        let Some(pages) = cache.as_mut() else { return false };
+        let Some(place) = pages.atlas.places.get(slot as usize).copied() else { return false };
+        if crate::texpack::content_size(t.width, t.height) != place.size || t.wrap != place.wrap || crate::texpack::stream_name(&t.key).is_some() {
+            return false;
+        }
+        self.write_place(&pages.texture, &place, &t.rgba);
+        pages.keys[slot as usize] = (t.key.clone(), t.width, t.height, t.wrap);
+        pages.key = crate::texpack::set_key_of(pages.keys.iter().map(|k| (k.0.as_str(), k.1, k.2, k.3)));
+        true
+    }
+
+    /// The pages' textures as they are now, by slot: (key, width, height, wrap), their side and their layers.
+    #[cfg(test)]
+    pub fn pages_state(&self) -> (Vec<(String, u32, u32, bool)>, u32, u32, Vec<crate::texpack::Place>) {
+        let cache = self.pages.lock().unwrap();
+        let p = cache.as_ref().expect("pages");
+        (p.keys.clone(), p.atlas.side, p.atlas.layers(), p.atlas.places.clone())
     }
 
     fn write_place(&self, pages: &wgpu::Texture, place: &crate::texpack::Place, img: &image::RgbaImage) {
