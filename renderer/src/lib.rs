@@ -15,6 +15,7 @@ pub mod gpu;
 pub mod heap;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
+pub mod indexed;
 pub mod live;
 pub mod ltree;
 pub mod merged;
@@ -112,7 +113,7 @@ pub fn emitter_tri(k: usize, tri_verts: &[[f32; 4]], a: &scene::GpuTriAttr, mate
     }
     let c = v(0) + (e1 + e2) / 3.0;
     let moves = tri_verts[k * 3][3].to_bits() & scene::TRI_DYNAMIC != 0;
-    Some(EmitterTri { tri: k as u32, mat, obj: a.x[1].to_bits(), area, c: c.to_array(), moves, nominal, in_tree: false, inst: NO_INST })
+    Some(EmitterTri { tri: k as u32, mat, obj: a.x[1].to_bits(), area, c: c.to_array(), moves, nominal, in_tree: false, inst: NO_INST, part: 0 })
 }
 
 /// An emissive triangle of the emitter CDF: triangle (traversal order), material, object, area.
@@ -134,6 +135,9 @@ pub struct EmitterTri {
     /// The instance that places its triangle (its record; the triangle is the mesh's, in model space), or `NO_INST`:
     /// a triangle in world space.
     pub inst: u32,
+    /// Its section of that instance's mesh (0 without one): a mesh's triangle does not say which section it is of,
+    /// so a light sample is told here, as a ray is by its hit.
+    pub part: u32,
 }
 
 /// No instance (pathtrace.wgsl `NO_INST`).
@@ -146,7 +150,8 @@ const _: () = assert!((ltree::PATH_BITS + 2) << ltree::PATH_BITS <= EMITTER_MOVE
 /// An emitter's triangle as the kernel's light sampling reads it (pathtrace.wgsl `EmitterTri`; `Table::EmitterTris`,
 /// entry i for `emitter_tris[i]`): in world space, the light list's own copy, so a sample reads no placement. v0, e1,
 /// e2 in world space; its triangle in the triangles' table (attributes); the instance that places it (`NO_INST`: the
-/// triangle is in world space there too); where its weight is (`emitter_codes`) with `EMITTER_MOVES`.
+/// triangle is in world space there too); where its weight is (`emitter_codes`) with `EMITTER_MOVES`; its section of
+/// that instance's mesh. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuEmitterTri {
@@ -156,13 +161,17 @@ pub struct GpuEmitterTri {
     pub inst: u32,
     pub e2: [f32; 3],
     pub code: u32,
+    pub part: u32,
+    pub spare: [u32; 3],
 }
 
 impl GpuEmitterTri {
     /// `e`'s, from its triangle's rows (v0, e1, e2: `Prepared::tri_verts`), with path code `code`.
     pub fn new(e: &EmitterTri, rows: &[[f32; 4]], code: u32) -> GpuEmitterTri {
         let v = |r: usize| [rows[r][0], rows[r][1], rows[r][2]];
-        GpuEmitterTri { v0: v(0), tri: e.tri, e1: v(1), inst: e.inst, e2: v(2), code: code | if e.moves { EMITTER_MOVES } else { 0 } }
+        // (As a hit has it: with an instance its section, without one its row, which is its triangle's.)
+        let part = if e.inst == NO_INST { e.tri } else { e.part };
+        GpuEmitterTri { v0: v(0), tri: e.tri, e1: v(1), inst: e.inst, e2: v(2), code: code | if e.moves { EMITTER_MOVES } else { 0 }, part, spare: [0; 3] }
     }
 
     /// As `new`, from its vertices.
@@ -181,17 +190,17 @@ impl GpuEmitterTri {
 /// The emitters of an instance that has some (`count` of them: `scene::rows_emitters`, or a model's mesh's
 /// `InstMesh::emitters`): one a numbered
 /// triangle, in the numbers' order, each with its triangle as the instance places it. `tris`: the mesh's, in model
-/// space; `first`: its first triangle in the triangles' table; `numbered(k)`: triangle k's number and material, if
-/// it emits; `record`: the instance's. A triangle of no area: no weight (area 0). A hidden instance's (an instanced
+/// space; `first`: its first triangle in the triangles' table; `numbered(k)`: triangle k's number, material and
+/// section, if it emits; `record`: the instance's. A triangle of no area: no weight (area 0). A hidden instance's (an instanced
 /// object's copy not shown) keep their mesh's own area: its object has no power, so they weigh nothing, and the light
 /// tree has them (`switchable_power`) for when the copy is shown.
-pub fn instance_emitters(inst: &scene::Instance, record: u32, tris: &[[glam::Vec3A; 3]], first: u32, numbered: &dyn Fn(usize) -> Option<(usize, u32)>, count: usize, materials: &[scene::GpuMaterial], moves: bool) -> Vec<(EmitterTri, [glam::Vec3A; 3])> {
-    let dead = EmitterTri { tri: first, mat: 0, obj: inst.object, area: 0.0, c: [0.0; 3], moves, nominal: false, in_tree: false, inst: record };
+pub fn instance_emitters(inst: &scene::Instance, record: u32, tris: &[[glam::Vec3A; 3]], first: u32, numbered: &dyn Fn(usize) -> Option<(usize, u32, u32)>, count: usize, materials: &[scene::GpuMaterial], moves: bool) -> Vec<(EmitterTri, [glam::Vec3A; 3])> {
+    let dead = EmitterTri { tri: first, mat: 0, obj: inst.object, area: 0.0, c: [0.0; 3], moves, nominal: false, in_tree: false, inst: record, part: 0 };
     let mut out = vec![(dead, [glam::Vec3A::ZERO; 3]); count];
     for (k, t) in tris.iter().enumerate() {
-        let Some((slot, mat)) = numbered(k) else { continue };
+        let Some((slot, mat, part)) = numbered(k) else { continue };
         let (area, c, w) = placed_emitter(inst, t, mat, materials);
-        out[slot] = (EmitterTri { tri: first + k as u32, mat, area, c, ..dead }, w);
+        out[slot] = (EmitterTri { tri: first + k as u32, mat, area, c, part, ..dead }, w);
     }
     out
 }
@@ -603,11 +612,6 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
     }
     // (A deforming mesh's previous vertices lie as its triangles do, counted from the first dynamic triangle: what
     // gpu.rs `prev_verts` holds at the build. Its instance's record says where.)
-    let first_dynamic: usize = groups[..4].iter().sum();
-    for i in &mut sc.instances {
-        let m = &sc.meshes[i.mesh as usize];
-        i.prev = if m.deforms { (pool_first - first_dynamic) as u32 + m.first } else { 0 };
-    }
     sc.gpu_instances = sc.instances.iter().map(|i| i.gpu(pool_first as u32 + sc.meshes[i.mesh as usize].first)).collect();
     // A row's section starts here in the triangles' table (hardware traversal: a hit's geometry is its section, its
     // primitive counts from there).
@@ -873,7 +877,7 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         lt_cam: [[0.0; 4]; 4],
         // (`gpu::Uploaded::place`, with the buffers.)
         table_first: [[0; 4]; 3],
-        word_first: [0; 4],
+        word_first: [[0; 4]; 2],
         // (`gpu::KernelBufs::place`, with what is traced into.)
         live_first: [[0; 4]; 2],
         live_len: [0; 4],
@@ -889,7 +893,112 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         first += u32::try_from(count).expect("more than 2^32 triangles");
     }
     let energy = energy_lut();
+    let t = Instant::now();
+    sc.indexed = index_geometry(sc, &tri_order, &tri_verts, &groups, pool_first, no_still);
+    // Software traversal: the trees' leaves, every triangle as it was laid out for its tree above (v0, e1, e2), a
+    // mesh's with its section and its index there, a world-space one's with its flags.
+    if !hwrt {
+        let pool = pool_first..pool_first + sc.pool_tris.len();
+        let rows = &sc.indexed.rows;
+        sc.indexed.leaves = tri_verts
+            .chunks_exact(3)
+            .enumerate()
+            .map(|(k, t)| {
+                let ids = if pool.contains(&k) { [rows[k][0], rows[k][3]] } else { [t[0][3].to_bits(), 0] };
+                [[t[0][0], t[0][1], t[0][2], f32::from_bits(ids[0])], [t[1][0], t[1][1], t[1][2], f32::from_bits(ids[1])], [t[2][0], t[2][1], t[2][2], 0.0]]
+            })
+            .collect();
+    }
+    timings.push(("index_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
+    timings.push(("vertices".into(), sc.indexed.vertices.len() as f64));
+    // An instance's triangles count their vertices from its mesh's first; the previous positions from the first
+    // vertex that moves.
+    // (A deforming mesh's previous positions: where its vertices are among those that move.)
+    for (m, &(first, count)) in sc.meshes.iter_mut().zip(&sc.indexed.meshes) {
+        (m.vfirst, m.vcount) = (first, count);
+    }
+    for (r, i) in sc.instances.iter_mut().enumerate() {
+        i.verts = sc.indexed.meshes[i.mesh as usize].0;
+        let deforms = sc.meshes[i.mesh as usize].deforms;
+        i.prev = if deforms { i.verts - sc.indexed.dynamic.0 } else { 0 };
+        i.bits = i.bits & !scene::INST_DEFORMS | if deforms { scene::INST_DEFORMS } else { 0 };
+        let bits = sc.gpu_instances[r].n[1][3].to_bits();
+        sc.gpu_instances[r].n[1][3] = f32::from_bits(bits & !scene::INST_DEFORMS | if deforms { scene::INST_DEFORMS } else { 0 });
+        sc.gpu_instances[r].info[2] = i.verts;
+        sc.gpu_instances[r].n[2][3] = f32::from_bits(i.prev);
+    }
+    params.word_first[1][2] = sc.indexed.dynamic.0;
+    // (Hardware traversal: the translucent particles' rows follow the world-space triangles'.)
+    params.word_first[1][3] = sc.indexed.pool_first;
     Prepared { tri_verts, groups, nodes, emitters, gpu_emitter_tris, emitter_runs, env, env_cdf, params, energy, emitter_tris, light_tree, env_nee_floor, mat_runs, moving_mats, tri_order }
+}
+
+/// The scene's triangles, in the GPU's order (`tri_verts`, `sc.attrs`), as vertices and indices (indexed.rs). The
+/// still world-space triangles share their vertices among themselves, the dynamic ones have three each (the CPU
+/// writes them whole), each mesh of the pool shares within itself (the meshes in parallel; a skinned one by its
+/// model's corners), the translucent particles' have three each. World-space triangles count their vertices from
+/// 0, a mesh's from the mesh's first. The vertices lie in that order, so those that move are one run: the dynamic
+/// world-space triangles', then the deforming meshes' (which are the pool's first).
+fn index_geometry(sc: &scene::Scene, order: &[u32], tri_verts: &[[f32; 4]], groups: &[usize; GROUPS], pool_first: usize, no_still: bool) -> indexed::Indexed {
+    use rayon::prelude::*;
+    let still: usize = groups[..4].iter().sum();
+    let flat: Vec<[Vec3A; 3]> = order.iter().map(|&i| sc.tris[i as usize]).collect();
+    let mut out = indexed::Indexed { meshes: vec![(0, 0); sc.meshes.len()], skins: vec![Default::default(); sc.skin_sources.len()], ..Default::default() };
+    out.push(indexed::shared(&flat[..still], &sc.attrs[..still]), 0);
+    let moving = out.vertices.len() as u32;
+    out.push(indexed::apart(&flat[still..], &sc.attrs[still..pool_first]), moving);
+    out.flat = out.vertices.len() as u32;
+    // The pool, mesh by mesh as their triangles lie.
+    let source_of: std::collections::HashMap<u32, u32> = sc.retained.skinned.iter().filter(|k| k.mesh != u32::MAX).map(|k| (k.mesh, k.source)).collect();
+    let mut meshes: Vec<usize> = (0..sc.meshes.len()).filter(|&m| sc.meshes[m].count > 0).collect();
+    meshes.sort_by_key(|&m| sc.meshes[m].first);
+    // (A skinned mesh with its source: the model's vertices are found with its first mesh.)
+    let scopes: Vec<(indexed::Scope, Option<u32>)> = meshes
+        .par_iter()
+        .map(|&m| {
+            let im = sc.meshes[m];
+            let r = im.first as usize..(im.first + im.count) as usize;
+            let (tris, attrs) = (&sc.pool_tris[r.clone()], &sc.attrs[pool_first + r.start..pool_first + r.end]);
+            match source_of.get(&(m as u32)).copied().filter(|&s| im.deforms && sc.skin_sources[s as usize].len() == tris.len()) {
+                Some(s) => (indexed::shared_skinned(&sc.skin_sources[s as usize], tris, attrs), Some(s)),
+                None => (indexed::shared(tris, attrs), None),
+            }
+        })
+        .collect();
+    let mut deforming = 0;
+    for (&m, (s, source)) in meshes.iter().zip(scopes) {
+        if let Some(k) = source.filter(|&k| out.skins[k as usize].1.is_empty()) {
+            out.skins[k as usize] = (indexed::source_vertices(&sc.skin_sources[k as usize], &s), s.indices.clone());
+        }
+        // (A mesh's triangles follow the mesh's before it: the pool has no triangle that is no mesh's.)
+        assert_eq!(out.indices.len(), pool_first + sc.meshes[m].first as usize, "the pool's triangles are its meshes', one after another");
+        let n = s.vertices.len() as u32;
+        out.meshes[m] = (out.push(s, 0), n);
+        if sc.meshes[m].deforms {
+            assert_eq!(out.meshes[m].0, moving + (pool_first - still) as u32 * 3 + deforming, "the deforming meshes are the pool's first");
+            deforming += n;
+        }
+    }
+    out.dynamic = (moving, (pool_first - still) as u32 * 3 + deforming);
+    assert_eq!(out.indices.len(), pool_first + sc.pool_tris.len());
+    // The triangle of a still tree over nothing: without area.
+    if no_still {
+        out.indices.push([0; 3]);
+    }
+    // The translucent particles' (what `tri_verts` has after the pool: under hardware traversal).
+    if out.indices.len() < sc.attrs.len() {
+        let first = out.indices.len();
+        out.translucent = out.vertices.len() as u32;
+        out.translucent_tris = (first as u32, sc.trans_tris.len() as u32);
+        out.push(indexed::apart(&sc.trans_tris, &sc.attrs[first..]), out.translucent);
+    }
+    assert_eq!((out.indices.len(), tri_verts.len()), (sc.attrs.len(), sc.attrs.len() * 3), "a row of indices a triangle");
+    // A row a triangle. One no instance places: its material, its object, its flags, its emitter + 1. A mesh's: its
+    // section and its index in it (whether it deforms is its instance's to say: `scene::INST_DEFORMS`).
+    let pool = pool_first..pool_first + sc.pool_tris.len();
+    out.rows = sc.attrs.iter().enumerate().map(|(k, a)| if pool.contains(&k) { [a.uv[3].to_bits(), 0, 0, a.x[3].to_bits()] } else { [a.uv[3].to_bits(), a.x[1].to_bits(), tri_verts[k * 3][3].to_bits(), a.x[3].to_bits()] }).collect();
+    out.pool_first = pool_first as u32;
+    out
 }
 
 /// Instances as world-space triangles (software traversal), appended to the flattened ones with their objects.
@@ -1433,7 +1542,7 @@ mod light_lod_tests {
         // the one a load with all of them on builds: the plain build's, its powers summed bottom-up.
         let mats = [scene::GpuMaterial { emissive: [1.0, 1.0, 1.0, 0.0], ..Default::default() }];
         let tris: Vec<EmitterTri> = (0..600u32)
-            .map(|i| EmitterTri { tri: i, mat: 0, obj: (i % 6 != 0) as u32, area: 0.5, c: [2.0 * i as f32 + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: NO_INST })
+            .map(|i| EmitterTri { tri: i, mat: 0, obj: (i % 6 != 0) as u32, area: 0.5, c: [2.0 * i as f32 + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: NO_INST, part: 0 })
             .collect();
         let verts: Vec<[f32; 4]> = (0..600).flat_map(|i| [[2.0 * i as f32, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]).collect();
         let (off, on) = ([[0.0, 0.0, 0.0, 1.0], [0.0; 4]], [[0.0, 0.0, 0.0, 1.0]; 2]);
@@ -1466,7 +1575,7 @@ mod light_lod_tests {
         let mut unit = || (rnd() >> 8) as f32 / (1 << 24) as f32;
         let mats: Vec<scene::GpuMaterial> = (0..4).map(|k| scene::GpuMaterial { emissive: [k as f32 * 3.0, k as f32, 0.5 * k as f32, 0.0], ..Default::default() }).collect();
         let tris: Vec<EmitterTri> = (0..3000)
-            .map(|i| EmitterTri { tri: i, mat: if i % 9 == 0 { 0 } else { 1 + i % 3 }, obj: 0, area: 10f32.powf(-6.0 * unit()), c: [300.0 * unit(), 5.0, 100.0 * unit()], moves: i % 50 == 0, nominal: false, in_tree: false, inst: NO_INST })
+            .map(|i| EmitterTri { tri: i, mat: if i % 9 == 0 { 0 } else { 1 + i % 3 }, obj: 0, area: 10f32.powf(-6.0 * unit()), c: [300.0 * unit(), 5.0, 100.0 * unit()], moves: i % 50 == 0, nominal: false, in_tree: false, inst: NO_INST, part: 0 })
             .collect();
         let (t, total, _) = emitter_cdf(&tris, &emitter_order(&tris, None), &mats, &[], 3, [20.0, 0.0, 30.0, 10.0], EmitterCull::default());
         let n = tris.len() as u32;
@@ -1651,6 +1760,71 @@ mod units_tests {
         agree(&world(true), (3000, 400, 2000));
     }
 
+    /// `prepare`'s vertices and indices (indexed.rs) are its triangles: every triangle read through its indices (a
+    /// mesh's from the mesh's first vertex, a world-space one's from 0) has the corners, the edges, the normals and
+    /// the UVs the kernel's arrays have for it, bit for bit, the tangent of one that has its own, and its row's four
+    /// words. Flattened, with units, and as hardware traversal has the scene; with two posed skinned models. A mesh's
+    /// vertices are fewer than its triangles' corners (the ring: 82 for 80 triangles), and the vertices that move are
+    /// one run. No GPU.
+    #[test]
+    fn the_indexed_geometry_is_the_scenes_triangles() {
+        let mut w = world(true);
+        for (id, x) in [(30, -0.7), (31, 0.7)] {
+            let pose = crate::desc::Animation { clip: "bend".into(), time: 0.25 * (id - 29) as f32, r#loop: true, nodes: Default::default() };
+            w.set_object(id, format!("arm{id}"), None, Kind::Model { uri: "tests/render/data/skin-blend.glb".into(), nodes: None, animation: Some(pose), functions: vec![] }, true, false).unwrap();
+            w.set_transform(id, Vec3::new(x, -1.0, 0.8), Quat::IDENTITY, Vec3::splat(2.0)).unwrap();
+        }
+        for (what, hwrt, units) in [("flattened", false, false), ("units", false, true), ("hardware traversal", true, false)] {
+            let mut sc = scene::build(&w, std::path::Path::new(".."), &default_presets_dir(), None).unwrap();
+            let p = prepare_as(hwrt, units, &mut sc, &mut vec![]);
+            let x = &sc.indexed;
+            assert_eq!((x.indices.len(), x.rows.len()), (sc.attrs.len(), sc.attrs.len()), "{what}");
+            // (A pool triangle's mesh: its vertices count from the mesh's first.)
+            let pool_first = sc.attrs.len() - sc.pool_tris.len() - sc.trans_tris.len() * usize::from(hwrt) - usize::from(sc.units.is_some() && sc.tris.is_empty());
+            let base = |k: usize| sc.meshes.iter().zip(&x.meshes).find(|(m, _)| m.count > 0 && (pool_first + m.first as usize..pool_first + (m.first + m.count) as usize).contains(&k)).map_or(0, |(_, v)| v.0);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            for (k, a) in sc.attrs.iter().enumerate() {
+                let (q, n, uv, tangent) = x.triangle(k, base(k));
+                let v = |r: usize| [p.tri_verts[k * 3 + r][0], p.tri_verts[k * 3 + r][1], p.tri_verts[k * 3 + r][2]];
+                let edge = |c: usize| [q[c][0] - q[0][0], q[c][1] - q[0][1], q[c][2] - q[0][2]];
+                assert_eq!((bits(&q[0]), bits(&edge(1)), bits(&edge(2))), (bits(&v(0)), bits(&v(1)), bits(&v(2))), "{what}: triangle {k}'s first corner and its edges");
+                let skinned_without_normals = n.iter().flatten().all(|c| *c == 0.0);
+                if !skinned_without_normals {
+                    assert_eq!([bits(&n[0]), bits(&n[1]), bits(&n[2])], [bits(&a.n0[..3]), bits(&a.n1[..3]), bits(&a.n2[..3])], "{what}: triangle {k}'s normals");
+                }
+                assert_eq!(bits(&uv.concat()), bits(&[a.n0[3], a.n1[3], a.n2[3], a.uv[0], a.uv[1], a.uv[2]]), "{what}: triangle {k}'s UVs");
+                let own = a.x[0].to_bits() & indexed::OWN_TANGENT != 0;
+                assert_eq!(bits(&tangent), bits(&if own { a.t } else { [0.0; 4] }), "{what}: triangle {k}'s own tangent on its first vertex, or none");
+                // (A mesh's triangle: its section and its index in it, nothing else. One no instance places: its
+                // material, its object, its flags, its emitter + 1.)
+                let pool = (pool_first..pool_first + sc.pool_tris.len()).contains(&k);
+                let row = if pool { [a.uv[3].to_bits(), 0, 0, a.x[3].to_bits()] } else { [a.uv[3].to_bits(), a.x[1].to_bits(), p.tri_verts[k * 3][3].to_bits(), a.x[3].to_bits()] };
+                assert_eq!(x.rows[k], row, "{what}: triangle {k}'s row");
+                // Software traversal: the triangle as its tree's leaf has it, with its ids (a mesh's: its section and
+                // its index there; a world-space one's: its flags).
+                if !hwrt {
+                    let ids = if pool { [row[0], row[3]] } else { [row[2], 0] };
+                    let corners = q.map(|c| Vec3A::new(c[0], c[1], c[2]));
+                    assert_eq!(x.leaves[k].map(|r| bits(&r)), indexed::leaf(corners, ids).map(|r| bits(&r)), "{what}: triangle {k}'s leaf");
+                }
+            }
+            assert_eq!(x.leaves.len(), if hwrt { 0 } else { x.indices.len() }, "{what}: a leaf a triangle under software traversal, none under hardware traversal");
+            if sc.meshes.is_empty() {
+                continue;
+            }
+            // The ring's mesh: 80 triangles of 82 vertices. Each skinned model's mesh: its own vertices, as many as
+            // the other's (one model), fewer than its corners; and they are the vertices that move.
+            assert!(sc.attrs.iter().any(|a| a.x[0].to_bits() & indexed::OWN_TANGENT != 0) && sc.attrs.iter().any(|a| a.x[0].to_bits() & indexed::OWN_TANGENT == 0), "{what}: triangles with a tangent of their own and without");
+            let ring = sc.meshes.iter().zip(&x.meshes).find(|(m, _)| m.count == 80).expect("the ring's mesh");
+            assert_eq!(ring.1 .1, 82, "{what}: the ring's vertices");
+            let skinned: Vec<(u32, u32)> = sc.meshes.iter().zip(&x.meshes).filter(|(m, _)| m.deforms).map(|(_, v)| *v).collect();
+            assert_eq!(skinned.len(), 2, "{what}: two skinned meshes");
+            let corners = sc.meshes.iter().find(|m| m.deforms).unwrap().count * 3;
+            assert!(skinned[0].1 == skinned[1].1 && skinned[0].1 < corners && skinned[0].1 >= corners / 6, "{what}: {} vertices for {corners} corners", skinned[0].1);
+            assert_eq!((x.dynamic.0, x.dynamic.1), (skinned[0].0.min(skinned[1].0), skinned[0].1 * 2), "{what}: the vertices that move are the skinned meshes'");
+        }
+    }
+
     /// The same with no still triangle at all: the still tree is then the leaf of one triangle (bvh.rs `EMPTY`), and
     /// that triangle must be one no ray meets, not the first of the units' (a mesh's, in its model space). First seen
     /// on a GPU: `geometry/instanced`, two planes, darker towards a triangle standing at the origin.
@@ -1715,13 +1889,13 @@ mod units_tests {
         assert_eq!(pu.nodes.len(), u.layout.top_first as usize + u.layout.top_cap as usize);
         let kernel = |p: &Prepared, sc: &scene::Scene| {
             let (top, units) = (p.params.motion[2].to_bits(), p.params.motion[3].to_bits());
-            (p.nodes.clone(), p.tri_verts.clone(), sc.gpu_instances.clone(), top, units, sc.attrs.iter().map(|a| a.uv[3].to_bits()).collect::<Vec<u32>>(), sc.rows.clone())
+            (p.nodes.clone(), sc.indexed.leaves.clone(), sc.gpu_instances.clone(), top, units, sc.rows.clone())
         };
         let (ku, kf) = (kernel(&pu, &su), kernel(&pf, &sf));
         #[allow(clippy::type_complexity)]
-        let walk = |k: &(Vec<bvh::GpuNode>, Vec<[f32; 4]>, Vec<scene::GpuInstance>, u32, u32, Vec<u32>, Vec<scene::Row>), o: Vec3A, d: Vec3A, mode: u32| {
+        let walk = |k: &(Vec<bvh::GpuNode>, Vec<indexed::Leaf>, Vec<scene::GpuInstance>, u32, u32, Vec<scene::Row>), o: Vec3A, d: Vec3A, mode: u32| {
             let instances = if k.2.is_empty() { vec![scene::GpuInstance::default()] } else { k.2.clone() };
-            let kernel = Kernel { nodes: &k.0, tri_verts: &k.1, instances: &instances, sections: &k.5, rows: &k.6, top: k.3, units: k.4, steps: Default::default(), budget: 1 << 20, deepest: Default::default(), reads: Default::default() };
+            let kernel = Kernel { nodes: &k.0, leaves: &k.1, instances: &instances, rows: &k.5, top: k.3, units: k.4, steps: Default::default(), budget: 1 << 20, deepest: Default::default(), reads: Default::default() };
             kernel.trace(o, d, INF, mode).unwrap_or_else(|e| panic!("ray {o} {d}, mode {mode}: the kernel {e}"))
         };
         let mut s = 12345u64;

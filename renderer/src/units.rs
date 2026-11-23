@@ -904,11 +904,11 @@ pub(crate) mod cpu {
     /// their buffer; every loop iteration counted against `budget` (the loop guard's role: the walk must end).
     pub(crate) struct Kernel<'a> {
         pub(crate) nodes: &'a [GpuNode],
-        pub(crate) tri_verts: &'a [[f32; 4]],
+        /// The trees' leaf triangles (`indexed::Leaf`), as the kernel has them.
+        pub(crate) leaves: &'a [crate::indexed::Leaf],
         pub(crate) instances: &'a [GpuInstance],
-        /// Each triangle's section (its attributes' uv.w) and the instances' rows: what a unit with rows has its
-        /// glass by (`row_flags`). Empty where no unit has rows.
-        pub(crate) sections: &'a [u32],
+        /// The instances' rows: what a unit with rows has its glass by, through its triangles' sections
+        /// (`row_flags`). Empty where no unit has rows.
         pub(crate) rows: &'a [crate::scene::Row],
         /// `P.motion.z`, `P.motion.w`.
         pub(crate) top: u32,
@@ -953,9 +953,14 @@ pub(crate) mod cpu {
             self.count(|r| *(if !r.in_units { &mut r.still_nodes } else if i >= self.top { &mut r.top_nodes } else { &mut r.mesh_nodes }) += 1);
             self.nodes.get(i as usize).copied().ok_or(format!("reads node {i} of {}", self.nodes.len()))
         }
-        pub(crate) fn vert(&self, i: u32) -> Walk<Vec3A> {
-            self.count(|r| *(if r.in_units { &mut r.mesh_verts } else { &mut r.still_verts }) += 1);
-            self.tri_verts.get(i as usize).map(|v| Vec3A::new(v[0], v[1], v[2])).ok_or(format!("reads vertex {i} of {}", self.tri_verts.len()))
+        /// A leaf's triangle: v0, e1, e2. (Counted as a triangle's three vertices.)
+        pub(crate) fn leaf(&self, i: u32) -> Walk<[Vec3A; 3]> {
+            self.count(|r| *(if r.in_units { &mut r.mesh_verts } else { &mut r.still_verts }) += 3);
+            self.leaves.get(i as usize).map(|l| l.map(|v| Vec3A::new(v[0], v[1], v[2]))).ok_or(format!("reads leaf triangle {i} of {}", self.leaves.len()))
+        }
+        /// pathtrace.wgsl `leaf_id`.
+        pub(crate) fn leaf_id(&self, ti: u32, k: usize) -> Walk<u32> {
+            Ok(self.leaves.get(ti as usize).ok_or(format!("reads leaf triangle {ti} of {}", self.leaves.len()))?[k][3].to_bits())
         }
         pub(crate) fn record(&self, i: u32) -> Walk<GpuInstance> {
             self.count(|r| r.records += 1);
@@ -986,7 +991,7 @@ pub(crate) mod cpu {
 
         /// pathtrace.wgsl `intersect_tri`: (t, u, v), t = INF for a miss.
         pub(crate) fn intersect_tri(&self, o: Vec3A, d: Vec3A, i: u32, tmax: f32) -> Walk<f32> {
-            let (v0, e1, e2) = (self.vert(i * 3)?, self.vert(i * 3 + 1)?, self.vert(i * 3 + 2)?);
+            let [v0, e1, e2] = self.leaf(i)?;
             let pv = d.cross(e2);
             let det = e1.dot(pv);
             if det.abs() < 1e-12 {
@@ -1038,12 +1043,12 @@ pub(crate) mod cpu {
                     for k in 0..n.count {
                         self.step()?;
                         let ti = n.left_or_first + k;
-                        let flags = self.tri_verts.get(ti as usize * 3).ok_or(format!("reads triangle {ti}"))?[3].to_bits();
-                        if mode == TRACE_SHADOW && flags & crate::scene::TRI_NO_SHADOW != 0 {
-                            continue;
-                        }
                         let t = self.intersect_tri(o, d, ti, hit.t)?;
                         if t < hit.t {
+                            let flags = self.leaf_id(ti, 0)?;
+                            if mode == TRACE_SHADOW && flags & crate::scene::TRI_NO_SHADOW != 0 {
+                                continue;
+                            }
                             hit = Hit { t, tri: ti, inst: NO_INST };
                             if mode != TRACE_CLOSEST {
                                 return Ok(hit);
@@ -1086,8 +1091,7 @@ pub(crate) mod cpu {
         }
 
         /// shaders/trace_units.wgsl `row_flags`.
-        fn row_flags(&self, first: u32, ti: u32) -> Walk<u32> {
-            let section = *self.sections.get(ti as usize).ok_or(format!("reads the section of triangle {ti}"))?;
+        fn row_flags(&self, first: u32, section: u32) -> Walk<u32> {
             let x = self.rows.get((first + section) as usize).ok_or(format!("reads row {first} + {section}"))?[0];
             Ok(if x & crate::scene::ROW_CUTOUT != 0 { crate::scene::TRI_MASKED } else { 0 } | if x & crate::scene::ROW_GLASS != 0 { crate::scene::TRI_NO_SHADOW } else { 0 })
         }
@@ -1155,9 +1159,10 @@ pub(crate) mod cpu {
                         let x = self.intersect_tri(ro, rd, ti, hit.t)?;
                         if x < hit.t {
                             // (A unit's glass: shadow rays pass it.)
-                            let mut flags = self.tri_verts.get(ti as usize * 3).ok_or(format!("reads triangle {ti}"))?[3].to_bits();
+                            let part = self.leaf_id(ti, 0)?;
+                            let mut flags = 0;
                             if ubits & (crate::scene::INST_CUTOUT | crate::scene::INST_GLASS) != 0 {
-                                flags |= self.row_flags(urows, ti)?;
+                                flags = self.row_flags(urows, part)?;
                             }
                             if mode == TRACE_SHADOW && flags & crate::scene::TRI_NO_SHADOW != 0 {
                                 continue;
@@ -1188,7 +1193,7 @@ pub(crate) mod cpu {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::cpu::*;
     use super::*;
     use glam::{Quat, Vec3};
@@ -1254,7 +1259,10 @@ mod tests {
                 "let ti = first + n.left_or_first + k;",
                 "let x = intersect_tri(ro, rd, ti, hit.t);",
                 "if (x.x < hit.t) {",
-                "hit = Hit(x.x, ti, x.y, x.z, rec);",
+                "let part = leaf_id(ti, 0u);",
+                "var flags = 0u;",
+                "if ((ubits & (INST_CUTOUT | INST_GLASS)) != 0u) { flags = row_flags(urows, part); }",
+                "hit = Hit(x.x, ti, x.y, x.z, rec, part);",
                 "if (mode != TRACE_CLOSEST) { return hit; }",
                 "if (rec != NO_INST && sp == base) {",
                 "rec = NO_INST;",
@@ -1273,12 +1281,14 @@ mod tests {
             kernel,
             "pathtrace.wgsl",
             &[
+                "fn leaf_id(ti: u32, k: u32) -> u32 { return bitcast<u32>(leaves[ti * 3u + k].w); }",
                 "fn proc_dir(r: Instance, d: vec3<f32>) -> vec3<f32> { return r.n0.xyz * d.x + r.n1.xyz * d.y + r.n2.xyz * d.z; }",
                 "fn proc_point(r: Instance, p: vec3<f32>) -> vec3<f32> { return proc_dir(r, p - vec3<f32>(r.m0.w, r.m1.w, r.m2.w)); }",
                 "fn intersect_tri(o: vec3<f32>, d: vec3<f32>, i: u32, tmax: f32) -> vec3<f32> {",
-                "let v0 = tri_verts[i * 3u].xyz;",
-                "let e1 = tri_verts[i * 3u + 1u].xyz;",
-                "let e2 = tri_verts[i * 3u + 2u].xyz;",
+                "let k = i * 3u;",
+                "let v0 = leaves[k].xyz;",
+                "let e1 = leaves[k + 1u].xyz;",
+                "let e2 = leaves[k + 2u].xyz;",
                 "let pv = cross(d, e2);",
                 "let det = dot(e1, pv);",
                 "if (abs(det) < 1e-12) { return vec3<f32>(INF, 0.0, 0.0); }",
@@ -1291,9 +1301,10 @@ mod tests {
                 "if (t <= 0.0 || t >= tmax) { return vec3<f32>(INF, 0.0, 0.0); }",
                 "fn trace(o: vec3<f32>, d: vec3<f32>, tmax_in: f32, mode: u32) -> Hit {",
                 "var stack: array<u32, 48>;",
-                "if (mode == TRACE_SHADOW && (flags & TRI_NO_SHADOW) != 0u) { continue; }",
                 "let r = intersect_tri(o, d, ti, hit.t);",
-                "hit = Hit(r.x, ti, r.y, r.z, NO_INST);",
+                "let flags = leaf_id(ti, 0u);",
+                "if (mode == TRACE_SHADOW && (flags & TRI_NO_SHADOW) != 0u) { continue; }",
+                "hit = Hit(r.x, ti, r.y, r.z, NO_INST, ti);",
                 "if (mode != TRACE_CLOSEST) { return hit; }",
                 "if (tr != INF && sp < 48u) {",
                 "if (has(F_PROC)) { return trace_procs(o, d, hit, mode); }",
@@ -1332,7 +1343,7 @@ mod tests {
     /// into room, a record, the top tree again.
     struct Scene {
         nodes: Vec<GpuNode>,
-        tri_verts: Vec<[f32; 4]>,
+        soup: Soup,
         instances: Vec<GpuInstance>,
         layout: Layout,
         still_tris: usize,
@@ -1346,27 +1357,35 @@ mod tests {
         kept: Kept,
     }
 
-    fn put_tris(out: &mut Vec<[f32; 4]>, tris: &[[Vec3A; 3]]) {
-        for [a, b, c] in tris {
-            let (e1, e2) = (*b - *a, *c - *a);
-            out.extend([[a.x, a.y, a.z, 0.0], [e1.x, e1.y, e1.z, 0.0], [e2.x, e2.y, e2.z, 0.0]]);
+    /// Triangles as the trees' leaves have them (`indexed::Leaf`), without flags or sections.
+    #[derive(Default)]
+    pub(crate) struct Soup {
+        pub(crate) leaves: Vec<crate::indexed::Leaf>,
+    }
+
+    impl Soup {
+        /// The triangles after those there are; the first's index.
+        pub(crate) fn push(&mut self, tris: &[[Vec3A; 3]]) -> u32 {
+            let first = self.leaves.len() as u32;
+            self.leaves.extend(tris.iter().map(|t| crate::indexed::leaf(*t, [0, 0])));
+            first
         }
     }
 
     impl Scene {
         fn new(still: &[[Vec3A; 3]], mesh_room: usize, units: usize) -> Scene {
             let b = bvh::build(still);
-            let mut tri_verts = vec![];
-            put_tris(&mut tri_verts, &b.order.iter().map(|&i| still[i as usize]).collect::<Vec<_>>());
+            let mut soup = Soup::default();
+            soup.push(&b.order.iter().map(|&i| still[i as usize]).collect::<Vec<_>>());
             // (An empty still scene: the tree over nothing is a leaf of triangle 0, here three zero triangles; the meshes'
             // triangles follow whole triangles.)
             if still.is_empty() {
-                tri_verts.resize(9, [0.0; 4]);
+                soup.push(&[[Vec3A::ZERO; 3]; 3]);
             }
             let layout = Layout::new(b.nodes.len(), mesh_room, units);
             let mut nodes = b.nodes;
             nodes.resize(nodes.len() + layout.nodes(), FILL);
-            Scene { nodes, tri_verts, instances: vec![GpuInstance::default()], top: layout.top_first, layout, still_tris: still.len(), meshes: vec![], units: vec![], count: 0, kept: Kept::default() }
+            Scene { nodes, soup, instances: vec![GpuInstance::default()], top: layout.top_first, layout, still_tris: still.len(), meshes: vec![], units: vec![], count: 0, kept: Kept::default() }
         }
 
         /// A new mesh: its tree placed and written, its triangles appended in the tree's order.
@@ -1374,8 +1393,7 @@ mod tests {
             let t = mesh_tree(tris)?;
             let root = self.layout.place(t.nodes.len()).ok_or("no room for the tree")?;
             self.nodes[root as usize..root as usize + t.nodes.len()].copy_from_slice(&t.nodes);
-            let first = (self.tri_verts.len() / 3) as u32;
-            put_tris(&mut self.tri_verts, &t.order.iter().map(|&i| tris[i as usize]).collect::<Vec<_>>());
+            let first = self.soup.push(&t.order.iter().map(|&i| tris[i as usize]).collect::<Vec<_>>());
             let (lo, hi) = tri_boxes(tris).into_iter().fold((Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NEG_INFINITY)), |a, b| (a.0.min(b.0), a.1.max(b.1)));
             self.meshes.push(Some((first, tris.len() as u32, root, t.nodes.len(), lo, hi)));
             Ok(self.meshes.len() - 1)
@@ -1390,7 +1408,7 @@ mod tests {
 
         fn record(&self, mesh: usize, world: Mat4, cast: bool) -> GpuInstance {
             let (first, _, root, ..) = self.meshes[mesh].unwrap();
-            let inst = crate::scene::Instance { mesh: mesh as u32, world, object: 0, cast_shadow: cast, name: String::new(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0 };
+            let inst = crate::scene::Instance { mesh: mesh as u32, world, object: 0, cast_shadow: cast, name: String::new(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0, verts: 0 };
             unit_record(inst.gpu(first), root, cast)
         }
 
@@ -1427,8 +1445,8 @@ mod tests {
         }
 
         fn kernel(&self) -> Kernel<'_> {
-            let budget = 64 * (self.nodes.len() as u64 + self.tri_verts.len() as u64) + 1024;
-            Kernel { nodes: &self.nodes, tri_verts: &self.tri_verts, instances: &self.instances, sections: &[], rows: &[], top: self.top, units: self.count, steps: Default::default(), budget, deepest: Default::default(), reads: Default::default() }
+            let budget = 64 * (self.nodes.len() as u64 + self.soup.leaves.len() as u64 * 3) + 1024;
+            Kernel { nodes: &self.nodes, leaves: &self.soup.leaves, instances: &self.instances, rows: &[], top: self.top, units: self.count, steps: Default::default(), budget, deepest: Default::default(), reads: Default::default() }
         }
 
         /// Every triangle a ray could meet, tested one by one with the kernel's own triangle test (the still scene's in
@@ -2060,7 +2078,7 @@ mod tests {
         // A built tree is a level short of the bound: two of them joined are at it.
         assert!(check_tree(&build_sah(&(0..1 << 12).map(|k| (Vec3A::splat(k as f32), Vec3A::splat(k as f32 + 1.0))).collect::<Vec<_>>(), 12).0, 64, |_, _| Ok(())).unwrap() <= 12);
         // The record's word for a placement by a translation alone.
-        let rec = |world: Mat4| unit_record(crate::scene::Instance { mesh: 0, world, object: 0, cast_shadow: true, name: String::new(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0 }.gpu(0), 9, true);
+        let rec = |world: Mat4| unit_record(crate::scene::Instance { mesh: 0, world, object: 0, cast_shadow: true, name: String::new(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0, verts: 0 }.gpu(0), 9, true);
         let shifted = |m: Mat4| rec(m).n[1][3].to_bits() & UNIT_SHIFTED != 0;
         assert!(shifted(Mat4::IDENTITY));
         assert!(shifted(Mat4::from_translation(Vec3::new(3.0, -2.0, 0.5))));

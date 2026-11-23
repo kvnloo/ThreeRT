@@ -1459,8 +1459,8 @@ too is an override, from F_TINT).
   `cache_acc_add`, `refl_store`, ...), declared once in each layout's block, so a layout is its declarations and
   nothing else of the kernel knows which it is in.
 - The loop guard's count goes into every loop by a pass over the variant's syntax tree (gpu.rs `guard_loops`).
-- What more than one shader reads or writes is declared once, in `records.wgsl`: a triangle's attributes
-  (`TriAttr`), a sample of the trace (`Pixel`), the light tiles' constants. The file is part of the kernel, of the
+- What more than one shader reads or writes is declared once, in `records.wgsl`: a triangle's attributes as a hit
+  has them (`TriAttr`), a sample of the trace (`Pixel`), the light tiles' constants. The file is part of the kernel, of the
   particle passes and of the live passes (build.rs reads it with live.wgsl). The particle passes take the object
   table's stride as a pipeline constant, as the kernel does (until 2026-11-15 gpu.rs rewrote a line of their text).
 - The kernel's bind group layouts are written in one place (gpu.rs `kernel_layout_entries`), and a test holds them
@@ -1492,7 +1492,8 @@ The kernel's read-only scene data other than triangles is two storage buffers, e
   copies, so a light sample reads no placement; what moves an emitter after the load is copied again on the GPU,
   `emitter_fill.wgsl`).
 - `words` (binding 5), 32-bit words (`Stream`): the environment's CDF, the procedural geometry's data, the vertex
-  colours (`env_cdf_at`, `pword`, `vcolor_word`). Integers are read as integers, not through a float's bits.
+  colours, the instances' rows, and the triangles' indices and rows ("The scene's triangles" below) (`env_cdf_at`,
+  `pword`, `vcolor_word`, `tri_indices`, `tri_row`). Integers are read as integers, not through a float's bits.
 
 `Params::table_first` and `word_first` name each section's first element and are written with the parameters
 (`Uploaded::place`). What a scene has more of is another section, not another binding.
@@ -1524,6 +1525,50 @@ The kernel's read-only scene data other than triangles is two storage buffers, e
   without, and stays at 29.)
   (Hardware traversal no longer binds software traversal's trees, a placeholder there; the light tiles' lists took
   the binding.)
+
+## The scene's triangles
+
+Vertices and indices, one layout for hardware and software traversal (`renderer/src/indexed.rs`):
+- **Vertices.** `vertices` (binding 1): a record of 48 bytes a vertex, (position, u), (normal, v), (tangent, hand;
+  zeros: none). The BLASes are built from this buffer too (stride 48).
+- **Triangles.** Three indices each, a section of `words` (`Stream::Indices`): what a hit reads, and the BLASes'
+  index buffer. A mesh's indices count from the mesh's first vertex, which its instances' records carry
+  (`info.z`); a world-space triangle's count from 0.
+- **A mesh's triangle has nothing else of its own.** Which section of its mesh it is in, its hit says (`Hit.part`):
+  the geometry of the BLAS it was hit in, or under software traversal its tree's leaf. Its instance's row for
+  the section has the material and where the section's triangles and emitters start; its instance's record has
+  its object and whether its mesh deforms (`INST_DEFORMS`). A light sample is told its emitter's section by the
+  light list's record (64 bytes). The record a pixel is left to `finish` by has 16 bits for it (`MESH_SECTIONS`).
+- **Rows** (`Stream::Triangles`, four words). A triangle no instance places (a light's card, a particle's, a
+  flattened scene's) has one: its material, its object, its flags, its emitter + 1. They are all the GPU holds: the
+  world-space triangles', then the translucent particles'.
+- **Software traversal's leaves** (`leaves`, binding 2; `indexed::Leaf`). A tree keeps its triangles itself, as an
+  acceleration structure does: 48 bytes each, in the triangles' order, (v0, id), (v1 - v0, id), (v2 - v0, -). A
+  candidate's test reads nothing else. The ids: a world-space triangle's flags; a mesh's section, and its index in
+  the section (a tree has a mesh's triangles in its own order). Written at the build and where an edit places a
+  mesh; after the skinning pass a pass takes a posed mesh's again from its vertices (`leaf_gather.wgsl`).
+- **A hit reads** its triangle's indices and its three vertices' records (`tri_data(triangle, instance, part)`).
+- **What shares.** Corners equal bit for bit in position, normal and UV are one vertex: the still world-space
+  triangles among themselves, each mesh within itself, a skinned mesh by its model's corners. Triangles the CPU or
+  a pass writes whole (those that move in world space, particles) keep three vertices each.
+- **Tangents.** A triangle's frame is its first vertex's tangent where its file has one (a first corner never
+  shares a vertex with a triangle of another tangent), else made where it is hit, from its edges, its UVs and its
+  first normal (`hit_tangent`), and placed by its instance there.
+- **Motion.** `prev_verts` (binding 6): the vertices that move as they were the previous frame, whole records (a
+  copy on the GPU has no stride; the kernel reads their positions): the moving world-space triangles' first, then
+  the deforming meshes', each where its record says (`n2.w`).
+- **Edits.** A mesh an edit places takes a run of triangles and a run of vertices (`EditState::tris`, `verts`);
+  both rooms grow by a copy on the GPU. A mesh changed in place keeps its run where the new vertices fit.
+- **Bytes.** A triangle was 144 bytes for the kernel (48 its vertices, 96 its attributes) and 36 more as the BLAS's
+  input; it is its three indices, 12, and its share of the vertices' 48 each. Vertices a triangle as measured:
+  Tokyo 1.17, Zero Day 1.03, a crowd of skinned walkers 0.98, small scenes of smooth models 0.5 to 0.7, a voxel
+  level's meshes 1.88 (a face's four corners are no other face's). With the BLASes, on the GPU: Tokyo 6.4 GB ->
+  3.9, Zero Day 1.6 -> 0.95.
+- The build still flattens a file's indexed geometry and finds the sharing again (1.2 s on Tokyo's 23 M
+  triangles): carrying a file's indices through is a later step.
+- Under hardware traversal the kernel binds one buffer fewer than it did (a triangle's attributes were a second
+  one): the translucency pass's pipeline, which was at Metal's 29 buffers a stage, is at 28. Under software
+  traversal the leaves take that place: a browser's merged layout uses all eight of its storage buffers, as it did.
 
 ## Random numbers
 
@@ -1896,7 +1941,7 @@ on the device", and differs where it says so.
   |---|---|---|
   | `tables` (4) and, with the views, `materials` (12), `lights` (13), `emitters` (14) | megabytes in a lit scene | storage: the device drew right with materials, lights and emitters as storage buffers of their own (bindings 4 to 6, before #89) and reads them right from `tables` whole; not as the views (above) |
   | `words` (5): the environment's CDF, the procedural geometry's data, vertex colours | megabytes | storage; the environment's light sampling is off on Android, below |
-  | `tri_verts` (1), `attrs` (2), `nodes` (3), `prev_verts` (6) | per triangle | storage (megabytes) |
+  | `vertices` (1), `leaves` (2), `nodes` (3), `prev_verts` (6) | per vertex, per triangle, per node | storage (megabytes) |
   | `accum` (11), group 1 (radiance cache, the trace's outputs, `finish`'s records, the loop guard's count) | per pixel, per cache entry | written by the kernel: cannot be uniform |
   | group 2, the translucency pass (`timg`, `vpts`, `vcount`, `tlow`) | per pixel | written by the pass |
   | the particle passes' `systems`, `spawns`, `grid`; the grid programs' `srcs` | small, read-only | storage: other shaders, of eleven bindings at most and no acceleration structure; not known to misread (the fix on the device left them alone) |

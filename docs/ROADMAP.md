@@ -2789,6 +2789,55 @@ What it costs: under hardware traversal a frame's GPU time in twelve scenes, alt
 is -1 % to +4 % (Zero Day +4.0, the neon street +3.8, the colour room +3.6, the crowd +2.9, the others under 2, Tokyo
 -1.0); under software traversal, whose tree walks are loops, the trace of a crowd of 3.3 M triangles is 85.3 -> 90.6 ms
 (+6 %). The pictures and the suites are the ones before.
+**Triangles are vertices and indices (2026-11-22).** Every triangle carried its own three vertices (48 bytes), its
+shading attributes (96) and, under hardware traversal, its positions again as the BLAS's input (36). Now the scene
+has vertices, a record of 48 bytes each (position and u; normal and v; tangent), and a triangle is three indices
+(`renderer/src/indexed.rs`; docs/RUNTIME.md "The scene's triangles"): one layout for both traversals, and the
+BLASes are built from the same vertices through the indices. A mesh's vertices are a run of their own: the
+skinning pass skins a vertex once (it skinned every corner), the particle passes and the light list's fill write
+and read vertices, the previous frame's are kept a vertex, and an edit in place takes a run of vertices with its
+triangles. The kernel binds one buffer fewer.
+A mesh's triangle has no data of its own besides. Its hit says which section of its mesh it is in (the BLAS's
+geometry; under software traversal its tree's leaf); the section's row of its instance has the material, the
+instance's record the object and whether the mesh deforms; the light list's record (64 bytes, was 48) has an
+emitter's section. A triangle no instance places keeps a row of four words.
+Software traversal's trees keep their triangles in their leaves, their own copy as an acceleration structure has
+one (48 bytes a triangle: v0, the edges, its section and its index there): a candidate's test read through the
+indices and the 48-byte vertices cost its trace 6 % (a crowd standing still, 85 -> 90 ms); from the leaves it is
+81 ms. A pass takes a posed mesh's leaves again from its vertices.
+On the GPU, data and BLASes together: Tokyo (23 M triangles) 6.4 GB -> 3.9, Zero Day 1.6 GB -> 0.95, a small scene
+15 MB -> 7.5. The BLASes themselves are as large as they were.
+A frame's GPU time under hardware traversal, twelve scenes alternated twice with the kernel before: the home
+showcase +4.2 %, the colour room +2.0, the museum +1.9, the crowd -2.5, Tokyo -1.2, the others within 1 %.
+What changes in a picture. A triangle's tangent frame, where its file gives none, is made where it is hit, not at
+the build: rounding (offline, software traversal, against the build before: two scenes the same bytes, one with
+411 of 921,600 pixels off by 2 steps at most). Under hardware traversal the driver's tree over indexed geometry is
+another tree, and a few rays at shared edges meet the other triangle: five scenes at 8 samples differ in 3 to
+2,408 pixels, by 3 steps at most but for single samples (8 steps; in one scene one sample, 22 steps over the 11 x 11
+pixels the denoiser spreads it to).
+A skinned vertex whose position is not finite is at its mesh's origin now; its triangles were left out before.
+The build finds the sharing again, 1.2 s on Tokyo (a file's indices are flattened before: historical, a later step).
+Tests: indexed.rs's own (sharing; a seam or a crease; a first corner's tangent; a triangle that is not finite); the
+build's triangles through their indices against the scene's; the in-place tests read every triangle they check
+back through its indices (the light list's emitters with their sections; a skinned mesh's corners, normals, UVs,
+tangents and previous positions against the CPU skin, its record's deforming bit, each triangle's section and its
+index there); a mesh changed in place to more vertices; a moved card beside another, a drifting particle and a
+drifting GPU particle, by their motion vectors; a skinned primitive without normals, by the normal the camera sees;
+emitters in a mesh's second section against the same triangles a mesh each (live, and offline for the weight of a
+ray that meets one); a first frames' bounce off a mesh's second section and off a particle, which the kernel's
+second pass shades; a cutout particle; an emitting particle's two sides beside a light's card;
+`material/function-file-tangent` (a file's tangent is the one a function is given); the rasterized first hit
+(`THREERT_RASTER`, which had no test and is off in any scene with a mesh since meshes are instances) against the
+traced picture.
+Fixed on the way: a still mesh that emits, moved for the first time, had the pass that places moved emitters run
+over the emitters the move had just made, which the light list did not hold yet (its write landed on the list's
+last record); they are made where the mesh stands and the pass leaves them alone.
+Mutations: 28 of the first form (20 failed a test there was, 8 none and have their tests above), 27 of this
+one (17 and 8; one changes nothing, no deforming instance has its materials' classes remade in place; one is
+reached only by a live view without units, `THREERT_UNITS=0`, and has no test) and 17 of the trees' leaves (15
+failed a test, one the walk's transcription alone, one none until the emitters' test had three at right angles).
+Next: tangents a vertex, interpolated (generated where a file has none); vertices packed to 32 bytes; a file's
+indices carried through the build.
 
 **A triangle's texel density is the hit's to compute (2026-11-22).** Every triangle carried a constant for its mip
 choice, half the log of its UV area over its area, made when the scene was built; an instance added an offset for

@@ -1,5 +1,5 @@
 //! The merged binding layout: the kernel with at most eight storage buffers a stage, WebGPU's default limit
-//! (`maxStorageBuffersPerShaderStage`). The kernel binds 21 as it is written: more than a browser gives a page.
+//! (`maxStorageBuffersPerShaderStage`). The kernel binds 20 as it is written: more than a browser gives a page.
 //! (The live passes need none of this: each binds at most eight, live/layout.rs, and a page binds them as they are.)
 //!
 //! The kernel's source has both layouts: pathtrace.wgsl declares its tables' views and its group-1 buffers in an
@@ -110,7 +110,7 @@ mod tests {
     /// Kernel variants in the merged layout: valid WGSL, no entry point with more than eight storage buffers, none
     /// declared beyond them (a pipeline layout counts what is declared), no length of a view's buffer in the source,
     /// and `MergedLive`'s members where the renderer puts their sections.
-    /// The layout as written has 22 (21 under hardware traversal, which has no trees' buffer). Because the merged
+    /// The layout as written has 22 (20 under hardware traversal, which has neither of the trees' buffers). Because the merged
     /// blocks declare none of the views or of group 1's buffers by their own names, a read or write of one past its
     /// accessor does not compile here (and naga says where), whatever the other layouts take.
     #[test]
@@ -121,7 +121,7 @@ mod tests {
         // (`main` no longer adds to the cache's sums: `finish` trains it.)
         assert_eq!(used.iter().map(|u| u.1).max(), Some(21), "{used:?}");
         let hw = kernel_wgsl(&kernel_template(), &KernelVariant::new(true, Default::default(), 0));
-        assert_eq!(hw.matches("var<storage").count(), 21 + 4, "hardware traversal: no trees' buffer (and the translucency pass's four)");
+        assert_eq!(hw.matches("var<storage").count(), 20 + 4, "hardware traversal: neither of the trees' buffers (and the translucency pass's four)");
         for features in [0, crate::gpu::F_VCOLOR, crate::gpu::F_GRID, crate::gpu::F_TINT | crate::gpu::F_UNLIT | crate::gpu::F_BACKGROUND, crate::gpu::F_SOURCE] {
             let src = variant(features, true);
             assert!(!src.contains("arrayLength"), "the lengths are the parameters'");
@@ -129,7 +129,8 @@ mod tests {
             let (used, declared) = storage_buffers(&m, &info);
             assert!(declared as u32 <= STORAGE_BUFFERS, "features {features:#x}: {declared} declared");
             assert!(used.iter().all(|u| u.1 as u32 <= STORAGE_BUFFERS), "features {features:#x}: {used:?}");
-            assert_eq!(used.iter().find(|u| u.0 == "main").map(|u| u.1), Some(8), "the trace reads all eight");
+            assert_eq!(used.iter().find(|u| u.0 == "main").map(|u| u.1), Some(8), "the trace reads all eight a page has (the trees' leaves the eighth)");
+            assert_eq!(declared, 8, "features {features:#x}");
             // The struct's members are the first sections; its last, the vec4s, begins where the cache's values do.
             let (at, _) = crate::heap::Heap::<crate::heap::Live>::starts_for(&crate::gpu::live_sizes(1, 64, 64, 64, 64));
             assert_eq!(layout(&m, "MergedLive").0, at[..4]);
@@ -245,8 +246,8 @@ mod tests {
             assert_eq!(g.matches("if (loop_guard()) {").count(), loops(&plain) - counted(&plain));
             let (m, info) = parse(&g);
             let (used, declared) = storage_buffers(&m, &info);
-            // (As written: the guard's count and `finish`'s records too. Merged: still eight.)
-            assert_eq!(declared as u32, if merged { STORAGE_BUFFERS } else { 23 }, "{used:?}");
+            // (As written: the guard's count and `finish`'s records too. Merged: the eight a page has.)
+            assert_eq!(declared as u32, if merged { 8 } else { 23 }, "{used:?}");
         }
         // The pass on its own: nested loops, a `continuing` block, comments and braces in them, a loop in an `if`; a
         // counted loop left alone, one bounded by a variable or assigning its counter guarded.

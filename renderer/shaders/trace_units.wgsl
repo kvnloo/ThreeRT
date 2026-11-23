@@ -37,10 +37,10 @@ const UNIT_SHADOW: u32 = 1u;
 const UNIT_SHIFTED: u32 = 2u;
 @if(units) var<private> stack: array<u32, 64>;
 
-// The flags of a triangle of a unit with rows (from `first` on), which its vertices do not carry: its section's row
-// says whether it is a cutout's (TRI_MASKED) or glass (TRI_NO_SHADOW). Asked of the units that have such a section.
-@if(units) fn row_flags(first: u32, ti: u32) -> u32 {
-    let x = row_word(first, bitcast<u32>(attrs[ti].uv.w), 0u);
+// The flags of a triangle of a unit with rows (from `first` on), of its section `part`: the section's row says
+// whether it is a cutout's (TRI_MASKED) or glass (TRI_NO_SHADOW). Asked of the units that have such a section.
+@if(units) fn row_flags(first: u32, part: u32) -> u32 {
+    let x = row_word(first, part, 0u);
     return select(0u, TRI_MASKED, (x & ROW_CUTOUT) != 0u) | select(0u, TRI_NO_SHADOW, (x & ROW_GLASS) != 0u);
 }
 
@@ -111,11 +111,13 @@ const UNIT_SHIFTED: u32 = 2u;
                 let ti = first + n.left_or_first + k;
                 let x = intersect_tri(ro, rd, ti, hit.t);
                 if (x.x < hit.t) {
-                    var flags = bitcast<u32>(tri_verts[ti * 3u].w);
-                    if ((ubits & (INST_CUTOUT | INST_GLASS)) != 0u) { flags |= row_flags(urows, ti); }
+                    // (Its section: its leaf's id.)
+                    let part = leaf_id(ti, 0u);
+                    var flags = 0u;
+                    if ((ubits & (INST_CUTOUT | INST_GLASS)) != 0u) { flags = row_flags(urows, part); }
                     if (has(F_IGLASS) && mode == TRACE_SHADOW && (flags & TRI_NO_SHADOW) != 0u) { continue; }
-                    if (has(F_MASKED) && (flags & TRI_MASKED) != 0u && !cutouts_opaque() && mode != TRACE_ANY_OPAQUE && !alpha_pass(ti, rec, x.y, x.z, x.x)) { shadow_hole = true; continue; }
-                    hit = Hit(x.x, ti, x.y, x.z, rec);
+                    if (has(F_MASKED) && (flags & TRI_MASKED) != 0u && !cutouts_opaque() && mode != TRACE_ANY_OPAQUE && !alpha_pass(ti, rec, part, x.y, x.z, x.x)) { shadow_hole = true; continue; }
+                    hit = Hit(x.x, ti, x.y, x.z, rec, part);
                     if (mode != TRACE_CLOSEST) { return hit; }
                 }
             }
