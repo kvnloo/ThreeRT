@@ -1020,8 +1020,8 @@ pub struct Skinned {
 }
 
 /// pathtrace.wgsl `Medium`: world -> local affine rows (the unit box / sphere's space), (function, shape or
-/// `MEDIUM_HIDDEN`, homogeneous, animated),
-/// (majorant 1/m, HG anisotropy, -, -), the node's customData, 32 parameter floats.
+/// `MEDIUM_HIDDEN`, homogeneous, animated), (majorant 1/m, HG anisotropy, its density grid's first layer in the atlas
+/// and its cells, as bits: 0 without one), the node's customData, 32 parameter floats.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MediumGpu {
@@ -1047,6 +1047,51 @@ pub struct GridBuild {
     pub medium: u32,
     /// `world::DensityGrid::made`.
     pub made: u32,
+}
+
+/// Where density grid `gid` lies in the atlas, as a medium's record has it (b.zw: its first layer and its cells, as
+/// bits). The first volume that names a grid has it built (`grids`: stacked along z in the order they come; `node`
+/// and `medium`: that volume's), its program by its rank among `programs`. The build and the live view's media
+/// table both come here.
+pub fn grid_of(w: &World, grids: &mut Vec<GridBuild>, programs: &[(String, String, String)], gid: u32, node: u32, medium: u32) -> Result<[f32; 2]> {
+    let k = match grids.iter().position(|b| b.id == gid) {
+        Some(k) => k,
+        None => {
+            let dg = w.grids.get(&gid).ok_or_else(|| anyhow!("unknown density grid {gid}"))?;
+            let program = match &dg.program {
+                Some((name, _)) => Some(programs.iter().position(|(k, _, _)| k == name).ok_or_else(|| anyhow!("unknown grid program {name}"))? as u32),
+                None => None,
+            };
+            let mut gp = [0.0f32; 32];
+            for (k, v) in dg.program.iter().flat_map(|(_, p)| p.iter()).take(32).enumerate() {
+                gp[k] = *v;
+            }
+            let z0 = grids.iter().map(|b| b.dims[2]).sum::<u32>();
+            let cells = grids.iter().map(|b| b.dims).chain([dg.dims]).map(|d| d.iter().map(|&d| d as u64).product::<u64>()).sum::<u64>();
+            // (The atlas is as wide and high as the widest and highest grid: its texels count too.)
+            let atlas = grids.iter().map(|b| b.dims[0]).chain([dg.dims[0]]).max().unwrap() as u64 * grids.iter().map(|b| b.dims[1]).chain([dg.dims[1]]).max().unwrap() as u64 * (z0 + dg.dims[2]) as u64;
+            if cells > world::GRID_MAX_SCENE_CELLS || atlas > 2 * world::GRID_MAX_SCENE_CELLS || z0 + dg.dims[2] > world::GRID_MAX_LAYERS {
+                return Err(anyhow!("the scene's density grids exceed {} cells or {} layers along z together (or differ too much in width and height)", world::GRID_MAX_SCENE_CELLS, world::GRID_MAX_LAYERS));
+            }
+            grids.push(GridBuild { id: gid, dims: dg.dims, z0, data: dg.data.clone(), program, params: gp, node, medium, made: dg.made });
+            grids.len() - 1
+        }
+    };
+    let b = &grids[k];
+    Ok([f32::from_bits(b.z0), f32::from_bits(b.dims[0] | b.dims[1] << 10 | b.dims[2] << 20)])
+}
+
+impl MediumGpu {
+    /// A volume's record: the object `o` (a `Kind::Volume`) placed by `m`, its function's number, whether it is shown
+    /// (a hidden one is built with no shape, to be shown in place), and its density grid's place (`grid`: b.zw).
+    pub fn of(o: &world::Object, m: Mat4, function: u32, shown: bool, grid: [f32; 2]) -> Option<MediumGpu> {
+        let Kind::Volume { params, shape, majorant, g, homogeneous, animated, .. } = &o.kind else { return None };
+        let mut p = [0.0f32; 32];
+        for (k, v) in params.iter().take(32).enumerate() {
+            p[k] = *v;
+        }
+        Some(MediumGpu { w: medium_rows(m), a: [function, if shown { *shape } else { MEDIUM_HIDDEN }, *homogeneous as u32, *animated as u32], b: [majorant.max(0.0), g.clamp(-0.99, 0.99), grid[0], grid[1]], c: o.custom, p })
+    }
 }
 
 /// The world -> local rows of a medium whose node has world matrix `m` (pathtrace.wgsl `Medium.w0..w2`).
@@ -2093,51 +2138,23 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
             },
             // (Hidden by its own `visible`: built while the kernel has room after the volumes shown, with no shape,
             // so that showing it is in place: gpu.rs `set_medium_hidden`.)
-            Kind::Volume { function, params, shape, majorant, g, homogeneous, animated, grid } if shown || (w.hidden_built(*id) && media.len() + media_to_show < MAX_MEDIA) => {
+            Kind::Volume { function, shape, grid, .. } if shown || (w.hidden_built(*id) && media.len() + media_to_show < MAX_MEDIA) => {
                 if shown {
                     media_to_show -= 1;
                 }
                 let func = volume_fns.iter().position(|(k, _, _)| k == function).ok_or_else(|| anyhow!("object {}: unknown volume function {function}", n.name))? as u32;
-                let mut p = [0.0f32; 32];
-                for (k, v) in params.iter().take(32).enumerate() {
-                    p[k] = *v;
-                }
                 // Its density grid: where it lies in the atlas and its cells, as bits in b.zw (pathtrace.wgsl `vgrid`).
                 let mut at = [0.0f32; 2];
                 if let Some(gid) = grid {
-                    let dg = w.grids.get(gid).ok_or_else(|| anyhow!("object {}: unknown density grid {gid}", n.name))?;
                     if *shape != 0 {
                         return Err(anyhow!("object {}: a density grid needs a box volume", n.name));
                     }
-                    let k = match grids.iter().position(|b| b.id == *gid) {
-                        Some(k) => k,
-                        None => {
-                            let program = match &dg.program {
-                                Some((name, _)) => Some(grid_programs.iter().position(|(k, _, _)| k == name).ok_or_else(|| anyhow!("object {}: unknown grid program {name}", n.name))? as u32),
-                                None => None,
-                            };
-                            let mut gp = [0.0f32; 32];
-                            for (k, v) in dg.program.iter().flat_map(|(_, p)| p.iter()).take(32).enumerate() {
-                                gp[k] = *v;
-                            }
-                            let z0 = grids.iter().map(|b| b.dims[2]).sum::<u32>();
-                            let cells = grids.iter().chain([&GridBuild { id: 0, dims: dg.dims, z0, data: None, program: None, params: [0.0; 32], node: 0, medium: 0, made: 0 }]).map(|b| b.dims.iter().map(|&d| d as u64).product::<u64>()).sum::<u64>();
-                            // (The atlas is as wide and high as the widest and highest grid: its texels count too.)
-                            let atlas = grids.iter().map(|b| b.dims[0]).chain([dg.dims[0]]).max().unwrap() as u64 * grids.iter().map(|b| b.dims[1]).chain([dg.dims[1]]).max().unwrap() as u64 * (z0 + dg.dims[2]) as u64;
-                            if cells > world::GRID_MAX_SCENE_CELLS || atlas > 2 * world::GRID_MAX_SCENE_CELLS || z0 + dg.dims[2] > world::GRID_MAX_LAYERS {
-                                return Err(anyhow!("object {}: the scene's density grids exceed {} cells or {} layers along z together (or differ too much in width and height)", n.name, world::GRID_MAX_SCENE_CELLS, world::GRID_MAX_LAYERS));
-                            }
-                            grids.push(GridBuild { id: *gid, dims: dg.dims, z0, data: dg.data.clone(), program, params: gp, node: *id, medium: media.len() as u32, made: dg.made });
-                            grids.len() - 1
-                        }
-                    };
-                    let b = &grids[k];
-                    at = [f32::from_bits(b.z0), f32::from_bits(b.dims[0] | b.dims[1] << 10 | b.dims[2] << 20)];
+                    at = grid_of(w, &mut grids, &grid_programs, *gid, *id, media.len() as u32).with_context(|| format!("object {}", n.name))?;
                 }
                 if media.len() >= MAX_MEDIA {
                     return Err(anyhow!("object {}: more than {MAX_MEDIA} volumes shown at once (the kernel takes {MAX_MEDIA}; the rest would not be drawn)", n.name));
                 }
-                media.push(MediumGpu { w: medium_rows(m), a: [func, if shown { *shape } else { MEDIUM_HIDDEN }, *homogeneous as u32, *animated as u32], b: [majorant.max(0.0), g.clamp(-0.99, 0.99), at[0], at[1]], c: n.custom, p });
+                media.push(MediumGpu::of(n, m, func, shown, at).expect("a volume"));
                 media_nodes.push(*id);
             }
             Kind::Procedural { .. } if shown => {
