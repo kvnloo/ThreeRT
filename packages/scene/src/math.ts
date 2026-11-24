@@ -764,6 +764,12 @@ export class Matrix4 {
     const scaleZSq = te[8] * te[8] + te[9] * te[9] + te[10] * te[10];
     return Math.sqrt(Math.max(scaleXSq, scaleYSq, scaleZSq));
   }
+  /** Copies only the translation of `m` (three.js). */
+  copyPosition(m: Matrix4): this {
+    const te = this.elements, me = m.elements;
+    te[12] = me[12]; te[13] = me[13]; te[14] = me[14];
+    return this;
+  }
   /** Transpose in place, as three.js does. */
   transpose(): this {
     const te = this.elements;
