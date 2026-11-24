@@ -41,13 +41,14 @@ test("Timer: deltas and elapsed from explicit timestamps, scaled by the timescal
   const t = new THREE.Timer();
   const t0 = performance.now();
   t.update(t0 + 1000);
+  const e0 = t.getElapsed();
   t.update(t0 + 1500);
   assert.ok(Math.abs(t.getDelta() - 0.5) < 1e-9);
   assert.equal(t.setTimescale(2), t);
   assert.equal(t.getTimescale(), 2);
   t.update(t0 + 2000);
   assert.ok(Math.abs(t.getDelta() - 1) < 1e-9);
-  assert.ok(Math.abs(t.getElapsed() - (t0 + 1000 - (t0 + 1000 - t.getElapsed() * 1000)) / 1000 * 1000 / 1000 - t.getElapsed()) < 1e-9);
+  assert.ok(Math.abs(t.getElapsed() - e0 - 1.5) < 1e-9);
 });
 
 test("Timer.connect: a hidden page gives a zero delta, and becoming visible resets", () => {
