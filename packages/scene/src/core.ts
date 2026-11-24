@@ -2018,21 +2018,23 @@ export class InstancedMesh extends Object3D {
     return matrix.fromArray(this.instanceMatrix.array, index * 16);
   }
   /** The first call gives every instance a colour (white). */
-  setColorAt(index: number, color: Color): void {
+  setColorAt(index: number, color: Color): this {
     this.instanceColor ??= new InstancedBufferAttribute(new Float32Array(this.instanceMatrix.count * 3).fill(1), 3);
     color.toArray(this.instanceColor.array, index * 3);
+    return this;
   }
   getColorAt(index: number, color: Color): Color {
     return this._color ? color.fromArray(this._color.array, index * 3) : color.setRGB(1, 1, 1);
   }
   /** The first call gives every instance the mesh's `customData`. */
-  setCustomDataAt(index: number, data: ArrayLike<number>): void {
+  setCustomDataAt(index: number, data: ArrayLike<number>): this {
     if (!this.instanceCustomData) {
       const d = new Float32Array(this.instanceMatrix.count * 4);
       for (let i = 0; i < d.length; i += 4) d.set(this.customData, i);
       this.instanceCustomData = new InstancedBufferAttribute(d, 4);
     }
     for (let k = 0; k < 4; k++) this.instanceCustomData.array[index * 4 + k] = data[k] ?? 0;
+    return this;
   }
   getCustomDataAt(index: number, target: number[] = []): number[] {
     for (let k = 0; k < 4; k++) target[k] = this._instData ? this._instData.array[index * 4 + k] : this.customData[k];
@@ -2040,7 +2042,9 @@ export class InstancedMesh extends Object3D {
   }
   computeBoundingBox(): void {}
   computeBoundingSphere(): void {}
+  /** Fires `dispose` (three.js); the renderer frees the instances when the mesh leaves the scene. */
   dispose(): this {
+    this.dispatchEvent({ type: "dispose" });
     return this;
   }
   /** As Object3D's, the instance tables copied rather than shared (three.js). */
