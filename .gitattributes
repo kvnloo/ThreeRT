@@ -1,0 +1,3 @@
+# Check text files out with LF on every platform. Git for Windows defaults to core.autocrlf=true, which would give
+# CRLF working copies, and tests that read sources with include_str! match multi-line strings joined with "\n" (#158).
+* text=auto eol=lf
