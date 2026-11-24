@@ -1572,6 +1572,59 @@ export class Sphere {
     return this;
   }
 
+  /** The sphere around `points`, centred on `optionalCenter` or else on their box's centre (three.js; not the smallest). */
+  setFromPoints(points: Vector3[], optionalCenter?: Vector3): this {
+    if (optionalCenter !== undefined) this.center.copy(optionalCenter);
+    else new Box3().setFromPoints(points).getCenter(this.center);
+    let r2 = 0;
+    for (const p of points) r2 = Math.max(r2, this.center.distanceToSquared(p));
+    this.radius = Math.sqrt(r2);
+    return this;
+  }
+  intersectsBox(box: Box3): boolean {
+    return box.intersectsSphere(this);
+  }
+  intersectsPlane(plane: Plane): boolean {
+    return Math.abs(plane.distanceToPoint(this.center)) <= this.radius;
+  }
+  /** `point`, or the nearest point of the sphere's surface if it lies outside (three.js). */
+  clampPoint(point: Vector3, target = new Vector3()): Vector3 {
+    target.copy(point);
+    if (this.center.distanceToSquared(point) > this.radius * this.radius) {
+      target.sub(this.center).normalize().multiplyScalar(this.radius).add(this.center);
+    }
+    return target;
+  }
+  /** The box around the sphere; an empty sphere gives an empty box (three.js). */
+  getBoundingBox(target = new Box3()): Box3 {
+    if (this.isEmpty()) return target.makeEmpty();
+    const { x, y, z } = this.center, r = this.radius;
+    target.min.set(x - r, y - r, z - r);
+    target.max.set(x + r, y + r, z + r);
+    return target;
+  }
+  /** Grows this sphere to hold `sphere` too (three.js). */
+  union(sphere: Sphere): this {
+    if (sphere.isEmpty()) return this;
+    if (this.isEmpty()) return this.copy(sphere);
+    if (this.center.equals(sphere.center)) {
+      this.radius = Math.max(this.radius, sphere.radius);
+    } else {
+      const v = new Vector3().subVectors(sphere.center, this.center).setLength(sphere.radius);
+      this.expandByPoint(sphere.center.clone().add(v));
+      this.expandByPoint(sphere.center.clone().sub(v));
+    }
+    return this;
+  }
+  toJSON(): { radius: number; center: [number, number, number] } {
+    return { radius: this.radius, center: this.center.toArray() };
+  }
+  fromJSON(json: { radius: number; center: ArrayLike<number> }): this {
+    this.radius = json.radius;
+    this.center.fromArray(json.center);
+    return this;
+  }
+
   clone(): Sphere {
     return new Sphere(this.center.clone(), this.radius);
   }
