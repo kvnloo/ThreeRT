@@ -68,7 +68,7 @@ fn ninety() -> f32 {
     90.0
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub enum Exposure {
     Manual { ev100: f32 },
@@ -76,7 +76,26 @@ pub enum Exposure {
     Auto { compensation: f32, min_ev100: f32, max_ev100: f32 },
 }
 
-#[derive(Deserialize, Debug, Clone)]
+impl Exposure {
+    /// The EV100 a scene is taken to be shown at before a frame says: the manual value, or auto exposure's brightest.
+    /// The kernel's firefly clamp is relative to it (`NativePreset::firefly_clamp`).
+    pub fn ev_guess(&self) -> f32 {
+        match self {
+            Exposure::Manual { ev100 } => *ev100,
+            Exposure::Auto { max_ev100, .. } => *max_ev100,
+        }
+    }
+
+    /// The exposure a view starts at: manual, 2^-EV100; auto, a first guess (the histogram takes over from frame 1).
+    pub fn start(&self) -> f32 {
+        match self {
+            Exposure::Manual { ev100 } => 2f32.powf(-ev100),
+            Exposure::Auto { compensation, max_ev100, .. } => 2f32.powf(*compensation) / 2f32.powf(*max_ev100),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Dof {
     pub focus_distance: f32,
@@ -84,13 +103,20 @@ pub struct Dof {
     pub sensor_width: f32,
 }
 
-/// Pose of an animated model: clip (by name) sampled at `time` s.
+/// Pose of an animated model: clip (by name) sampled at `time` s, then the nodes the game poses itself (`nodes`).
+/// Without a clip the nodes not named stay as the file has them.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Animation {
+    #[serde(default)]
     pub clip: String,
+    #[serde(default)]
     pub time: f32,
     #[serde(default = "yes")]
     pub r#loop: bool,
+    /// Local transforms of nodes by name, over the clip's: 4 numbers (rotation, quaternion xyzw) or 7 (translation xyz,
+    /// then the rotation). A skeleton posed by the game: aim, look, procedural steps, ragdolls.
+    #[serde(default)]
+    pub nodes: std::collections::BTreeMap<String, Vec<f32>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -159,7 +185,7 @@ pub struct Volumetric {
     pub distance: f32,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Sky {
     /// `dynamic`: the sun moves while the scene runs (time of day). The live view then bakes the sky at
@@ -194,7 +220,7 @@ pub enum Sky {
     Gradient { zenith: Vec3, horizon: Vec3, ground: Vec3, intensity: f32, horizon_exponent: Option<f32>, glow: Option<SkyGlow>, clouds: Option<SkyClouds>, sky_light_intensity: f32 },
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkyGlow {
     pub color: Vec3,
@@ -208,7 +234,7 @@ pub struct SkyGlow {
     pub power: Option<f32>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkyClouds {
     /// 0..1 sky fraction.
@@ -419,7 +445,7 @@ pub struct AutoExposure {
     /// lens attenuation 0.78 is the same log2 luminance: Scene.cpp, r.DefaultFeature.AutoExposure.
     /// ExtendDefaultLuminanceRange, on in every UE 5 project template). UE's legacy range, -8 .. 4, saturates in
     /// daylight (a 3000-nit sky would pin the exposure at EV 6.5); scenes ported from a project without the extended
-    /// range set it explicitly (Kabukichō).
+    /// range set it explicitly.
     pub histogram_log_min: f32,
     pub histogram_log_max: f32,
     /// Eye adaptation speed toward brighter / darker targets, EV per second (UE defaults 3 / 1; real-time only).
@@ -447,6 +473,14 @@ pub struct NativePreset {
 
 fn one() -> f32 {
     1.0
+}
+
+impl NativePreset {
+    /// The kernel's firefly clamp on indirect paths (`Params::misc[0]`): relative to the exposure, so that it is the
+    /// same in every scene.
+    pub fn firefly_clamp(&self, exposure: &Exposure) -> f32 {
+        self.clamp_indirect * 2f32.powf(exposure.ev_guess())
+    }
 }
 
 pub fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {

@@ -18,7 +18,7 @@ struct LiveParams {
     size: vec4<u32>,   // width, height, frame, reset history (1)
     misc: vec4<f32>,   // exposure scale, max history, vignette intensity, bloom on (1) / off (0)
     misc2: vec4<f32>,  // denoise strength, sample clamp (display units at the current exposure), -, samples this frame
-    mode: vec4<u32>,   // view mode (0 lit, 1 base color, 2 world normal, 3 lit no denoise, 4 raw sample, 5 history), -, the scene's lighting is changing (live/mod.rs `live_lighting`), -
+    mode: vec4<u32>,   // view mode (0 lit, 1 base color, 2 world normal, 3 lit no denoise, 4 raw sample, 5 history), display whites a unit of a reconstruction provider's input is (reconstruction.wgsl `rc_radiance_unit`), the scene's lighting is changing (live/mod.rs `live_lighting`), -
     post: vec4<f32>,   // chromatic aberration (UE scene fringe), film grain, bloom threshold (<= 0 off), -
     ae: vec4<f32>,     // auto exposure: low / high fraction, histogram log2 min / max
     ae2: vec4<f32>,    // compensation (2^bias; manual: the exposure), min / max average luminance, mode (1 = auto)
@@ -222,16 +222,24 @@ fn oct_enc(n: vec3<f32>) -> vec2<f32> {
 // The g-buffer (`gbuffer`), 8 bytes: octahedral normal (snorm16 x 2), view depth
 // (0 = sky) and roughness (f16). The surface tests compare depths relatively (2-4 %), far coarser than f16. One fetch
 // per tap for the specular filter and the history tests (it was 16 bytes, and roughness a second 16-byte fetch from the
-// albedo / emission history): those passes are bandwidth-bound.
-struct GB { n: vec3<f32>, depth: f32, rough: f32 };
+// albedo / emission history): those passes are bandwidth-bound. `moves`: the surface is a moving object's and crossed
+// a traced sample this frame (`stemporal`), kept in the roughness's sign (-1 - roughness), so the next frame knows what
+// was in front of what it uncovers was moving (`judge`) and that a lock on it moved with it (`lock_carry`).
+struct GB { n: vec3<f32>, depth: f32, rough: f32, moves: bool };
 
-fn gb_pack(n: vec3<f32>, depth: f32, rough: f32) -> vec2<u32> {
-    return vec2<u32>(pack2x16snorm(oct_enc(n)), pack2x16float(vec2<f32>(min(depth, 6.0e4), rough)));
+// The second word: view depth, roughness and `moves`.
+fn gb_dr(depth: f32, rough: f32, moves: bool) -> u32 {
+    return pack2x16float(vec2<f32>(min(depth, 6.0e4), select(rough, -1.0 - rough, moves)));
+}
+
+fn gb_pack(n: vec3<f32>, depth: f32, rough: f32, moves: bool) -> vec2<u32> {
+    return vec2<u32>(pack2x16snorm(oct_enc(n)), gb_dr(depth, rough, moves));
 }
 
 fn gb_unpack(g: vec2<u32>) -> GB {
     let dr = unpack2x16float(g.y);
-    return GB(oct_dec(g.x), dr.x, dr.y);
+    let moves = dr.y < -0.5;
+    return GB(oct_dec(g.x), dr.x, select(dr.y, -1.0 - dr.y, moves), moves);
 }
 
 const RESOLVE_N: u32 = 8u;
@@ -792,6 +800,10 @@ fn spec_history(pp: vec3<f32>, n: vec3<f32>, t: f32, rough: f32, virt: bool) -> 
 
 // The most a specular history may trail behind its reflection, output pixels (`stemporal`).
 const SPEC_TRAIL: f32 = 2.0;
+// How far from this frame's neighbourhood mean a specular history may lie, in deviations of the neighbourhood
+// (`stemporal`'s variance clipping).
+const SPEC_CLIP: f32 = 2.0;
+const SPEC_CLIP_REL: f32 = 0.5;
 
 // Specular temporal accumulation on the traced grid (UE 5.8 Lumen reflections, LumenReflectionDenoiserTemporal.usf): the
 // surface history and the reflection-hit one (reprojected through the mirror image of what it shows); the one closer to
@@ -819,8 +831,9 @@ fn stemporal(@builtin(global_invocation_id) gid: vec3<u32>) {
         depth = dot(p - L.cur.pos.xyz, L.cur.fwd.xyz);
     }
     let cur = sample_specular(q);
-    // This frame's neighbourhood mean (same surface), in YCoCg.
+    // This frame's neighbourhood mean and spread (same surface), in YCoCg.
     var m1 = vec3<f32>(0.0);
+    var m2 = vec3<f32>(0.0);
     var mn = 0.0;
     for (var k = 0; k < 9; k++) {
         let qx = i32(gid.x) + k % 3 - 1;
@@ -835,10 +848,13 @@ fn stemporal(@builtin(global_invocation_id) gid: vec3<u32>) {
             ok = s.color.w == 0.0;
         }
         if (!ok) { continue; }
-        m1 += ycocg(sample_specular(j));
+        let yq = ycocg(sample_specular(j));
+        m1 += yq;
+        m2 += yq * yq;
         mn += 1.0;
     }
     let smean = m1 / max(mn, 1.0);
+    let ssd = sqrt(max(m2 / max(mn, 1.0) - smean * smean, vec3<f32>(0.0)));
     // Reflection hit distance for the mirror-image reprojection: on near mirrors the resolved one (pass `refl`).
     let st = select(px.spec.w, refl_res[q].w, refl_res[q].w > 0.0 && rough < NEAR_MIRROR);
     let mv = motion_in[q];
@@ -874,7 +890,18 @@ fn stemporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     var surf = select(0.0, 0.8, length(smean - yv) > length(smean - ys) + 0.01 / exposure_scale());
     surf = select(surf, 1.0, hv.w <= 0.0);
     surf = select(surf, 0.0, hs.w <= 0.0 && hv.w > 0.0);
-    let hy = mix(yv, ys, surf);
+    // The history held within SPEC_CLIP deviations of this frame's neighbourhood (variance clipping, as Lumen's
+    // reflection temporal clamps its history): what a still surface reflects can move while the surface and the camera
+    // hold still (a light carried past a polished floor), and nothing else tells its history so. Unclipped, the
+    // reflection of a thrown orb stayed on the floor along its whole path for the length of the history.
+    // While the scene's lighting changes (`mode.z`: something moved, a light switched), as the diffuse anti-lag: a
+    // settled scene has nothing to find, and clipping it cuts what the history averaged out of one sample a pixel.
+    // (Plus SPEC_CLIP_REL of the neighbourhood's luminance: one sample a pixel is heavy-tailed, most of the nine are
+    // dark next to a rare bright one, and a deviation's box alone pulled a right history down and let the next bright
+    // sample flash, a square at a time. What moved past is many times brighter than what is left.)
+    let slack = SPEC_CLIP * ssd + vec3<f32>(SPEC_CLIP_REL * abs(smean.x) + 0.002 / exposure_scale(), 0.0, 0.0);
+    var hy = mix(yv, ys, surf);
+    if (L.mode.z != 0u && mn >= 3.0) { hy = clamp(hy, smean - slack, smean + slack); }
     // The history's length is the pixel's own (until 2026-11-13 every pixel's was held to 2 .. 12 frames by roughness
     // while the camera moved or turned at all, and to 4 for 8 frames after it translated): HIST_MOVING at a pixel a
     // frame, as the diffuse; and no longer than keeps its trail behind the reflection (frames x parallax) within
@@ -892,7 +919,16 @@ fn stemporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     s_out = select(max(s_out, vec3<f32>(0.0)), vec3<f32>(0.0), non_finite(s_out));
     spec_hist[this_half(q)] = vec4<f32>(s_out, count_s);
     spec_store(0u, q, vec4<f32>(s_out, count_s));
-    gbuffer[this_half(q)] = gb_pack(n, depth, rough);
+    // `moves`: a moving object's surface that crossed a traced sample this frame. One that moved less (a leaf in the
+    // wind, a walker far away) has not left its place among the nine: what it shows and hides is the jitter's, as at
+    // a still edge, and the rules for what a moving object uncovers made every such edge start again each frame.
+    var swept = false;
+    if (mv.w > 0.5 && t > 0.0) {
+        let now = prev_pixel(p + mv.xyz);
+        let still = prev_pixel(p);
+        swept = now.z <= 0.0 || still.z <= 0.0 || length(now.xy - still.xy) >= f32(L.size.x) / f32(max(L.isz.z, 1u));
+    }
+    gbuffer[this_half(q)] = gb_pack(n, depth, rough, swept);
 }
 
 // The specular filter (`spec_filter`'s kernel) on the traced grid: three passes over `spec_pp`, slot 0 -> 1 -> 0 -> 1.
@@ -967,7 +1003,19 @@ fn compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     let q = gid.y * iw + gid.x;
     let px = sample_px[q];
     let t = px.color.w;
-    let c = (fa[q].rgb * max(px.albedo.rgb, vec3<f32>(0.02)) + spec_load(1u, q).rgb) * medium_tr(q) + sample_emission(q) + direct_in[q].rgb;
+    var lighting: vec3<f32>;
+    if (L.mode.w == 1u) {
+        // The trace kept the whole specular path, including deferred-cache lighting. No irradiance
+        // demodulation or temporal/spatial filter here. Keep the pre-reconstruction signals for snapshots.
+        var spec = finite_or_zero(px.spec.rgb / L.misc2.w);
+        let ceiling = sample_clamp();
+        spec *= min(1.0, ceiling / max(lum(spec), 1e-8));
+        spec_store(1u, q, vec4<f32>(spec, 1.0));
+        lighting = sample_diffuse(q) + spec;
+    } else {
+        lighting = fa[q].rgb * max(px.albedo.rgb, vec3<f32>(0.02)) + spec_load(1u, q).rgb;
+    }
+    let c = lighting * medium_tr(q) + sample_emission(q) + direct_in[q].rgb;
     let sp = sample_pos(i32(gid.x), i32(gid.y));
     let dir = ray_dir(L.cur, sp.x, sp.y);
     var p = L.cur.pos.xyz + dir * 1.0e6;
@@ -1016,6 +1064,19 @@ fn track(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let still = 1.0 - clamp(length(vel) / UP_SPEED, 0.0, 1.0);
+    // The light here changed (a shadow's edge passed, a lamp's pool moved, a light switched): the composed sample
+    // jumped by more than LIGHT_CHANGE of itself since the previous frame at the same surface point, and by far more
+    // than it flickers under the jitter (`Flicker`). Its history is of the light before: `upscale` holds it to this
+    // frame's samples. Without it, a shadow swept over a still floor (a character running in the sun) left a
+    // line of its edge a frame, fading over UP_SAMPLES frames: the floor stands still, so nothing clamped it, and a
+    // line a pixel wide widens its own range. While the lighting is live (`mode.z`: something moved, as anti-lag).
+    // The flicker's frame count starts again there (`n`): until it is LIGHT_SETTLE again, `upscale` holds the history
+    // around to this frame's samples (the line of an edge outlives the frame that edge passed).
+    var changed = false;
+    if (L.mode.z != 0u && f.n >= 2.0) {
+        let jump = abs(now - f.last.x) / max(max(now, f.last.x), 1.0e-4 / exposure_scale());
+        changed = jump > LIGHT_CHANGE && jump > LIGHT_FLICKER * f.sd;
+    }
     var sd = select(1.0, f.sd, f.n >= 1.0);
     if (f.n >= 2.0) {
         let bend = min(abs(now - 2.0 * f.last.x + f.last.y) / max(max(now, max(f.last.x, f.last.y)), 1e-9), UP_ONSET * max(f.sd, 0.01));
@@ -1043,7 +1104,9 @@ fn track(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fw = atomicLoad(&lock_fwd[q]);
     atomicStore(&lock_fwd[q], 0u);
     var was = Carried(0.0, 0.0, 0.0, vec2<f32>(0.0), false);
-    if (fw != 0u && L.size.w == 0u && ps.x > 0) { was = carry((fw & 0x1ffffffu) - 1u); }
+    // (Not onto a moving object's surface: the thing locked there a frame ago has moved, likely with the object that
+    // started moving under it.)
+    if (fw != 0u && L.size.w == 0u && ps.x > 0 && !gb_unpack(gbuffer[this_half(q)]).moves) { was = carry((fw & 0x1ffffffu) - 1u); }
     var life = max(was.life - 1.0 / jitter_phases(), 0.0);
     var lz = was.depth;
     var at = clamp(was.at - vec2<f32>(f32(gid.x), f32(gid.y)), vec2<f32>(0.0), vec2<f32>(0.999));
@@ -1053,7 +1116,7 @@ fn track(@builtin(global_invocation_id) gid: vec3<u32>) {
         at = L.jit.xy;
     }
     life *= 1.0 - reactive;
-    up_state[this_half(q)] = vec4<u32>(pack2x16float(vec2<f32>(now, select(now, f.last.x, f.n >= 1.0))), pack2x16float(vec2<f32>(sd * still, min(max(f.n + still, 1.0), 9.0))), pack2x16float(vec2<f32>(life, min(lz, 6.0e4))), pack2x16float(at));
+    up_state[this_half(q)] = vec4<u32>(pack2x16float(vec2<f32>(now, select(now, f.last.x, f.n >= 1.0))), pack2x16float(vec2<f32>(sd * still, select(min(max(f.n + still, 1.0), 9.0), 1.0, changed))), pack2x16float(vec2<f32>(life, min(lz, 6.0e4))), pack2x16float(at));
 }
 
 // The upscaler works on linear radiance and its means are plain ones. (Weighted by 1 / (1 + luminance x exposure), so
@@ -1073,6 +1136,12 @@ const UP_REJECT: f32 = 0.25;
 const UP_REACTIVE: f32 = 4.0;
 // The share of a pixel a medium that changes with time takes (`medium_share`) from which the pixel is as reactive.
 const UP_MEDIUM: f32 = 0.25;
+// How much a composed sample's luminance changes from the previous frame, as a share of it, and in deviations of its
+// own flicker, before the light there counts as changed (`track`), and the flicker frame count from which it counts
+// as settled again (`upscale`).
+const LIGHT_CHANGE: f32 = 0.35;
+const LIGHT_FLICKER: f32 = 2.5;
+const LIGHT_SETTLE: f32 = 6.0;
 // How far outside the range of the history's pixels around it a point sample may lie (`judge`): this many deviations
 // of the traced sample's own flicker (`Flicker`). Of 1, 2, 3 (measured while the deviation was still an amount of
 // light): Bistro held still changes 0.49, 0.42, 0.38 from frame to frame, and Tokyo's skyline at dusk is furthest from
@@ -1198,8 +1267,12 @@ fn lock_carry(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.y * L.isz.z + gid.x;
     let c = carry(p);
     let g = gb_unpack(gbuffer[last_half(p)]);
+    // (A lock on a moving object's surface went with it: the two cameras cannot take it there, and left where it was
+    // it kept the object's light in the history over whatever it uncovered, a copy of its screen's text a frame. It
+    // is found again where a sample next shows the thing.)
+    if (g.moves) { return; }
     if (c.life > 0.0 && c.was > 0.0 && (g.depth <= 0.0 || c.was < g.depth)) {
-        gbuffer[last_half(p)].y = pack2x16float(vec2<f32>(min(c.was, 6.0e4), g.rough));
+        gbuffer[last_half(p)].y = gb_dr(c.was, g.rough, g.moves);
     }
     if (c.life * jitter_phases() <= 1.0 || !c.ahead) { return; }
     let q = vec2<i32>(floor(c.at));
@@ -1229,11 +1302,11 @@ fn flicker_at(q: u32) -> Flicker {
 // history there), the motion its output pixels reproject by: the surface nearest the camera among the nine samples
 // around (the sky the farthest), since an edge moves with what is in front of it; and whether its history is of
 // something that is gone.
-struct Judged { d: vec3<f32>, lum: f32, vel: vec2<f32>, gone: bool };
+struct Judged { d: vec3<f32>, lum: f32, vel: vec2<f32>, gone: bool, moved: bool };
 fn judged_at(q: u32) -> Judged {
     let v = up_state[judged_slot(q)];
     let b = unpack2x16float(v.y);
-    return Judged(vec3<f32>(unpack2x16float(v.x), b.x), b.y, unpack2x16float(v.z), v.w != 0u);
+    return Judged(vec3<f32>(unpack2x16float(v.x), b.x), b.y, unpack2x16float(v.z), v.w != 0u, v.w == 2u);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1269,6 +1342,7 @@ fn judge(@builtin(global_invocation_id) gid: vec3<u32>) {
     var d = vec3<f32>(0.0);
     var l = -1.0;
     var gone = false;
+    var gone_moving = false;
     if (L.size.w == 0u) {
         let up = vec2<f32>(f32(L.size.x), f32(L.size.y)) / vec2<f32>(f32(iw), f32(ih));
         // Where this sample's point was a frame ago (output pixels; a pixel's centre at + 0.5).
@@ -1311,15 +1385,27 @@ fn judge(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 let pc = vec2<i32>(floor(was * vec2<f32>(ps) / vec2<f32>(f32(L.size.x), f32(L.size.y))));
                 var was_near = 1.0e30;
+                var was_moving = false;
                 for (var k = 0; k < 9; k++) {
                     let x = pc.x + k % 3 - 1;
                     let y = pc.y + k / 3 - 1;
                     if (x < 0 || y < 0 || x >= ps.x || y >= ps.y) { continue; }
-                    let zq = gb_unpack(gbuffer[last_half(u32(y * ps.x + x))]).depth;
-                    was_near = min(was_near, select(1.0e29, zq, zq > 0.0));
+                    let gq = gb_unpack(gbuffer[last_half(u32(y * ps.x + x))]);
+                    let zq = select(1.0e29, gq.depth, gq.depth > 0.0);
+                    if (zq < was_near) {
+                        was_near = zq;
+                        was_moving = gq.moves;
+                    }
                 }
                 let now_near = select(near * zr, 1.0e29, near >= 1.0e29);
-                if (was_near < 1.0e29 && now_near > was_near * (1.0 + UP_GONE) + 0.01) {
+                // Uncovered by something moving: this sample's own surface (not the nearest of the nine) stands still
+                // and lies behind the moving object's surface that was nearest here. The band behind a moving edge
+                // takes the edge's motion (the nearest of the nine is still the object), so its history is the
+                // object's, and the clamp in motion keeps it (the object's colour is among the nine): each frame
+                // left a line of it where the edge had been.
+                let own = select(1.0e29, sample_vel[q].z * zr, sample_vel[q].z > 0.0);
+                let uncovered = was_moving && motion_in[q].w <= 0.5 && was_near < 1.0e29 && own > was_near * (1.0 + UP_GONE) + 0.01;
+                if (was_near < 1.0e29 && (uncovered || now_near > was_near * (1.0 + UP_GONE) + 0.01)) {
                     var clo = vec3<f32>(1.0e30);
                     var chi = vec3<f32>(-1.0e30);
                     // (And no thin feature's lock alive among the nine: a lamp the samples miss this frame is not gone.
@@ -1336,7 +1422,12 @@ fn judge(@builtin(global_invocation_id) gid: vec3<u32>) {
                         alive = max(alive, unpack2x16float(up_state[this_half(j)].z).x);
                     }
                     let hm = hsum / hn;
-                    gone = alive <= 0.0 && lum(abs(hm - clamp(hm, clo, chi))) > UP_STALE * lum(hm) + 0.01 / exposure_scale();
+                    // (What was in front and is gone was a moving object's surface: it went, the jitter did not take it
+                    // out of the nine. No colour asked: a rim half the object's light, half what it uncovers, lies
+                    // within the noisy range of the samples of what it uncovers, and stayed a line where the object's
+                    // edge was, one a frame, fading over UP_SAMPLES frames.)
+                    gone = alive <= 0.0 && (was_moving || lum(abs(hm - clamp(hm, clo, chi))) > UP_STALE * lum(hm) + 0.01 / exposure_scale());
+                    gone_moving = was_moving;
                 }
             }
         }
@@ -1344,7 +1435,8 @@ fn judge(@builtin(global_invocation_id) gid: vec3<u32>) {
     // A locked sample's distance from the history's range is no finding (a lamp finer than a pixel lies above it
     // whenever a sample hits it).
     d *= 1.0 - locked(q);
-    up_state[judged_slot(q)] = vec4<u32>(pack2x16float(d.xy), pack2x16float(vec2<f32>(d.z, l)), pack2x16float(vel), u32(gone));
+    // (w: 1 gone, 2 gone with what was in front moving.)
+    up_state[judged_slot(q)] = vec4<u32>(pack2x16float(d.xy), pack2x16float(vec2<f32>(d.z, l)), pack2x16float(vel), select(u32(gone), 2u, gone && gone_moving));
 }
 
 // `reject`: per traced pixel, into `spec_pp`'s slot 0 (free once the specular filter is done; f16): the correction
@@ -1396,10 +1488,14 @@ fn reject(@builtin(global_invocation_id) gid: vec3<u32>) {
         let found = wsum / wall;
         drop = clamp(abs(mean) * keep / (UP_REJECT * level / wsum + 0.01 / e), 0.0, 1.0) * found + (1.0 - found);
     }
-    // (Its history is of something that is gone from in front of this: all of it goes.)
-    if (judged_at(q).gone) {
+    // (Its history is of something that is gone from in front of this: all of it goes; and where what went was moving,
+    // in every output pixel this sample's verdict reaches, `upscale`: drop 2 says so. Not for a still scene's gone: the
+    // jitter alone finds one at an edge now and then, and dropped whole every time, a held Bistro flickered half as
+    // much again, Kabukichō twice.)
+    let jq = judged_at(q);
+    if (jq.gone) {
         delta = vec3<f32>(0.0);
-        drop = 1.0;
+        drop = select(1.0, 2.0, jq.moved);
     }
     spec_store(0u, q, vec4<f32>(clamp(delta, vec3<f32>(-6.0e4), vec3<f32>(6.0e4)), drop));
 }
@@ -1457,6 +1553,7 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (A lock spares the output pixels at the thing it is for: where in its traced pixel that is, `Lock`; full within
     // LOCK_REACH output pixels, none half a pixel further.)
     var lock = 0.0;
+    var shaded = 0.0;
     let centre = vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5;
     for (var k = 0; k < 9; k++) {
         let qx = bc.x + k % 3 - 1;
@@ -1472,6 +1569,11 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
         let j = u32(qy * iw + qx);
         let at = (vec2<f32>(f32(qx), f32(qy)) + unpack2x16float(up_state[this_half(j)].w)) * up;
         lock = max(lock, locked(j) * clamp(LOCK_REACH + 0.5 - length(at - centre), 0.0, 1.0));
+        // (A sample whose light changed lately, `track`, near enough to count: fully the frame it changed, less as its
+        // flicker's count grows back to LIGHT_SETTLE.)
+        if (L.mode.z != 0u && wt > 0.02) {
+            shaded = max(shaded, clamp((LIGHT_SETTLE - unpack2x16float(up_state[this_half(j)].y).y) / (LIGHT_SETTLE - 1.0), 0.0, 1.0));
+        }
     }
     let cur = select(fb[u32(bc.y * iw + bc.x)].rgb, sum / wsum, wsum > 1e-9);
     let conf = min(wsum, 1.0);
@@ -1480,15 +1582,21 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ft = rc - floor(rc);
     var verdict = vec4<f32>(0.0);
     var vsum = 0.0;
+    var gone_near = false;
     for (var k = 0; k < 4; k++) {
         let qx = f0.x + (k & 1);
         let qy = f0.y + (k >> 1u);
         if (qx < 0 || qy < 0 || qx >= iw || qy >= ih) { continue; }
         let bw = select(1.0 - ft.x, ft.x, (k & 1) == 1) * select(1.0 - ft.y, ft.y, (k >> 1u) == 1);
-        verdict += spec_load(0u, u32(qy * iw + qx)) * bw;
+        let v = spec_load(0u, u32(qy * iw + qx));
+        // (A history of something gone, `reject`'s drop 2, goes wherever its verdict reaches: blended with its
+        // neighbours' it left part of a moving object's edge where the edge had been, a dashed line a frame.)
+        gone_near = gone_near || (v.w > 1.5 && bw > 0.0);
+        verdict += vec4<f32>(v.xyz, min(v.w, 1.0)) * bw;
         vsum += bw;
     }
     verdict = select(vec4<f32>(0.0, 0.0, 0.0, 1.0), verdict / vsum, vsum > 1e-4);
+    if (gone_near) { verdict = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let vel = judged_at(u32(bc.y * iw + bc.x)).vel;
     var hist = vec4<f32>(0.0);
     if (L.size.w == 0u) {
@@ -1511,7 +1619,8 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let kept = hist.w * (1.0 - verdict.w);
     if (kept > 0.0) {
         var hc = max(hist.rgb + verdict.xyz, vec3<f32>(0.0));
-        hc = mix(hc, clamp(hc, xlo, xhi), moving * (1.0 - lock));
+        // (And where the light changed among the samples around: the history is of the light before.)
+        hc = mix(hc, clamp(hc, xlo, xhi), max(moving, shaded) * (1.0 - lock));
         let most = min(mix(UP_SAMPLES, UP_MOVING, moving), mix(UP_SAMPLES, UP_REACTIVE, clamp(sample_vel[u32(bc.y * iw + bc.x)].w, 0.0, 1.0)));
         count = min(kept + conf, most);
         let a = clamp(conf / max(count, 1e-4), 0.0, 1.0);

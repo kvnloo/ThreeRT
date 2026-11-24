@@ -12,52 +12,73 @@ pub(super) struct LoadedScene {
     pub(super) tri_nodes: Vec<(String, u32, u32)>,
     /// Flattened instances of instanced objects: (first, end, instance index), for picking.
     pub(super) tri_instances: Vec<(u32, u32, u32)>,
+    /// (A mesh the GPU skins has its build's pose here: `LiveCore::mesh_tris` has it as it is now.)
     pub(super) pool_tris: Vec<[glam::Vec3A; 3]>,
+    /// The vertices that move, the first and how many (`indexed::Indexed::dynamic`); by skin source, the model's
+    /// vertices its meshes are skinned from and their triangles' indices (`Indexed::skins`).
+    pub(super) dynamic_verts: (u32, u32),
+    pub(super) skins: Vec<(Vec<crate::skin::SkinCorner>, Vec<[u32; 3]>)>,
+    /// Software traversal with units: the shape of each skin source's meshes' trees (`scene::Scene::skin_trees`): a
+    /// new pose takes a tree's boxes again from its vertices as posed (live/edits.rs `repose_skinned`).
+    pub(super) skin_trees: Vec<Vec<crate::bvh::GpuNode>>,
+    /// Software traversal: each pool triangle's section and its index in it (a unit's tree orders its mesh's
+    /// triangles; live/edits.rs `mesh_places`). Empty under hardware traversal, where they lie by section.
+    pub(super) pool_place: Vec<[u32; 2]>,
     pub(super) meshes: Vec<scene::InstMesh>,
     pub(super) instances: Vec<scene::Instance>,
+    /// The meshes' sections and the instances' rows as the GPU has them (`scene::Scene::sections`, `rows`); what an
+    /// edit places takes its rows from the room (`EditState::take_rows`).
+    pub(super) sections: Vec<scene::Section>,
+    pub(super) rows: Vec<scene::Row>,
     /// The instances' kernel records as uploaded (movable ones are rewritten when they move), then the procedural
     /// objects' (from `proc_first`).
     pub(super) gpu_instances: Vec<scene::GpuInstance>,
-    /// Procedural geometry (moves, picking), by node in `proc_of`; its records start at `proc_first`.
+    /// Procedural geometry (moves, picking): the record `proc_first` + j is `procs[j]`'s, as record i is
+    /// `instances[i]`'s. Both hold what edits place too, at its record (hidden fillers at the records between).
     pub(super) procs: Vec<scene::ProcObject>,
-    pub(super) proc_of: std::collections::HashMap<u32, usize>,
     pub(super) proc_first: usize,
+    /// Some object's move is an instance's transform (`Retained::moves_instances`: kept where the proxies change,
+    /// here and in a geometry edit): the frame's kernel then writes motion vectors.
+    pub(super) moving_instances: bool,
     /// The scene has instanced meshes or procedural geometry (the raster experiment draws only flattened triangles:
     /// primary visibility is traced).
     pub(super) instanced: bool,
-    /// Kernel features of the instanced meshes (gpu::instance_features), which edits cannot change.
+    /// Kernel features of the scene's structure (gpu::instance_features), which edits cannot change.
     pub(super) instance_features: u32,
     pub(super) name: String,
     pub(super) triangles: usize,
     pub(super) up: gpu::Uploaded,
     pub(super) base: gpu::Params,
-    /// The live passes' bind groups, a pass each (`Targets::bind_groups`).
-    pub(super) bgs: Vec<wgpu::BindGroup>,
-    pub(super) exposure: f32,
-    pub(super) exposure_settings: ExposureSettings,
-    pub(super) tan_half_fov: f32,
-    pub(super) scene_camera: Camera,
-    /// The camera's depth of field (UE: off unless it sets a focus distance).
-    pub(super) dof: Option<crate::desc::Dof>,
     /// GPU table copies that parameter edits rewrite in place (`commit`).
     pub(super) tables: tables::Tables,
-    /// CPU copy of the dynamic triangles (posed models: the tail of the GPU triangle order from `dynamic_first`):
-    /// vertices (kernel layout), shading attributes, BLAS vertices.
+    /// CPU copy of the dynamic triangles (posed models: the tail of the GPU triangle order, from its first): rows
+    /// (v0, e1, e2), shading attributes, corners (a triangle that is not finite: at the origin). Their vertices on
+    /// the GPU are made from these (`upload_dynamic`).
     pub(super) dynamic: (usize, Vec<[f32; 4]>, Vec<scene::GpuTriAttr>, Vec<[f32; 3]>),
-    /// Kernel feature inputs edits cannot change: textures, material functions, traversal groups.
+    /// Kernel feature inputs of the scene as a whole: whether it has textures, whether it has material functions,
+    /// its traversal groups (edits cannot change the groups).
     pub(super) fixed_features: (bool, bool, [usize; crate::GROUPS]),
+    /// The scene's material functions (name, code, helpers), each at its number (`Retained::shaders`): the build's
+    /// by name, one that came while the scene runs after them (`set_functions`).
+    pub(super) shaders: Vec<(String, String, String)>,
+    /// The materials of translucent particles' triangles: their functions are the translucency pass's.
+    pub(super) translucent_mats: Vec<u32>,
+    /// The functions of those materials the scene's kernel was made with (`LiveCore::remake_functions`).
+    pub(super) translucent_used: std::collections::BTreeSet<i32>,
+    /// The scene's volume functions (name, code, helpers), each at its number: the build's by name, one that came
+    /// while the scene runs after them (`set_volume_functions`).
+    pub(super) volume_fns: Vec<(String, String, String)>,
     /// Where in-place geometry edits write next (`edit_geometry`); a rebuild starts it afresh.
     pub(super) edit: EditState,
-    /// The atmosphere's sky once its sun has moved in place (`move_sun` starts it), and what it bakes with: the
-    /// environment map's size, the viewer's altitude and the environment's light-sampling floor, as the load had them.
-    pub(super) sky: Option<DynamicSky>,
     /// Power edits' emitter rebuilds on a worker (`EmitterWorker`), for scenes with many emitters.
     pub(super) emit: Option<EmitterWorker>,
-    pub(super) sky_inputs: ((u32, u32), f32, f32),
     /// For materials that start emitting (`add_material_emitters`): their flattened static triangles' runs (`prepare`)
     /// and the flattened triangles' build indices in traversal order (positions in `tris`).
     pub(super) mat_runs: std::collections::HashMap<u32, Vec<[u32; 3]>>,
     pub(super) tri_order: Vec<u32>,
+    /// The light list's path codes as the last `write_emitters` wrote them (`GpuEmitterTri::code`, by emitter): it
+    /// writes only those that changed since. Empty after a load or a rebuild (the next write sends them all).
+    pub(super) codes_sent: Vec<u32>,
 }
 
 /// Cores the sky's worker thread bakes with: the rest stay with the frame (scripts, uploads, the GPU's driver).
@@ -73,12 +94,10 @@ pub(super) struct DynamicSky {
     /// (sun direction, sun illuminance above the atmosphere, cloud cover)
     pub(super) ask: mpsc::Sender<(glam::Vec3, glam::Vec3, f32)>,
     pub(super) done: mpsc::Receiver<(gpu::EnvMap, Vec<f32>, f32)>,
-    /// The brightest sky texel from which the environment is light-sampled (`Prepared::env_nee_floor`).
-    pub(super) env_nee_floor: f32,
 }
 
 impl DynamicSky {
-    pub(super) fn new(world: &World, (w, h): (u32, u32), altitude: f32, env_nee_floor: f32) -> Option<DynamicSky> {
+    pub(super) fn new(world: &World, (w, h): (u32, u32), altitude: f32) -> Option<DynamicSky> {
         let crate::desc::Sky::Atmosphere { rayleigh_scale, mie_scale, mie_anisotropy, ground_albedo, glow, horizon_glow, sun: Some(_), .. } = &world.environment.sky else {
             return None;
         };
@@ -117,7 +136,7 @@ impl DynamicSky {
                 }
             })
             .ok()?;
-        Some(DynamicSky { atm, ask, done, env_nee_floor })
+        Some(DynamicSky { atm, ask, done })
     }
 }
 
@@ -172,19 +191,22 @@ impl EmitterWorker {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn new(e: &tables::Tables, device: &wgpu::Device) -> Option<EmitterWorker> {
-        let changing = e.light_tree.as_ref().is_some_and(|t| t.dynamic.is_some() || t.moving_count > 0);
+        // (Nor where an instance's emitters change in place, an instanced object's copies: the worker weighs its own
+        // copy of the list.)
+        let changing = e.light_tree.as_ref().is_some_and(|t| t.dynamic.is_some() || t.moving_count > 0) || e.emitter_tris.iter().any(|t| t.moves && t.inst != crate::NO_INST);
         if e.emitter_tris.len() < ASYNC_EMITTERS || changing {
             return None;
         }
         let device = device.clone();
         let (tris, mut tree, stride) = (e.emitter_tris.clone(), e.light_tree.clone(), e.stride);
+        let order = crate::emitter_order(&tris, tree.as_ref());
         let (ask, asked) = mpsc::channel::<EmitterJob>();
         let (tx, done) = mpsc::channel();
         std::thread::Builder::new()
             .name("emitters".into())
             .spawn(move || {
                 while let Ok(j) = asked.recv() {
-                    let (em, total, power) = crate::emitter_cdf(&tris, &j.materials, &j.objects, stride, j.lod, j.cull);
+                    let (em, total, power) = crate::emitter_cdf(&tris, &order, &j.materials, &j.objects, stride, j.lod, j.cull);
                     let node_powers = tree.as_mut().map_or(vec![], |t| {
                         let w: Vec<f32> = t.order.iter().map(|&i| crate::emitter_power(&tris[i as usize], &j.materials, &j.objects, stride)).collect();
                         t.refit(&|k| w[k]);
@@ -211,7 +233,7 @@ impl EmitterWorker {
     }
 }
 
-pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &Path, w: u32, h: u32, targets: &Targets, passes: &Passes) -> Result<(LoadedScene, crate::desc::PostPreset)> {
+pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &Path, w: u32, h: u32, targets: &Targets) -> Result<(LoadedScene, ViewState, Environment)> {
     let t0 = Instant::now();
     let mut sc = scene::build(world, assets, presets, None)?;
     sc.width = w;
@@ -224,40 +246,58 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
     let mut tables = tables::Tables::new(&sc, std::mem::take(&mut prep.emitter_tris), prep.light_tree.take());
     // (THREERT_EDIT_REBUILD=1: every edit rebuilds, a material that starts emitting too: the A/B.)
     tables.emit_in_place = std::env::var("THREERT_EDIT_REBUILD").map_or(true, |v| v != "1");
-    tables.fixed_mats = std::mem::take(&mut prep.fixed_mats);
+    tables.static_mats = prep.mat_runs.keys().copied().collect();
+    tables.moving_mats = std::mem::take(&mut prep.moving_mats);
     let emit = EmitterWorker::new(&tables, &g.device);
     tables.defer_powers = emit.is_some();
     let (mat_runs, tri_order) = (std::mem::take(&mut prep.mat_runs), std::mem::take(&mut prep.tri_order));
     let fixed_features = (!sc.textures.is_empty(), !sc.shaders.is_empty(), prep.groups);
+    let shaders = sc.shaders.clone();
+    let volume_fns = sc.volume_fns.clone();
+    let mut translucent_mats: Vec<u32> = sc.trans_attrs.iter().map(|a| a.uv[3].to_bits()).collect();
+    translucent_mats.sort_unstable();
+    translucent_mats.dedup();
+    let translucent_used = translucent_mats.iter().filter_map(|&m| sc.materials.get(m as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
     // (The light tree is the tables' by now: its nodes from there.)
-    let up = g.upload(&sc, w, h, &prep.tri_verts, prep.groups, bytemuck::cast_slice(&prep.nodes), &prep.emitters, crate::ltree::nodes_of(tables.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, &mut timings)?;
+    let up = g.upload(&sc, &targets.accum, prep.groups, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(tables.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, &mut timings)?;
     let _ = g.pipeline(&up.kernel, true); // compile the scene's kernel variant now, not in the first frame
-    let sky_inputs = ((prep.env.width, prep.env.height), sc.camera.position.y.max(0.0), prep.env_nee_floor);
+    if !g.merged {
+        let _ = g.kernel_pass(&up.kernel, "finish");
+    }
+    // (And the media passes where the scene has a medium, shown or hidden: the frame that first shows one, an idle
+    // fireball's first fire, would otherwise wait for them.)
+    if up.kernel.features & gpu::F_MEDIA != 0 {
+        let _ = g.kernel_pass(&up.kernel, "media_train");
+        let _ = g.kernel_pass(&up.kernel, "media_composite");
+    }
+    let env = Environment {
+        sky: SkyState { map: (prep.env.width, prep.env.height), altitude: sc.camera.position.y.max(0.0), floor: prep.env_nee_floor, cover: sc.environment.cloud_cover, worker: None },
+        settings: sc.environment.clone(),
+    };
+    let view = ViewState::new(&sc.camera, Arc::new(sc.preset.clone()));
     let mut base = prep.params;
-    // The live viewport resamples fewer light-tree candidates at camera hits than offline renders (ltree.rs).
+    // The live view's own count of light-tree candidates at camera hits (ltree.rs `RIS_LIVE`).
     if base.ltree[3] > 0.5 {
         base.ltree[3] = crate::ltree::live_candidates() as f32;
     }
     base.ltile[3] = super::LIST_CANDIDATES;
     base.cam_fwd[3] = w as f32 / h as f32;
-    let bgs = targets.bind_groups(&g.device, passes, &up.accum);
-    let exposure_settings = ExposureSettings::new(&sc.camera.exposure, &sc.preset.post);
-    // Manual: 2^-EV100. Auto: a first guess for the firefly clamp (the GPU histogram takes over from frame 1).
-    let exposure = match &sc.camera.exposure {
-        crate::desc::Exposure::Manual { ev100 } => 2f32.powf(-ev100),
-        crate::desc::Exposure::Auto { compensation, max_ev100, .. } => 2f32.powf(*compensation) / 2f32.powf(*max_ev100),
-    };
-    let c = &sc.camera;
-    let scene_camera = Camera { pos: c.position, fwd: c.forward, up: c.up, right: c.right, tan_half_fov: c.tan_half_fov };
     let (tris, tri_nodes, tri_instances) = (std::mem::take(&mut sc.tris), std::mem::take(&mut sc.tri_nodes), std::mem::take(&mut sc.tri_instances));
     let instanced = !sc.gpu_instances.is_empty() || !sc.procs.is_empty();
     let instance_features = gpu::instance_features(&sc);
+    let pool_place: Vec<[u32; 2]> = if up.units.is_some() { sc.pool_attrs.iter().map(|a| [a.uv[3].to_bits(), a.x[3].to_bits()]).collect() } else { vec![] };
     let (pool_tris, meshes, instances) = (std::mem::take(&mut sc.pool_tris), std::mem::take(&mut sc.meshes), std::mem::take(&mut sc.instances));
+    let skin_trees = if up.units.is_some() { std::mem::take(&mut sc.skin_trees) } else { vec![] };
+    // (The vertices and the indices themselves are the GPU's now.)
+    let ix = std::mem::take(&mut sc.indexed);
+    let (vertices, dynamic_verts, skins) = (ix.vertices.len(), ix.dynamic, ix.skins);
+    let (sections, rows) = (std::mem::take(&mut sc.sections), std::mem::take(&mut sc.rows));
     let mut gpu_instances = std::mem::take(&mut sc.gpu_instances);
     let proc_first = gpu_instances.len();
     gpu_instances.extend_from_slice(&sc.proc_records);
     let procs = std::mem::take(&mut sc.procs);
-    let proc_of = procs.iter().enumerate().filter(|(_, p)| p.sub.is_none()).map(|(j, p)| (p.node, j)).collect();
+    // (A proxy's index in `procs` is the build's: nothing between the build and here may take one out.)
+    assert!(tables.retained.proxies.iter().all(|(id, p)| !matches!(p.draw, scene::Draw::Procedural(j) if procs.get(j as usize).map(|q| q.node) != Some(*id))), "a procedural object's proxy names another's place");
     let triangles = sc.stats.get("triangles").map_or(tris.len(), |t| *t as usize);
     let first = prep.groups[..4].iter().sum::<usize>();
     // The kernel's first dynamic triangle (motion vectors, prev_verts) is group 4's first.
@@ -276,15 +316,13 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
     for i in &instances {
         *users.entry(i.mesh).or_default() += 1;
     }
-    let mesh_of = tables.retained.own_instance.iter().filter_map(|(&id, &k)| instances.get(k as usize).map(|i| (id, i.mesh))).collect();
-    let managed = tables.retained.own_mesh.values().chain(tables.retained.emitter_mesh.values()).copied().collect();
+    let managed = tables.retained.own_mesh.values().copied().collect();
     let edit = EditState {
         tris: Holes::new(room_base.0, room_base.0 + room.tris),
         records: Holes::new(room_base.1, room_base.1 + room.records),
         objects: Holes::new(room_base.2, room_base.2 + room.objects),
         word: room_base.3,
         word_cap: room_base.3 + room.proc_words,
-        mesh_of,
         users,
         managed,
         dead_meshes: vec![],
@@ -292,12 +330,16 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
         rebind: false,
         uniform_said: false,
         base: room_base,
+        rows: Holes::new(rows.len(), rows.len() + room.records),
+        row_runs: Default::default(),
         pool_first: prep.groups.iter().sum(),
         blobs,
-        placed: Default::default(),
-        instanced: Default::default(),
-        inst_at_load: instances.len(),
-        added: Default::default(),
+        // (The previous positions at the build: the vertices that move. No room: it grows with the first deforming
+        // mesh an edit places.)
+        prev: Holes::new(dynamic_verts.1 as usize, dynamic_verts.1 as usize),
+        // (Three vertices a triangle of the room: `Gpu::upload`.)
+        verts: Holes::new(vertices, vertices + room.tris * 3),
+        free_skinned: vec![],
     };
-    Ok((LoadedScene { timings, triangles, tris, tri_nodes, tri_instances, pool_tris, meshes, instances, gpu_instances, procs, proc_of, proc_first, instanced, instance_features, name: sc.name.clone(), up, base, bgs, exposure, exposure_settings, tan_half_fov: c.tan_half_fov, scene_camera, dof: c.dof.clone(), tables, fixed_features, dynamic, edit, sky: None, emit, sky_inputs, mat_runs, tri_order }, sc.preset.post))
+    Ok((LoadedScene { timings, triangles, tris, tri_nodes, tri_instances, pool_tris, dynamic_verts, skins, skin_trees, pool_place, meshes, instances, sections, rows, gpu_instances, procs, proc_first, moving_instances: tables.retained.moves_instances(), instanced, instance_features, name: sc.name.clone(), up, base, tables, fixed_features, shaders, translucent_mats, translucent_used, volume_fns, dynamic, edit, emit, mat_runs, tri_order, codes_sent: vec![] }, view, env))
 }

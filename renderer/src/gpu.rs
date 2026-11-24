@@ -7,33 +7,76 @@ use anyhow::{anyhow, Result};
 use web_time::Instant;
 use wgpu::util::DeviceExt;
 
+/// The uploaded texture pages of a texture set (texpack.rs).
+struct Pages {
+    /// `texpack::set_key` of the set.
+    key: u64,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    info: std::sync::Arc<Vec<[f32; 4]>>,
+    /// Stream textures by name: where their pixels go (`Gpu::write_stream`).
+    streams: Vec<(String, crate::texpack::Place)>,
+    /// Where each texture is and what the pages have free (`Gpu::place_texture`).
+    atlas: crate::texpack::Atlas,
+    /// By slot: the texture's key, its size and whether it wraps (what `texpack::set_key` is made of).
+    keys: Vec<(String, u32, u32, bool)>,
+}
+
+/// What `Gpu::place_texture` did to the pages.
+pub struct PagesEdit {
+    /// The texture's slot: its index among the scene's textures, its rows in `tex_info`.
+    pub slot: i32,
+    /// Every texture's rows as they are now, where a texture was placed.
+    pub info: Option<std::sync::Arc<Vec<[f32; 4]>>>,
+    /// The pages' view, where they are another texture now (they grew): bind groups hold the old one's.
+    pub view: Option<wgpu::TextureView>,
+}
+
+#[cfg(dlss)]
+pub(crate) type DlssSdk = std::sync::Arc<std::sync::Mutex<dlss_wgpu::DlssSdk>>;
+
 pub struct Gpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     /// GPU timestamp queries are available (used for adaptive samples per frame in the viewer).
     pub timestamps: bool,
+    #[cfg(dlss)]
+    pub(crate) dlss_sdk: Option<DlssSdk>,
+    /// NGX reported DLSS Ray Reconstruction on this device (with `dlss_sdk`).
+    #[cfg(dlss)]
+    pub(crate) dlss_rr: bool,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
     /// The kernel's bounded tables are uniform buffers (`GpuOptions::uniform_tables`; merged.rs `UNIFORM_TABLES`).
     pub uniform_tables: bool,
+    /// The kernel reads its seven typed tables from the tables' buffer whole, not from views of their sections
+    /// (`GpuOptions::table_views`; merged.rs `TABLE_VIEWS`).
+    pub whole_tables: bool,
     /// The kernel's switches this device was opened with (`KernelSwitches`): they are in `source`.
     pub switches: KernelSwitches,
+    /// The approximations a live view's kernel takes (`A_*`): the options' (`GpuOptions::approx`) unless a view asked
+    /// for others (`set_approx`).
+    pub approx: u32,
+    approx_default: u32,
     /// Compiled pipelines kept between runs (`GpuOptions::pipeline_cache`), where the backend has such a cache.
     pipeline_cache: Option<crate::pipeline_cache::PipelineCache>,
     /// Kernel source (hardware or software traversal spliced in); scenes with material functions get their own module.
-    source: String,
+    source: std::sync::Arc<String>,
     /// The kernel as written: a scene without features that change the source or functions of its own.
     module: wgpu::ShaderModule,
     /// The merged binding layout (merged.rs): a browser's, where a stage has eight storage buffers. Natively with
     /// THREERT_MERGED=1 (software traversal, the device held to eight too).
     pub merged: bool,
     /// By (material-function code hash, the features that change the source: `KernelVariant::flags`).
-    modules: std::sync::Mutex<std::collections::HashMap<(u64, u32), wgpu::ShaderModule>>,
+    modules: ModuleCache,
     pipeline_layout: wgpu::PipelineLayout,
     /// Kernel variants by (feature mask, material-function code hash, LIVE): `FEAT` compiles out the features a scene
     /// does not use (they cost registers even when idle); `LIVE` = one fresh sample per dispatch for the viewport.
-    pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), wgpu::ComputePipeline>>,
+    pipelines: PipelineMap<(u32, u64, bool, u32)>,
+    /// The kernels being made on another thread (`warm_kernel`): by (features, functions' hash, approximations).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    warming: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u32, u64, u32)>>>,
     layout: wgpu::BindGroupLayout,
     /// Group 1, the live viewport's: primary visibility (texture_2d<u32>), the radiance cache (`CacheBuffers`) and
     /// what the live passes read of a trace (`KernelBufs`). Offline renders bind `no_vis` (1x1 texture `no_vis_view`,
@@ -46,17 +89,25 @@ pub struct Gpu {
     /// Binding 19 of scenes without density grids (one cell), and the grid pass's bind group layout (grid_sim.wgsl).
     no_grid_view: wgpu::TextureView,
     grid_layout: wgpu::BindGroupLayout,
+    /// The pass that fills runs of the light list from their triangles (emitter_fill.wgsl), made when first needed.
+    fill: std::sync::OnceLock<wgpu::ComputePipeline>,
     /// Hardware ray queries (Metal / Vulkan RT). Software BVH traversal otherwise.
     pub hwrt: bool,
     /// Last uploaded texture pages, reused while the scene's texture set is unchanged (live edits re-upload often).
-    pages: std::sync::Mutex<Option<(u64, wgpu::TextureView, std::sync::Arc<Vec<[f32; 4]>>)>>,
+    pages: std::sync::Mutex<Option<Pages>>,
+    /// The last picture of each stream texture (`write_stream`), kept for pages that are packed again.
+    streams: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<image::RgbaImage>>>,
     /// The translucency pass (hardware RT): group 2's layout (translucent.wgsl), the kernel layout with it, and its
     /// pipelines (`translucent`, `volume_train`) by the kernel's variant key.
     tl_layout: Option<wgpu::BindGroupLayout>,
     tl_pipeline_layout: Option<wgpu::PipelineLayout>,
-    tl_pipelines: std::sync::Mutex<std::collections::HashMap<(u32, u64, bool), TranslucentPipelines>>,
-    /// The live media passes (pathtrace.wgsl `media_train`, `media_composite`) by kernel variant and entry point.
-    media_passes: std::sync::Mutex<std::collections::HashMap<(u32, u64, &'static str), wgpu::ComputePipeline>>,
+    /// Its group 1: `vis_layout` without `finish`'s records, which the pass does not read (with them its three groups
+    /// are one buffer past Metal's 29 a stage), and `no_vis` made for it.
+    pub tl_vis_layout: Option<wgpu::BindGroupLayout>,
+    no_vis_tl: Option<wgpu::BindGroup>,
+    tl_pipelines: PipelineMap<(u32, u64, bool, u32), TranslucentPipelines>,
+    /// The kernel's passes beside `main` (`kernel_pass`) by kernel variant and entry point.
+    kernel_passes: PipelineMap<(u32, u64, &'static str, u32)>,
     /// The procedural blobs of the last upload (`upload_procs`).
     proc_cache: std::sync::Mutex<Option<ProcCache>>,
     /// The last upload's procedural BLASes by geometry hash (read-only once built; another upload may share them), with
@@ -127,8 +178,9 @@ pub struct Params {
     /// Each table's first vec4 in the tables' heap (`heap::Table`'s order; `Uploaded::place`).
     pub table_first: [[u32; 4]; 3],
     /// Each stream's first word in the words' heap (`heap::Stream`'s order): the environment's CDF, the procedural
-    /// data, the vertex colours, -.
-    pub word_first: [u32; 4],
+    /// data, the vertex colours, the instances' rows; the triangles' indices, their rows. Then the first vertex that
+    /// moves (the previous positions count from it), -.
+    pub word_first: [[u32; 4]; 2],
     /// The merged layout (`KernelBufs::place`): each of group 1's vec4 sections' first vec4 in the tail of its one
     /// buffer (the cache's values, the specular rays, the motion vectors, the direct light; the light lists), and
     /// the last four's lengths. As written: zeros (the kernel asks the buffers).
@@ -136,8 +188,12 @@ pub struct Params {
     pub live_len: [u32; 4],
 }
 
+/// A vertex's bytes (`indexed::Vertex`): the stride the acceleration structures read positions by.
+const VERTEX_STRIDE: u64 = crate::indexed::VERTEX_BYTES as u64;
+
 /// Room the live view's in-place geometry edits grow into (live/edits.rs `edit_geometry`), past the scene's own data:
-/// triangles (verts, attrs, BLAS vertices), kernel records and TLAS instances, object-table entries, procedural words.
+/// triangles (verts, attrs, BLAS vertices), kernel records and TLAS instances (and a row a record: what an edit
+/// places has one section), object-table entries, procedural words.
 /// Only scenes with editable geometry (procedural meshes, `own_blas` meshes) under hardware RT get any: a quarter of
 /// what they have, at least a minimum; `THREERT_EDIT_RESERVE` scales it (0: none). Past it an edit rebuilds the scene.
 #[derive(Clone, Copy, Default, Debug)]
@@ -156,7 +212,7 @@ impl EditRoom {
     /// Whether the scene gets room (`for_scene`): editable geometry under hardware RT, or under software traversal
     /// with units (`hwrt` true for them too: `lib.rs prepare`).
     pub fn editable(scene: &Scene, hwrt: bool) -> bool {
-        hwrt && Self::reserve() > 0.0 && (!scene.procs.is_empty() || !scene.retained.own_instance.is_empty())
+        hwrt && Self::reserve() > 0.0 && (!scene.procs.is_empty() || scene.retained.has_own_instances())
     }
 
     /// `units`: software traversal with units, whose room does not grow (hardware traversal's does, from nothing): a
@@ -164,7 +220,7 @@ impl EditRoom {
     /// it has (a mesh it has not rebuilds the scene: no triangles).
     pub(crate) fn for_scene(scene: &Scene, tris: usize, records: usize, hwrt: bool, units: bool) -> EditRoom {
         let k = Self::reserve();
-        let (procs, meshes) = (!scene.procs.is_empty(), !scene.retained.own_instance.is_empty());
+        let (procs, meshes) = (!scene.procs.is_empty(), scene.retained.has_own_instances());
         let part = |n: usize, min: usize| ((n as f64 * 0.25 * k) as usize).max((min as f64 * k) as usize);
         if !Self::editable(scene, hwrt || units) {
             return if units && k > 0.0 {
@@ -183,11 +239,86 @@ impl EditRoom {
     }
 }
 
-/// A procedural BLAS an edit made, to be built with the edit's TLAS (`Gpu::proc_blas`, `build_edit`).
+/// A procedural BLAS an edit made, to be built with its commit's TLAS (`Gpu::proc_blas`, `TopBuild`): kept by its
+/// blob's hash for reuse once built (`bytes`: its size).
 pub struct PendingProc {
+    hash: [u8; 32],
     blas: wgpu::Blas,
     boxes: wgpu::Buffer,
     size: wgpu::BlasAABBGeometrySizeDescriptor,
+    bytes: u64,
+}
+
+/// What a commit's edits leave to build above the triangles (live/edits.rs `commit`): each writes its data and notes
+/// here what is to build, and the commit builds once at its end (`Gpu::build_top`).
+#[derive(Default)]
+pub struct TopBuild {
+    /// Instances (hardware traversal's TLAS instances, software traversal's units) moved, came or went.
+    pub instances: bool,
+    /// The dynamic groups' BLASes: their triangles were re-transformed.
+    pub dynamic: bool,
+    /// Instanced meshes' BLASes: new meshes, a skinned model's new pose. (Software traversal: their trees are written
+    /// by then; the top tree is made over their bounds.)
+    pub meshes: Vec<u32>,
+    /// Procedural BLASes an edit made.
+    pub procs: Vec<PendingProc>,
+}
+
+impl TopBuild {
+    pub fn any(&self) -> bool {
+        self.instances || self.dynamic || !self.meshes.is_empty() || !self.procs.is_empty()
+    }
+}
+
+/// The build entries of instanced meshes' BLASes over their pool triangles as they are now.
+fn mesh_entries<'a>(accel: &'a Accel, meshes: &[u32]) -> Vec<wgpu::BlasBuildEntry<'a>> {
+    meshes
+        .iter()
+        .map(|&m| {
+            let (parts, sizes) = &accel.mesh_geo[m as usize];
+            wgpu::BlasBuildEntry {
+                blas: &accel.meshes[m as usize],
+                geometry: wgpu::BlasGeometries::TriangleGeometries(
+                    sizes
+                        .iter()
+                        .zip(parts)
+                        .map(|(size, &(first, _))| wgpu::BlasTriangleGeometry {
+                            size,
+                            vertex_buffer: &accel.vertices,
+                            first_vertex: accel.mesh_verts[m as usize].0,
+                            vertex_stride: VERTEX_STRIDE,
+                            index_buffer: Some(&accel.indices),
+                            first_index: Some(accel.index_first + ((accel.pool_first + first as usize) * 3) as u32),
+                            transform_buffer: None,
+                            transform_buffer_offset: None,
+                        })
+                        .collect(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The build entries of the dynamic groups' BLASes (groups 4 and up) over their triangles as they are now.
+fn dynamic_entries(accel: &Accel) -> Vec<wgpu::BlasBuildEntry<'_>> {
+    accel
+        .blases
+        .iter()
+        .filter(|b| b.1 >= 4)
+        .map(|(blas, _, first, size)| wgpu::BlasBuildEntry {
+            blas,
+            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+                size,
+                vertex_buffer: &accel.vertices,
+                first_vertex: 0,
+                vertex_stride: VERTEX_STRIDE,
+                index_buffer: Some(&accel.indices),
+                first_index: Some(accel.index_first + (*first * 3) as u32),
+                transform_buffer: None,
+                transform_buffer_offset: None,
+            }]),
+        })
+        .collect()
 }
 
 /// The acceleration structure's binding in the scene's group (trace_hw.wgsl `acc`): the last, after every buffer.
@@ -200,6 +331,8 @@ pub(crate) struct LayoutShape {
     pub hwrt: bool,
     pub merged: bool,
     pub uniform_tables: bool,
+    /// No views of the tables' sections (`Gpu::whole_tables`).
+    pub whole_tables: bool,
     pub guard: bool,
 }
 
@@ -219,16 +352,15 @@ const ACCELERATION_STRUCTURE: wgpu::BindingType = wgpu::BindingType::Acceleratio
 /// (what the kernel writes), group 2 (the translucency pass's; hardware traversal). A test holds them to what every
 /// variant of the kernel's source declares (`the_kernels_layouts_are_its_declarations`).
 pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupLayoutEntry>; 3] {
-    use crate::merged::{GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
-    let LayoutShape { hwrt, merged, uniform_tables, guard } = shape;
+    use crate::merged::{DEFERRED_BINDING, GUARD_BINDING, LISTS_BINDING, LIVE_BINDING, TABLE_VIEWS, UNIFORM_TABLES};
+    let LayoutShape { hwrt, merged, uniform_tables, whole_tables, guard } = shape;
     let (read, write) = (storage_buffer(true), storage_buffer(false));
-    // Group 0: the parameters; triangles and their attributes; the tables' heap, the words' heap; the dynamic
-    // triangles' previous vertices; the texture pages and their sampler, the environment, the density grids' atlas
+    // Group 0: the parameters; the vertices; the tables' heap, the words' heap; the previous frame's vertices of
+    // those that move; the texture pages and their sampler, the environment, the density grids' atlas
     // (a 1-cell texture in scenes without grids, whose kernel does not read it); the accumulation buffer.
     let mut scene = vec![
         layout_entry(0, UNIFORM_BUFFER),
         layout_entry(1, read),
-        layout_entry(2, read),
         layout_entry(4, read),
         layout_entry(5, read),
         layout_entry(6, read),
@@ -238,13 +370,15 @@ pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupL
         layout_entry(10, float_texture(wgpu::TextureViewDimension::D3)),
         layout_entry(11, write),
     ];
-    // Software traversal's trees.
+    // Software traversal's trees: their leaves' triangles, their nodes.
     if !hwrt {
+        scene.push(layout_entry(2, read));
         scene.push(layout_entry(3, read));
     }
     // The tables the kernel reads at every hit or light, bound again as typed views of their sections (the merged
-    // layout has no binding for them), four of them uniform copies where a driver needs it.
-    if !merged {
+    // layout has no binding for them, nor has a device that reads them from the buffer whole), four of them uniform
+    // copies where a driver needs it.
+    if !merged && !whole_tables {
         let copied = |b: u32| uniform_tables && UNIFORM_TABLES.iter().any(|t| t.binding == b);
         scene.extend(TABLE_VIEWS.iter().map(|&(_, b)| layout_entry(b, if copied(b) { UNIFORM_BUFFER } else { read })));
     }
@@ -253,14 +387,15 @@ pub(crate) fn kernel_layout_entries(shape: LayoutShape) -> [Vec<wgpu::BindGroupL
     }
     // Group 1: the raster pass's visibility; then, merged, the one buffer (`heap::Live`, the loop guard's count in
     // it); as written, the radiance cache's three, the light tiles' lists, the specular rays, the motion vectors, the
-    // direct light, and the loop guard's count where a kernel of this device may have the guard (one without it does
-    // not name the binding).
+    // direct light, the pixels left for `finish`, and the loop guard's count where a kernel of this device may have
+    // the guard (one without it does not name the binding).
     let mut live = vec![layout_entry(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false })];
     if merged {
         live.push(layout_entry(LIVE_BINDING, write));
     } else {
         live.extend([1, 2, 3, 5, 6, 7].map(|b| layout_entry(b, write)));
         live.push(layout_entry(LISTS_BINDING, read));
+        live.push(layout_entry(DEFERRED_BINDING, write));
         if guard {
             live.push(layout_entry(GUARD_BINDING, write));
         }
@@ -291,6 +426,9 @@ fn uniform_copy_bytes(table: u64, copy: u64) -> u64 {
 /// What the scene bind group holds besides `Uploaded`'s buffers (`Gpu::rebind_scene` makes it again).
 pub struct BindParts {
     pub nodes: wgpu::Buffer,
+    /// Software traversal: the trees' leaf triangles (`indexed::Leaf`: pathtrace.wgsl `leaves`), with room for an
+    /// edit's. (Hardware traversal: unbound, of no triangle.)
+    pub leaves: wgpu::Buffer,
     pub tex_view: wgpu::TextureView,
     pub env_view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
@@ -301,11 +439,10 @@ pub struct BindParts {
 /// What the scene's bind group is made of (`Gpu::scene_bind_group`).
 struct SceneBuffers<'a> {
     params: &'a wgpu::Buffer,
-    verts: &'a wgpu::Buffer,
-    attrs: &'a wgpu::Buffer,
+    vertices: &'a wgpu::Buffer,
     heap: &'a Heap<Table>,
     words: &'a Heap<Stream>,
-    prev_verts: &'a wgpu::Buffer,
+    prev_vertices: &'a wgpu::Buffer,
     accum: &'a wgpu::Buffer,
     parts: &'a BindParts,
     accel: Option<&'a Accel>,
@@ -316,11 +453,9 @@ struct SceneBuffers<'a> {
 /// section of the tables as a buffer of its own). The pass's bind group holds them: one replaced, the group is made
 /// again (`Gpu::rebind_scene`).
 struct ParticleTargets<'a> {
-    verts: &'a wgpu::Buffer,
-    prev_verts: &'a wgpu::Buffer,
-    blas_verts: &'a wgpu::Buffer,
+    vertices: &'a wgpu::Buffer,
+    prev_vertices: &'a wgpu::Buffer,
     heap: &'a Heap<Table>,
-    attrs: &'a wgpu::Buffer,
 }
 
 fn buffer_entry(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -330,7 +465,7 @@ fn buffer_entry(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 /// A particle pass's bind group: its `own` buffers at their bindings, and the scene's it writes.
 fn particle_bind_group(d: &wgpu::Device, pipeline: &wgpu::ComputePipeline, label: &str, own: &[(u32, &wgpu::Buffer)], t: &ParticleTargets) -> wgpu::BindGroup {
     let mut entries: Vec<wgpu::BindGroupEntry> = own.iter().map(|(binding, b)| buffer_entry(*binding, b)).collect();
-    entries.extend([buffer_entry(2, t.verts), buffer_entry(3, t.prev_verts), buffer_entry(4, t.blas_verts), wgpu::BindGroupEntry { binding: 5, resource: t.heap.binding(Table::Objects) }, buffer_entry(6, t.attrs)]);
+    entries.extend([buffer_entry(2, t.vertices), buffer_entry(3, t.prev_vertices), wgpu::BindGroupEntry { binding: 5, resource: t.heap.binding(Table::Objects) }]);
     d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: &pipeline.get_bind_group_layout(0), entries: &entries })
 }
 
@@ -343,19 +478,17 @@ pub struct Uploaded {
     /// The uniform tables (`Gpu::uniform_tables`): the uniform buffers the kernel reads four tables from (merged.rs
     /// `UNIFORM_TABLES`' order; `Gpu::sync_tables` copies their sections there each frame).
     pub uniform: Option<[wgpu::Buffer; 4]>,
+    /// The trace's samples, a `Pixel` a pixel: the view's buffer (a live view's targets', an offline render's own:
+    /// `accum_buffer`). A handle of it here, for the scene's bind group, where the kernel's layout has it;
+    /// `Gpu::set_accum` gives it another (a view of another size).
     pub accum: wgpu::Buffer,
     pub params: wgpu::Buffer,
-    pub width: u32,
-    pub height: u32,
     /// Kernel specialisation for this scene (`Gpu::pipeline`).
     pub kernel: Kernel,
-    /// Triangle vertices / shading attributes (posed models rewrite their ranges).
-    pub verts: wgpu::Buffer,
-    pub attrs: wgpu::Buffer,
-    /// The dynamic triangles' (posed models, movable objects: the tail from `dynamic_first`) vertices of the previous
-    /// frame, kernel layout: live motion vectors.
-    pub prev_verts: wgpu::Buffer,
-    pub dynamic_first: usize,
+    /// The vertices (indexed.rs `Vertex`): a record of 48 bytes each; and those that move as they were the previous
+    /// frame, whole records too (a copy on the GPU has no stride). What the kernel reads (bindings 1 and 6).
+    pub vertices: wgpu::Buffer,
+    pub prev_vertices: wgpu::Buffer,
     pub accel: Option<Accel>,
     /// Software traversal's units (units.rs), when the scene has any: what `accel` is to hardware traversal. Their
     /// trees are in the node buffer (`bg_parts.nodes`).
@@ -363,6 +496,9 @@ pub struct Uploaded {
     /// The particle pass, when the scene has particle systems (hardware RT).
     pub particles: Option<ParticleGpu>,
     pub gpu_particles: Option<GpuParticlesGpu>,
+    /// The skinning pass, when meshes of the scene deform (hardware RT).
+    pub skin: Option<SkinGpu>,
+    pub fills: EmitterFills,
     /// The density grids (the atlas the kernel reads, the grid programs' pass), when the scene has any.
     pub grids: Option<GridsGpu>,
     /// Each medium's node (the media table's order).
@@ -378,10 +514,27 @@ pub struct Uploaded {
     pub words: Heap<Stream>,
     pub cdf_words: usize,
     pub region_words: usize,
-    /// The environment map (`write_env` replaces it in place when a dynamic sky's sun moves).
+    /// The environment map (`put_env` replaces it: a dynamic sky's sun moved, another sky).
     pub env_tex: wgpu::Texture,
     /// Translucent particles' acceleration structures and pass resources (hardware RT).
     pub translucent: Option<Translucent>,
+}
+
+/// Runs of the light list the GPU takes again from their triangles (emitter_fill.wgsl; lib.rs `EmitterRuns`): the
+/// runs, the pass's bind group, and its dispatch (the runs' count, the longest's length).
+pub struct EmitterFill {
+    runs: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+    count: u32,
+    longest: u32,
+}
+
+/// A scene's fills: of the emitters the CPU moves (after a commit that moved them), and of the particles' (after
+/// their passes). None where the scene has no such emitters.
+#[derive(Default)]
+pub struct EmitterFills {
+    pub moved: Option<EmitterFill>,
+    pub particles: Option<EmitterFill>,
 }
 
 /// The particle pass of a scene (shaders/particles.wgsl with its particle functions): pipeline, bind group, the
@@ -394,9 +547,8 @@ pub struct ParticleGpu {
     params: wgpu::Buffer,
     /// The system table (`ParticleSystemGpu`) and each system's node (pivot updates when it moves).
     table: wgpu::Buffer,
-    /// The pass's own buffers besides: the last frame's vertices, the translucent BLAS input's stand-in.
+    /// The pass's own buffer besides: the last frame's vertices.
     last: wgpu::Buffer,
-    no_trans: wgpu::Buffer,
     nodes: Vec<u32>,
     systems: u32,
     max_count: u32,
@@ -427,20 +579,19 @@ enum Hidden {
 /// Volume training points per frame at most (translucent.wgsl `volume_train`).
 pub const VOLUME_TRAIN_CAP: u32 = 8192;
 
-/// Translucent particles (`transparent` materials; hardware RT): their own BLAS + TLAS over the BLAS input the
-/// particle pass writes (`verts`), from triangle `first` in the kernel's tables; the translucency pass's parameters and
-/// volume training points (translucent.wgsl).
+/// Translucent particles (`transparent` materials; hardware RT): their own BLAS + TLAS over their vertices, which the
+/// particle pass writes (`vertices` from `first_vertex`, three a triangle), from triangle `first` in the kernel's
+/// tables; the translucency pass's parameters and volume training points (translucent.wgsl).
 pub struct Translucent {
     blas: wgpu::Blas,
     pub tlas: wgpu::Tlas,
     size: wgpu::BlasTriangleGeometrySizeDescriptor,
-    verts: wgpu::Buffer,
+    vertices: wgpu::Buffer,
+    first_vertex: u32,
     pub first: u32,
     pub params: wgpu::Buffer,
     pub points: wgpu::Buffer,
     pub count: wgpu::Buffer,
-    /// Live below full resolution: (colour, transmittance) per traced pixel (translucent.wgsl `tlow`).
-    pub low: wgpu::Buffer,
 }
 
 impl Uploaded {
@@ -456,7 +607,9 @@ impl Uploaded {
         let first = self.heap.firsts();
         p.table_first = std::array::from_fn(|k| std::array::from_fn(|j| first.get(k * 4 + j).copied().unwrap_or(0)));
         let first = self.words.firsts();
-        p.word_first = std::array::from_fn(|k| first.get(k).copied().unwrap_or(0));
+        for (k, at) in first.iter().enumerate().take(6) {
+            p.word_first[k / 4][k % 4] = *at;
+        }
     }
 }
 
@@ -465,7 +618,7 @@ impl Translucent {
     fn build(&self, e: &mut wgpu::CommandEncoder) {
         let entry = wgpu::BlasBuildEntry {
             blas: &self.blas,
-            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry { size: &self.size, vertex_buffer: &self.verts, first_vertex: 0, vertex_stride: 12, index_buffer: None, first_index: None, transform_buffer: None, transform_buffer_offset: None }]),
+            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry { size: &self.size, vertex_buffer: &self.vertices, first_vertex: self.first_vertex, vertex_stride: VERTEX_STRIDE, index_buffer: None, first_index: None, transform_buffer: None, transform_buffer_offset: None }]),
         };
         e.build_acceleration_structures([entry].iter(), [&self.tlas]);
     }
@@ -571,27 +724,29 @@ struct GridSim {
 pub struct GridsGpu {
     atlas: wgpu::Texture,
     pipeline: Option<wgpu::ComputePipeline>,
+    /// The grid programs the pipeline was made from (none without one).
+    programs: Vec<(String, String, String)>,
     grids: Vec<GridGpu>,
     step: std::cell::Cell<u32>,
 }
 
 /// grid_sim.wgsl with the scene's grid programs (`fn gp_<name>`) and their dispatch.
-fn grid_sim_source(scene: &Scene) -> String {
+fn grid_sim_source(programs: &[(String, String, String)]) -> String {
     let base = include_str!("../shaders/grid_sim.wgsl");
     let mut f = String::new();
     let mut seen = std::collections::HashSet::new();
-    for (_, _, helpers) in &scene.grid_programs {
+    for (_, _, helpers) in programs {
         if !helpers.is_empty() && seen.insert(helpers.clone()) {
             f.push_str(helpers);
             f.push('\n');
         }
     }
-    for (_, code, _) in &scene.grid_programs {
+    for (_, code, _) in programs {
         f.push_str(code);
         f.push('\n');
     }
     f.push_str("fn grid_program(f: u32, s: Cell, i: CIn, p: array<vec4<f32>, 8>) -> Cell {\n    switch f {\n");
-    for (k, (id, _, _)) in scene.grid_programs.iter().enumerate() {
+    for (k, (id, _, _)) in programs.iter().enumerate() {
         f.push_str(&format!("        case {k}u {{ return gp_{id}(s, i, p); }}\n"));
     }
     f.push_str("        default { return s; }\n    }\n}\n");
@@ -607,6 +762,126 @@ fn grid_halves(data: &[f32]) -> Vec<half::f16> {
 
 /// Spawns one frame takes at most (gpu_particles.wgsl `spawns`: two vec4 each).
 pub const MAX_SPAWNS: usize = 1 << 16;
+
+/// Triangles a workgroup of the skinning pass, and workgroups a row of its dispatch (skin.wgsl).
+const SKIN_BLOCK: u32 = 64;
+const SKIN_ROW: u32 = 32768;
+
+/// skin.wgsl `Job`: a mesh that deforms: its first triangle in the scene's and how many, its first triangle among the
+/// corners, its palette's first matrix.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkinJob {
+    first: u32,
+    count: u32,
+    source: u32,
+    palette: u32,
+}
+
+/// leaf_gather.wgsl `Job`: a mesh: its first triangle in the scene's and how many, its first vertex.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct LeafJob {
+    first: u32,
+    count: u32,
+    vertex: u32,
+    spare: u32,
+}
+
+/// The leaf-gather pass (shaders/leaf_gather.wgsl; software traversal): after the skinning pass has written a
+/// mesh's vertices, its tree's leaves take their triangles again from them. A job each skinned model, the skinning
+/// pass's order.
+struct LeafGather {
+    pipeline: wgpu::ComputePipeline,
+    bg: Option<wgpu::BindGroup>,
+    params: wgpu::Buffer,
+    /// A frame's work: (job, its first triangle of the block), `SKIN_BLOCK` triangles each.
+    blocks: wgpu::Buffer,
+    table: wgpu::Buffer,
+    jobs: Vec<LeafJob>,
+}
+
+fn leaf_gather_bind_group(d: &wgpu::Device, l: &LeafGather, vertices: &wgpu::Buffer, words: &wgpu::Buffer, leaves: &wgpu::Buffer) -> wgpu::BindGroup {
+    let entries: Vec<wgpu::BindGroupEntry> = [&l.params, &l.blocks, &l.table, vertices, words, leaves].iter().enumerate().map(|(k, b)| buffer_entry(k as u32, b)).collect();
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("leaf gather"), layout: &l.pipeline.get_bind_group_layout(0), entries: &entries })
+}
+
+/// The skinning pass of a scene (shaders/skin.wgsl): the meshes that deform (a job each, `scene::Skinned`'s index)
+/// are skinned from their models' corners and their poses' palettes into the scene's triangles, attributes and BLAS
+/// input. Hardware RT.
+pub struct SkinGpu {
+    pipeline: wgpu::ComputePipeline,
+    bg: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    /// A frame's work: (job, its first triangle of the block), `SKIN_BLOCK` triangles each.
+    blocks: wgpu::Buffer,
+    table: wgpu::Buffer,
+    corners: wgpu::Buffer,
+    /// Every job's palette, three rows a matrix (`skin::PaletteRows`).
+    palette: wgpu::Buffer,
+    /// Per job, and how many matrices its palette is.
+    jobs: Vec<(SkinJob, u32)>,
+    /// Each source's first triangle among the corners (`Scene::skin_sources`), and the palette's matrices in use.
+    source_first: Vec<u32>,
+    palette_end: u32,
+    /// Software traversal: the pass that takes the trees' leaves again from the vertices this one wrote.
+    leaves: Option<LeafGather>,
+}
+
+impl SkinGpu {
+    /// (Tests: the bytes of the jobs' table, the palettes' and the blocks' buffers.)
+    #[cfg(test)]
+    pub fn rooms(&self) -> [u64; 3] {
+        [self.table.size(), self.palette.size(), self.blocks.size()]
+    }
+
+    /// The job of a mesh an edit placed, at `slot` (a new one, or one whose mesh is gone): its triangles from `first`
+    /// in the scene's, skinned from `source`'s corners by a palette of `palette_len` matrices. The pass's buffers
+    /// grow with it (the table written again whole; the palette's and the blocks' contents are a dispatch's, and
+    /// need no copy). True where one was made again: the pass's bind group is then to be (`Gpu::rebind_scene`).
+    pub fn set_job(&mut self, d: &wgpu::Device, q: &wgpu::Queue, slot: usize, first: u32, count: u32, source: u32, palette_len: u32) -> bool {
+        let room = |label: &str, size: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut grew = false;
+        // Its palette: the slot's own where that is as long, else new room at the end.
+        let palette = match self.jobs.get(slot) {
+            Some((j, len)) if *len == palette_len => j.palette,
+            _ => {
+                self.palette_end += palette_len;
+                self.palette_end - palette_len
+            }
+        };
+        let job = SkinJob { first, count, source: self.source_first[source as usize], palette };
+        if slot < self.jobs.len() {
+            self.jobs[slot] = (job, palette_len);
+        } else {
+            self.jobs.push((job, palette_len));
+        }
+        if self.jobs.len() as u64 * 16 > self.table.size() {
+            self.table = room("skin jobs", self.jobs.len() as u64 * 32);
+            let table: Vec<SkinJob> = self.jobs.iter().map(|j| j.0).collect();
+            q.write_buffer(&self.table, 0, bytemuck::cast_slice(&table));
+            grew = true;
+        } else {
+            q.write_buffer(&self.table, slot as u64 * 16, bytemuck::bytes_of(&job));
+        }
+        if self.palette_end as u64 * 48 > self.palette.size() {
+            self.palette = room("skin palette", self.palette_end as u64 * 96);
+            grew = true;
+        }
+        let blocks: u64 = self.jobs.iter().map(|j| j.0.count.div_ceil(SKIN_BLOCK) as u64).sum();
+        if blocks * 8 > self.blocks.size() {
+            self.blocks = room("skin blocks", blocks * 16);
+            grew = true;
+        }
+        grew
+    }
+}
+
+fn skin_bind_group(d: &wgpu::Device, pipeline: &wgpu::ComputePipeline, own: [&wgpu::Buffer; 5], vertices: &wgpu::Buffer) -> wgpu::BindGroup {
+    let mut entries: Vec<wgpu::BindGroupEntry> = own.iter().enumerate().map(|(k, b)| buffer_entry(k as u32, b)).collect();
+    entries.push(buffer_entry(5, vertices));
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("skin"), layout: &pipeline.get_bind_group_layout(0), entries: &entries })
+}
 
 /// Stateful GPU particles (gpu_particles.wgsl; ROADMAP § 6 step 5a): the pass, its tables and buffers, and per system
 /// what the CPU keeps between frames: where the next emission starts in its ring of slots, the rate's fraction carried.
@@ -691,14 +966,21 @@ fn particle_source(scene: &Scene) -> String {
 /// Hardware acceleration structures: one BLAS per non-empty traversal group, one TLAS over them.
 pub struct Accel {
     pub tlas: wgpu::Tlas,
-    /// Triangle vertices the BLASes are built from (12 B per vertex, 3 per triangle).
-    pub verts: wgpu::Buffer,
+    /// What the BLASes are built from: the vertices (`Uploaded::vertices`: a record's first 12 bytes its position) and
+    /// the triangles' indices (the words' heap, from word `index_first` on). Handles of the scene's buffers as they
+    /// are now (`Gpu::rebind_scene` takes them again when one grew).
+    pub vertices: wgpu::Buffer,
+    pub indices: wgpu::Buffer,
+    pub index_first: u32,
+    /// By mesh: its first vertex and how many (`indexed::Indexed::meshes`); and the world-space triangles' vertices.
+    pub mesh_verts: Vec<(u32, u32)>,
+    pub flat_verts: u32,
     /// (BLAS, group, first triangle, size).
     blases: Vec<(wgpu::Blas, usize, usize, wgpu::BlasTriangleGeometrySizeDescriptor)>,
     /// One per instanced mesh (model space), referenced by the TLAS's model instances.
     meshes: Vec<wgpu::Blas>,
-    /// Per mesh: its (first pool triangle, count, opaque) geometries and their sizes (`rebuild_meshes`).
-    mesh_geo: Vec<(Vec<(u32, u32, bool)>, Vec<wgpu::BlasTriangleGeometrySizeDescriptor>)>,
+    /// Per mesh: its (first pool triangle, count) geometries and their sizes (`mesh_entries`).
+    mesh_geo: Vec<(Vec<(u32, u32)>, Vec<wgpu::BlasTriangleGeometrySizeDescriptor>)>,
     /// The first pool triangle in the GPU order.
     pool_first: usize,
     /// The TLAS index of model instance 0 (the traversal groups' instances come first).
@@ -732,14 +1014,6 @@ impl<'a> Top<'a> {
         match self {
             Top::Hw(a) => a.inst_base,
             Top::Sw(_) => 0,
-        }
-    }
-
-    /// The slot of the first procedural object (`proc_first`: its record).
-    pub fn proc_base(&self, proc_first: usize) -> usize {
-        match self {
-            Top::Hw(a) => a.proc_base,
-            Top::Sw(_) => proc_first,
         }
     }
 
@@ -809,6 +1083,10 @@ impl<'a> Top<'a> {
 
 /// A TLAS instance transform: the world matrix's first three rows.
 /// TLAS mask of an instance: 1 casts shadows, 2 does not, 0 a hidden instance of an instanced object (no ray sees it).
+/// Triangles a batch of the scene's first BLAS build holds at most (`Gpu::upload`): the build's scratch buffer is the sum
+/// of its BLASes' (on an RTX GPU about as large as the BLASes themselves).
+const BLAS_BATCH_TRIS: u64 = 4_000_000;
+
 pub fn instance_mask(cast_shadow: bool, hidden: bool) -> u8 {
     if hidden {
         0
@@ -852,6 +1130,9 @@ pub struct KernelVariant {
     pub merged: bool,
     /// Four tables in uniform buffers (merged.rs `UNIFORM_TABLES`; `GpuOptions::uniform_tables`). Never with `merged`.
     pub uniform_tables: bool,
+    /// The seven typed tables read from the tables' buffer whole, as the merged layout reads them, with the layout as
+    /// written otherwise (`GpuOptions::table_views`). Never with `uniform_tables`.
+    pub whole_tables: bool,
     /// The loop guard's limit, in a kernel with the guard (`loop_guard_of`, `guard_loops`).
     pub guard: Option<u32>,
 }
@@ -863,7 +1144,7 @@ impl KernelVariant {
     }
 
     /// The flags of the kernel's conditional translation (pathtrace.wgsl's head).
-    pub fn flags(&self) -> [(&'static str, bool); 11] {
+    pub fn flags(&self) -> [(&'static str, bool); 12] {
         let (k, f) = (&self.switches, |bit: u32| self.features & bit != 0);
         [
             ("hwrt", self.hwrt),
@@ -876,6 +1157,7 @@ impl KernelVariant {
             ("units", f(F_UNITS)),
             ("merged", self.merged),
             ("uniform_tables", self.uniform_tables),
+            ("whole_tables", self.whole_tables),
             ("guard", self.guard.is_some()),
         ]
     }
@@ -907,6 +1189,7 @@ pub fn kernel_wgsl(src: &str, v: &KernelVariant) -> String {
 /// `kernel_wgsl`, saying what did not compile instead of panicking (a scene's own functions are a game's code).
 pub fn try_kernel_wgsl(src: &str, v: &KernelVariant) -> Result<String, String> {
     assert!(!(v.merged && v.uniform_tables), "the uniform tables are never in the merged layout");
+    assert!(!(v.whole_tables && v.uniform_tables), "the uniform tables are copies of views the kernel reading the tables whole does not have");
     let mut out = try_wesl_wgsl(src, &v.flags(), &v.constants())?;
     if v.guard.is_some() {
         guard_loops(&mut out);
@@ -1105,14 +1388,23 @@ pub struct GpuOptions {
     /// buffers (merged.rs `UNIFORM_TABLES`). None: where a driver needs it, which is Android. Never with the merged
     /// layout, whose tables are one buffer of its own.
     pub uniform_tables: Option<bool>,
+    /// The seven tables the kernel reads at every hit or light (materials, lights, emitters, texture rects, objects,
+    /// instances, media) as views of their sections, each a binding of its own (merged.rs `TABLE_VIEWS`), or read from
+    /// the tables' buffer whole by the offsets in the parameters, as the merged layout reads them. None: views, but on
+    /// Android: Adreno 740's driver read the views wrong (docs/RUNTIME.md "Android"). Without views there are no
+    /// uniform tables either.
+    pub table_views: Option<bool>,
     /// A directory to keep compiled pipelines in between runs (pipeline_cache.rs). None: nothing is kept.
     pub pipeline_cache: Option<std::path::PathBuf>,
     pub kernel: KernelSwitches,
+    /// The live renderer's approximations (`A_*`). None: all of them (`A_LIVE`). 0: a live view whose kernel is the
+    /// offline one's estimator, slower, for holding its picture to the offline render's.
+    pub approx: Option<u32>,
 }
 
 impl GpuOptions {
-    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, and the kernel's switches
-    /// (`KernelSwitches::from_env`).
+    /// THREERT_UNIFORM_TABLES=1|0, THREERT_PIPELINE_CACHE=<directory>, THREERT_APPROX=<bits of `A_*`>, and the
+    /// kernel's switches (`KernelSwitches::from_env`).
     pub fn from_env() -> GpuOptions {
         Self::from_vars(&|name| std::env::var(name).ok(), cfg!(target_os = "android"))
     }
@@ -1121,14 +1413,23 @@ impl GpuOptions {
     fn from_vars(var: &dyn Fn(&str) -> Option<String>, android: bool) -> GpuOptions {
         GpuOptions {
             uniform_tables: var("THREERT_UNIFORM_TABLES").map(|v| v == "1"),
+            table_views: var("THREERT_TABLE_VIEWS").map(|v| v == "1"),
             pipeline_cache: var("THREERT_PIPELINE_CACHE").filter(|d| !d.is_empty()).map(std::path::PathBuf::from),
             kernel: KernelSwitches::from_vars(var, android),
+            approx: var("THREERT_APPROX").and_then(|v| v.trim().parse().ok()),
         }
     }
 
-    /// Whether the device has the uniform tables: as asked, else on Android; not in the merged layout.
+    /// Whether the kernel reads its tables from views of their sections: as asked, else everywhere but Android; never
+    /// in the merged layout.
+    fn table_views_on(&self, merged: bool, android: bool) -> bool {
+        !merged && self.table_views.unwrap_or(!android)
+    }
+
+    /// Whether the device has the uniform tables (copies of four of the views): as asked, else on Android; only with
+    /// the views.
     fn uniform_tables_on(&self, merged: bool, android: bool) -> bool {
-        !merged && self.uniform_tables.unwrap_or(android)
+        self.table_views_on(merged, android) && self.uniform_tables.unwrap_or(android)
     }
 }
 
@@ -1179,11 +1480,120 @@ impl KernelSwitches {
     }
 }
 
-/// The kernel's runtime checks: none (all indices come from our own BVH / scene builder). THREERT_CHECKED turns naga's
-/// on to diagnose a driver: 1 = every check, else a mask (2 bounds, 4 loop bounding, 8 ray-query initialization
-/// tracking).
+type ModuleCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(u64, u32), wgpu::ShaderModule>>>;
+type PipelineMap<K, V = wgpu::ComputePipeline> = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<K, V>>>;
+
+/// What a kernel variant's module and pipelines are made from and kept in: a device's, cloned to the thread that
+/// makes a variant the frame does not wait for (`Gpu::warm_kernel`). A variant is looked up, made without a lock
+/// held (a compile takes long, and the frame looks its own up meanwhile), then kept; made twice at once, the first
+/// kept stays.
+#[derive(Clone)]
+struct KernelMaker {
+    device: wgpu::Device,
+    source: std::sync::Arc<String>,
+    /// The kernel as written (`Gpu::module`).
+    module: wgpu::ShaderModule,
+    /// The device's part of a variant (its features 0, its guard a kernel's own).
+    variant: KernelVariant,
+    layout: wgpu::PipelineLayout,
+    tl_layout: Option<wgpu::PipelineLayout>,
+    modules: ModuleCache,
+    pipelines: PipelineMap<(u32, u64, bool, u32)>,
+    passes: PipelineMap<(u32, u64, &'static str, u32)>,
+    tl: PipelineMap<(u32, u64, bool, u32), TranslucentPipelines>,
+}
+
+impl KernelMaker {
+    /// The kernel module for a scene: the shared one, or with its material functions spliced in.
+    fn module(&self, k: &Kernel) -> wgpu::ShaderModule {
+        let patches = k.features & F_SOURCE;
+        if patches == 0 && k.functions.is_empty() && k.volume_functions.is_empty() && k.geometry_functions.is_empty() {
+            return self.module.clone();
+        }
+        if let Some(m) = self.modules.lock().unwrap().get(&(k.hash, patches)) {
+            return m.clone();
+        }
+        let splice = |src: &str, marker: &str, code: &str| -> String {
+            if code.is_empty() {
+                return src.to_string();
+            }
+            let (head, rest) = src.split_once(&format!("// @{marker}-begin")).unwrap();
+            let (_, tail) = rest.split_once(&format!("// @{marker}-end")).unwrap();
+            format!("{head}{code}{tail}")
+        };
+        let src = splice(&splice(&splice(&self.source, "material-functions", &k.functions), "volume-functions", &k.volume_functions), "geometry-functions", &k.geometry_functions);
+        // The variant: this device's traversal, switches, layout and loop guard, this scene's features.
+        let v = KernelVariant { features: patches, guard: loop_guard_of(patches & F_UNITS != 0), ..self.variant };
+        // A scene's functions that do not compile (a game's own WGSL) cost the game its functions, not the
+        // app its renderer: the kernel is made without them, and the game's log says why. (A panic here took
+        // the engine down, and ThreeRT for Android then took the device for one without a renderer.)
+        let wgsl = try_kernel_wgsl(&src, &v).unwrap_or_else(|e| {
+            let msg = format!("this scene's material, volume or geometry functions do not compile, so it is drawn without them: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::script::engine_log("error", &msg);
+            #[cfg(target_arch = "wasm32")]
+            eprintln!("{msg}");
+            kernel_wgsl(&self.source, &v)
+        });
+        let m = unsafe { self.device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("pathtrace+functions"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }, kernel_checks()) };
+        self.modules.lock().unwrap().entry((k.hash, patches)).or_insert(m).clone()
+    }
+
+    fn make(&self, k: &Kernel, live: bool, entry: &str, label: &str, layout: Option<&wgpu::PipelineLayout>, cache: Option<&wgpu::PipelineCache>) -> wgpu::ComputePipeline {
+        let (module, constants) = (self.module(k), k.constants(live));
+        self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout,
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
+            cache,
+        })
+    }
+
+    /// The kernel's `main` for `k` (`live`: the viewport's), and whether it was made now.
+    fn pipeline(&self, k: &Kernel, live: bool, cache: Option<&wgpu::PipelineCache>) -> (wgpu::ComputePipeline, bool) {
+        let key = (k.features, k.hash, live, k.approx_of(live));
+        if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let p = self.make(k, live, "main", if live { "pathtrace-live" } else { "pathtrace" }, Some(&self.layout), cache);
+        (self.pipelines.lock().unwrap().entry(key).or_insert(p).clone(), true)
+    }
+
+    /// A live pass of `k` beside `main`, and whether it was made now.
+    fn pass(&self, k: &Kernel, entry: &'static str, cache: Option<&wgpu::PipelineCache>) -> (wgpu::ComputePipeline, bool) {
+        let key = (k.features, k.hash, entry, k.approx);
+        if let Some(p) = self.passes.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let p = self.make(k, true, entry, entry, Some(&self.layout), cache);
+        (self.passes.lock().unwrap().entry(key).or_insert(p).clone(), true)
+    }
+
+    /// The translucency pass's pipelines for `k`, and whether they were made now.
+    fn translucent(&self, k: &Kernel, live: bool, cache: Option<&wgpu::PipelineCache>) -> (TranslucentPipelines, bool) {
+        let key = (k.features, k.hash, live, k.approx_of(live));
+        if let Some(p) = self.tl.lock().unwrap().get(&key) {
+            return (p.clone(), false);
+        }
+        let make = |entry: &str| self.make(k, live, entry, entry, self.tl_layout.as_ref(), cache);
+        let made = TranslucentPipelines { draw: make("translucent"), train: make("volume_train"), up: make("translucent_up") };
+        (self.tl.lock().unwrap().entry(key).or_insert(made).clone(), true)
+    }
+}
+
+/// The kernel's runtime checks: loop bounding alone, wgpu's default for it (every loop has a count its compiler can
+/// see the end of). The kernel's loops end on sound data, which does not promise a compiler that they end; without
+/// the bound, kernels Metal's compiler made lost the state of whole SIMD groups on a scene with cutouts, one build and
+/// not the next. No bounds checks: all indices come from our own BVH / scene builder. THREERT_CHECKED, to diagnose a
+/// driver: 0 = none, 1 = every check, else a mask (2 bounds, 4 loop bounding, 8 ray-query initialization tracking).
 fn kernel_checks() -> wgpu::ShaderRuntimeChecks {
-    let v: u32 = std::env::var("THREERT_CHECKED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    kernel_checks_of(std::env::var("THREERT_CHECKED").ok().and_then(|v| v.parse().ok()))
+}
+
+fn kernel_checks_of(asked: Option<u32>) -> wgpu::ShaderRuntimeChecks {
+    let v = asked.unwrap_or(4);
     if v == 1 {
         return wgpu::ShaderRuntimeChecks::checked();
     }
@@ -1202,6 +1612,12 @@ pub fn tlas_rows(w: glam::Mat4) -> [f32; 12] {
 
 /// Entries of the live radiance cache (pathtrace.wgsl CACHE_SIZE).
 pub const CACHE_SIZE: u64 = 1 << 18;
+/// The kernel's `finish` pass (pathtrace.wgsl): a record's bytes (DEFERRED_VECS vec4s) after the 16 of their count,
+/// and the invocations of a dispatch row (DEFERRED_ROW).
+pub const DEFERRED_BYTES: u64 = 96;
+pub const DEFERRED_ROW: u32 = 16384;
+/// The bytes of a traced pixel's samples (records.wgsl `Pixel`), in a view's buffer of them (`Gpu::accum_buffer`).
+pub const SAMPLE_BYTES: u64 = 80;
 
 /// A buffer, or a range of one: in the merged layout (merged.rs) several of the engine's buffers are ranges of the one
 /// buffer a binding holds.
@@ -1263,6 +1679,9 @@ pub struct KernelBufs {
     pub motion: Buf,
     pub direct: Buf,
     pub lists: Buf,
+    /// The pixels a sample's trace leaves for `finish` (their count, then `DEFERRED_BYTES` each): the layout as
+    /// written only. Of one record until a live view makes it for its traced size (`deferred_buffer`).
+    pub deferred: Option<Buf>,
     /// The loop guard's count (`guard_loops`: its first word, the invocations a loop of which was stopped): with
     /// the guard, and always in the merged layout.
     pub guard: Option<Buf>,
@@ -1271,20 +1690,35 @@ pub struct KernelBufs {
 }
 
 impl KernelBufs {
+    /// Each in a buffer of its own: the live passes' four of these bytes, made (and `deferred` of one record: its view
+    /// makes it for what it traces), with this radiance cache and loop guard's count.
+    fn separate(d: &wgpu::Device, cache: CacheBuffers, guard: Option<Buf>, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
+        let sb = |label: &str, size: u64| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
+        KernelBufs { cache, refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), deferred: Some(deferred_buffer(d, 1)), guard, merged: None }
+    }
+
+    /// These for a view of another size: the four that follow the size made again, the radiance cache and the loop
+    /// guard's count kept. The merged layout's are one buffer: all of it made again, the cache (as long) empty.
+    pub fn resized(&self, d: &wgpu::Device, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
+        match self.merged {
+            Some(_) => KernelBufs::new(d, true, true, self.cache.val.size / 32, refl, motion, direct, lists),
+            None => KernelBufs::separate(d, self.cache.clone(), self.guard.clone(), refl, motion, direct, lists),
+        }
+    }
+
     /// For a cache of `entries` and the live passes' four of these bytes.
     /// `guard`: the layout as written has the guard's count (`Gpu::guard_room`).
     pub fn new(d: &wgpu::Device, merged: bool, guard: bool, entries: u64, refl: u64, motion: u64, direct: u64, lists: u64) -> KernelBufs {
         if !merged {
-            let sb = |label: &str, size: u64| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
-            let guard = guard.then(|| sb("loop guard", crate::merged::GUARD_WORDS as u64 * 4));
-            return KernelBufs { cache: CacheBuffers::new(d, entries), refl: sb("refl", refl), motion: sb("motion", motion), direct: sb("direct", direct), lists: sb("light lists", lists), guard, merged: None };
+            let guard = guard.then(|| Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard"), size: crate::merged::GUARD_WORDS as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false })));
+            return KernelBufs::separate(d, CacheBuffers::new(d, entries), guard, refl, motion, direct, lists);
         }
         // (The cache's keys and sums are as long as the kernel's struct says, whatever `entries`: `live_sizes`. A
         // section's range is the bytes asked for: a pass that binds it sees an array of that length.)
         let bytes = live_sizes(entries, refl, motion, direct, lists);
         let heap = Heap::<Live>::new(d, &bytes);
         let b = |s: Live| Buf { buffer: heap.buffer.clone(), offset: heap.at(s), size: bytes[s.index()] };
-        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), guard: Some(b(Live::Guard)), merged: Some(heap) }
+        KernelBufs { cache: CacheBuffers { keys: b(Live::CacheKeys), acc: b(Live::CacheAcc), val: b(Live::CacheVal) }, refl: b(Live::Refl), motion: b(Live::Motion), direct: b(Live::Direct), lists: b(Live::Lists), deferred: None, guard: Some(b(Live::Guard)), merged: Some(heap) }
     }
 
     /// Where the kernel finds the vec4 sections in the merged layout (`Params::live_first`, `live_len`): written with
@@ -1297,6 +1731,11 @@ impl KernelBufs {
     }
 }
 
+/// `finish`'s buffer for `records` pixels: their count (16 bytes, cleared before each sample), then the records.
+pub fn deferred_buffer(d: &wgpu::Device, records: u64) -> Buf {
+    Buf::whole(d.create_buffer(&wgpu::BufferDescriptor { label: Some("deferred"), size: 16 + records.max(1) * DEFERRED_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+}
+
 /// The bytes of the merged layout's group-1 buffer's sections (`heap::Live`'s order) for a cache whose values are
 /// `entries` long and the live passes' four of these bytes. The cache's keys and sums and the loop guard's count are
 /// members of the kernel's struct, of the kernel's lengths (pathtrace.wgsl `MergedLive`).
@@ -1306,7 +1745,8 @@ pub(crate) fn live_sizes(entries: u64, refl: u64, motion: u64, direct: u64, list
 
 /// Group-1 bind group of the kernel: a primary-visibility texture, the radiance cache and the
 /// reflection resolve's inputs (`KernelBufs`); in the merged layout, the texture and the one buffer.
-pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs) -> wgpu::BindGroup {
+/// `deferred`: with `finish`'s records (`vis_layout`; the translucency pass's `tl_vis_layout` is without).
+pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, b: &KernelBufs, deferred: bool) -> wgpu::BindGroup {
     fn e(binding: u32, b: &Buf) -> wgpu::BindGroupEntry<'_> {
         wgpu::BindGroupEntry { binding, resource: b.binding() }
     }
@@ -1315,6 +1755,7 @@ pub fn vis_bind_group(d: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &w
         Some(heap) => d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &[tex, wgpu::BindGroupEntry { binding: crate::merged::LIVE_BINDING, resource: heap.buffer.as_entire_binding() }] }),
         None => {
             let mut entries = vec![tex, e(1, &b.cache.keys), e(2, &b.cache.acc), e(3, &b.cache.val), e(crate::merged::LISTS_BINDING, &b.lists), e(5, &b.refl), e(6, &b.motion), e(7, &b.direct)];
+            entries.extend(b.deferred.as_ref().filter(|_| deferred).map(|r| e(crate::merged::DEFERRED_BINDING, r)));
             entries.extend(b.guard.as_ref().map(|g| e(crate::merged::GUARD_BINDING, g)));
             d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vis"), layout, entries: &entries })
         }
@@ -1344,34 +1785,48 @@ pub struct Kernel {
     /// The scene's geometry functions and their dispatch (pathtrace.wgsl `geometry_function`), spliced like `functions`.
     pub geometry_functions: String,
     pub hash: u64,
+    /// The approximations its live pipelines are compiled with (`A_*`; an offline pipeline has none): the device's
+    /// (`Gpu::approx`) unless a view sets others.
+    pub approx: u32,
 }
 
 impl Kernel {
-    pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
+    /// A pipeline's constants: `LIVE`, `FEAT`, `APPROX`.
+    fn constants(&self, live: bool) -> [(&'static str, f64); 3] {
+        [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", self.features as f64), ("APPROX", self.approx_of(live) as f64)]
+    }
+
+    fn approx_of(&self, live: bool) -> u32 {
+        if live { self.approx } else { 0 }
+    }
+
+    /// A scene's material functions and their dispatch (pathtrace.wgsl `material_function` and its kin), as they are
+    /// spliced into the kernel: `shaders` (name, code, helpers) in the order of their numbers; `translucent`: the
+    /// functions of translucent particles' materials.
+    fn material_functions(shaders: &[(String, String, String)], translucent: &std::collections::BTreeSet<i32>) -> String {
         let mut functions = String::new();
-        if !scene.shaders.is_empty() {
+        if !shaders.is_empty() {
             let mut seen = std::collections::HashSet::new();
-            for (_, _, helpers) in &scene.shaders {
+            for (_, _, helpers) in shaders {
                 if !helpers.is_empty() && seen.insert(helpers.clone()) {
                     functions.push_str(helpers);
                     functions.push('\n');
                 }
             }
-            for (_, code, _) in &scene.shaders {
+            for (_, code, _) in shaders {
                 functions.push_str(code);
                 functions.push('\n');
             }
             functions.push_str("fn material_function(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {\n    switch f {\n");
-            for (k, (id, _, _)) in scene.shaders.iter().enumerate() {
+            for (k, (id, _, _)) in shaders.iter().enumerate() {
                 functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
             }
             functions.push_str("        default { return base; }\n    }\n}\n");
             // The translucency pass's (translucent.wgsl): only the functions of its particles' materials. With every
             // function in it, the Metal compiler failed on Tokyo's kernel once the city's ground had one (wetLayer).
-            let used: std::collections::BTreeSet<i32> = scene.trans_attrs.iter().filter_map(|a| scene.materials.get(a.uv[3].to_bits() as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
             functions.push_str("fn translucent_material_function(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {\n    switch f {\n");
-            for k in used {
-                if let Some((id, _, _)) = scene.shaders.get(k as usize) {
+            for &k in translucent {
+                if let Some((id, _, _)) = shaders.get(k as usize) {
                     functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
                 }
             }
@@ -1382,7 +1837,7 @@ impl Kernel {
             // ~0.8 ms on Tokyo, dry).
             for (name, field) in [("alpha_material_function", "opacity"), ("emissive_material_function", "emissive")] {
                 functions.push_str(&format!("fn {name}(f: i32, i: MatIn, m: Material, base: MatOut) -> MatOut {{\n    switch f {{\n"));
-                for (k, (id, code, _)) in scene.shaders.iter().enumerate() {
+                for (k, (id, code, _)) in shaders.iter().enumerate() {
                     if writes_field(code, field) {
                         functions.push_str(&format!("        case {k} {{ return mf_{id}(i, m, base); }}\n"));
                     }
@@ -1390,25 +1845,62 @@ impl Kernel {
                 functions.push_str("        default { return base; }\n    }\n}\n");
             }
         }
+        functions
+    }
+
+    /// A scene's volume functions and their dispatch (pathtrace.wgsl `volume_function`), as they are spliced into the
+    /// kernel: (name, code, helpers) in the order of their numbers.
+    fn volume_functions_of(fns: &[(String, String, String)]) -> String {
         let mut volume_functions = String::new();
-        if !scene.volume_fns.is_empty() {
+        if !fns.is_empty() {
             let mut seen = std::collections::HashSet::new();
-            for (_, _, helpers) in &scene.volume_fns {
+            for (_, _, helpers) in fns {
                 if !helpers.is_empty() && seen.insert(helpers.clone()) {
                     volume_functions.push_str(helpers);
                     volume_functions.push('\n');
                 }
             }
-            for (_, code, _) in &scene.volume_fns {
+            for (_, code, _) in fns {
                 volume_functions.push_str(code);
                 volume_functions.push('\n');
             }
             volume_functions.push_str("fn volume_function(f: u32, i: VIn, p: array<vec4<f32>, 8>) -> VOut {\n    switch f {\n");
-            for (k, (id, _, _)) in scene.volume_fns.iter().enumerate() {
+            for (k, (id, _, _)) in fns.iter().enumerate() {
                 volume_functions.push_str(&format!("        case {k}u {{ return vf_{id}(i, p); }}\n"));
             }
             volume_functions.push_str("        default { return VOut(0.0, vec3<f32>(1.0), vec3<f32>(0.0)); }\n    }\n}\n");
         }
+        volume_functions
+    }
+
+    /// This kernel with other volume functions (one that came or changed while the scene runs): another module.
+    pub fn with_volume_functions(&self, fns: &[(String, String, String)]) -> Kernel {
+        use std::hash::{Hash, Hasher};
+        let volume_functions = legacy_wgsl(Kernel::volume_functions_of(fns));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.functions.hash(&mut h);
+        volume_functions.hash(&mut h);
+        self.geometry_functions.hash(&mut h);
+        Kernel { volume_functions, hash: h.finish(), ..self.clone() }
+    }
+
+    /// This kernel with other material functions (a function added or changed while the scene runs): another module
+    /// (`hash`), the volume and geometry functions as they are.
+    pub fn with_material_functions(&self, shaders: &[(String, String, String)], translucent: &std::collections::BTreeSet<i32>) -> Kernel {
+        use std::hash::{Hash, Hasher};
+        let functions = legacy_wgsl(Kernel::material_functions(shaders, translucent));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        functions.hash(&mut h);
+        self.volume_functions.hash(&mut h);
+        self.geometry_functions.hash(&mut h);
+        Kernel { functions, hash: h.finish(), ..self.clone() }
+    }
+
+    pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
+        // (The translucency pass's functions: those of its particles' materials.)
+        let used: std::collections::BTreeSet<i32> = scene.trans_attrs.iter().filter_map(|a| scene.materials.get(a.uv[3].to_bits() as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
+        let functions = Kernel::material_functions(&scene.shaders, &used);
+        let volume_functions = Kernel::volume_functions_of(&scene.volume_fns);
         let mut geometry_functions = String::new();
         if !scene.geometry_fns.is_empty() {
             let mut seen = std::collections::HashSet::new();
@@ -1435,9 +1927,19 @@ impl Kernel {
         functions.hash(&mut h);
         volume_functions.hash(&mut h);
         geometry_functions.hash(&mut h);
-        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish() }
+        Kernel { features: features(scene, groups), functions, volume_functions, geometry_functions, hash: h.finish(), approx: A_LIVE }
     }
 }
+
+// The live renderer's approximations (`override APPROX` in pathtrace.wgsl, which says what each is; docs/RUNTIME.md
+// "How live differs from offline").
+pub const A_GLASS_SHADOWS: u32 = 1;
+pub const A_MEDIA_SHADOWS: u32 = 2;
+pub const A_CUTOUT_PATHS: u32 = 4;
+pub const A_CUTOUT_EMITTERS: u32 = 8;
+pub const A_FAR_EMITTERS: u32 = 16;
+/// All of them: what a live view takes unless it asks otherwise (`GpuOptions::approx`).
+pub const A_LIVE: u32 = 31;
 
 // Kernel features (`override FEAT` in pathtrace.wgsl).
 pub const F_MASKED: u32 = 1;
@@ -1483,6 +1985,29 @@ pub const F_GRID: u32 = 1 << 25;
 /// guided live by the light tiles (pathtrace.wgsl "Light tiles"; the live view's `light_tiles` pass runs for such a
 /// scene).
 pub const F_LISTS: u32 = 1 << 27;
+/// A material function on an instanced mesh: its inputs outside full shading (pathtrace.wgsl `mat_in_at`) place the
+/// triangle by its instance. Compiled out where no scene has one: the kernel's compiler works the placement out for
+/// every call otherwise, taken or not (Kabukicho's 64,224 emitters with a function, none on an instance: frame GPU
+/// +2.7 %).
+pub const F_IFUNC: u32 = 1 << 28;
+/// Glass among an instance's other sections: a shadow ray steps through a hit whose row says glass (trace_hw.wgsl;
+/// software traversal skips such a triangle of a unit). Compiled out where no instance mixes the two: one that is all
+/// glass is out of a shadow ray's way by its mask (`scene::rows_cast`).
+pub const F_IGLASS: u32 = 1 << 29;
+/// A mesh that deforms among the instances (a posed skinned model's): the first hit's motion takes its previous
+/// frame's vertices from where its instance's record says. Compiled out where no mesh deforms: with the read in every
+/// kernel a scene without one paid for it (a flight over a city: frame GPU +0.6 %, five pairs of five).
+pub const F_DEFORM: u32 = 1 << 30;
+/// Whether a scene with more such lights has the light tiles (`F_LISTS`): `THREERT_LIGHT_TILES=1|0`, else everywhere
+/// but Android. On Adreno 740 they took OpenStrikeRT's Foundry from 31 to 48 ms a frame (249 x 140, one bounce):
+/// there the lights are resampled as in a scene of fewer, unguided (docs/RUNTIME.md "Android").
+pub fn light_tiles_on() -> bool {
+    light_tiles_of(std::env::var("THREERT_LIGHT_TILES").ok().as_deref(), cfg!(target_os = "android"))
+}
+
+fn light_tiles_of(var: Option<&str>, android: bool) -> bool {
+    var.map_or(!android, |v| v == "1")
+}
 /// Local lights the kernel sums exactly (pathtrace.wgsl `RIS_EXACT`; the test below holds the two together).
 pub const RIS_EXACT: usize = 8;
 /// The features that change the kernel's source (an `@if` flag) rather than switch code in it (`FEAT`).
@@ -1510,38 +2035,62 @@ pub fn huge(groups: [usize; GROUPS], instanced: bool) -> bool {
 
 /// Features a scene needs; `THREERT_FEATURES` (bit mask) restricts them for profiling.
 pub fn features(scene: &Scene, groups: [usize; GROUPS]) -> u32 {
-    features_of(&scene.materials, scene.fog.as_ref(), !scene.textures.is_empty(), !scene.shaders.is_empty(), groups, instance_features(scene)) | if scene.aerial[0] > 0.0 { F_AERIAL } else { 0 }
+    features_of(&scene.materials, scene.environment.features(), !scene.textures.is_empty(), !scene.shaders.is_empty(), groups, instance_features(scene))
+}
+
+impl Params {
+    /// What the kernel takes from the render preset and the camera's exposure: the bounce limit, the depth Russian
+    /// roulette starts at, the firefly clamp on indirect paths (relative to the exposure), energy compensation.
+    pub fn set_preset(&mut self, native: &crate::desc::NativePreset, exposure: &crate::desc::Exposure) {
+        self.counts[2] = native.max_bounces;
+        self.counts[3] = native.russian_roulette_depth;
+        self.misc[0] = native.firefly_clamp(exposure);
+        self.misc[2] = native.energy_compensation;
+    }
+}
+
+/// Kernel features of the environment, which edits change: fog (F_FOG, with lit scattering F_VOLUME), a background
+/// (F_BACKGROUND), the sky's aerial perspective (F_AERIAL; `aerial`: `Params::aerial`).
+pub fn environment_features(fog: Option<&crate::desc::Fog>, background: bool, aerial: [f32; 4]) -> u32 {
+    let mut f = if background { F_BACKGROUND } else { 0 } | if aerial[0] > 0.0 { F_AERIAL } else { 0 };
+    if let Some(fog) = fog.filter(|fog| fog.density > 0.0) {
+        f |= F_FOG | if fog.volumetric.as_ref().is_some_and(|v| v.scattering > 0.0) { F_VOLUME } else { 0 };
+    }
+    f
 }
 
 /// Kernel features of the scene's structure, which parameter edits do not change: F_INST and F_MASKED for the
 /// instanced meshes (cutout triangles among them), F_MEDIA for participating media (F_HMEDIA for homogeneous ones),
-/// F_PEMIT for opaque particles, F_PROC for procedural geometry, F_TINT for instance colours.
+/// F_PEMIT for opaque particles, F_PROC for procedural geometry, F_TINT for instance colours, F_IFUNC for a material
+/// function on an instanced mesh, F_IGLASS for glass on one, F_DEFORM for a mesh that deforms.
 pub fn instance_features(scene: &Scene) -> u32 {
     // (F_GRID also for a volume function that calls `vgrid` on a node without a grid: it reads zeros.)
     let grid = !scene.grids.is_empty() || (!scene.media.is_empty() && scene.volume_fns.iter().any(|(_, code, helpers)| code.contains("vgrid(") || helpers.contains("vgrid(")));
     let media = if scene.media.is_empty() { 0 } else { F_MEDIA } | if scene.media.iter().any(|m| m.a[2] != 0) { F_HMEDIA } else { 0 } | if grid { F_GRID } else { 0 };
-    let particles = if scene.particles.iter().any(|p| !p.translucent) || !scene.gpu_particles.is_empty() { F_PEMIT } else { 0 } | if scene.procs.is_empty() { 0 } else { F_PROC } | if scene.tinted { F_TINT } else { 0 } | if scene.background.is_some() { F_BACKGROUND } else { 0 } | if scene.gpu_vcolors.is_empty() { 0 } else { F_VCOLOR } | if scene.lights.iter().filter(|l| l.pos[3] != 0.0 && l.ext[3] >= 0.5).count() > RIS_EXACT { F_LISTS } else { 0 };
+    let particles = if scene.particles.iter().any(|p| !p.translucent) || !scene.gpu_particles.is_empty() { F_PEMIT } else { 0 } | if scene.procs.is_empty() { 0 } else { F_PROC } | if scene.tinted { F_TINT } else { 0 } | if scene.gpu_vcolors.is_empty() { 0 } else { F_VCOLOR } | if light_tiles_on() && scene.lights.iter().filter(|l| l.pos[3] != 0.0 && l.ext[3] >= 0.5).count() > RIS_EXACT { F_LISTS } else { 0 };
     if scene.gpu_instances.is_empty() {
         return media | particles;
     }
-    media | particles | F_INST | if scene.meshes.iter().any(|m| m.opaque < m.count) { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
+    // (An instance's rows say its materials and their classes.)
+    let function = |mat: u32| scene.materials.get(mat as usize).is_some_and(|m| m.tex1[3] != 0);
+    let rows = |i: &crate::scene::Instance| &scene.rows[i.rows as usize..][..scene.meshes[i.mesh as usize].sect_count as usize];
+    let any_row = |bit: u32| scene.instances.iter().any(|i| rows(i).iter().any(|r| r[0] & bit != 0));
+    let mixed_glass = scene.instances.iter().any(|i| i.bits & crate::scene::INST_GLASS != 0 && i.cast_shadow);
+    let ifunc = if scene.rows.iter().any(|r| function(crate::scene::row_material(r))) { F_IFUNC } else { 0 };
+    let iglass = if mixed_glass { F_IGLASS } else { 0 };
+    let masked = any_row(crate::scene::ROW_CUTOUT);
+    let deform = if scene.meshes.iter().any(|m| m.deforms) { F_DEFORM } else { 0 };
+    media | particles | ifunc | iglass | deform | F_INST | if masked { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
 }
 
-/// `features` from the parts parameter edits change (materials, fog), and the instanced meshes' (`instance_features`).
-pub fn features_of(ms: &[crate::scene::GpuMaterial], fog: Option<&crate::desc::Fog>, textures: bool, functions: bool, groups: [usize; GROUPS], instances: u32) -> u32 {
+/// `features` from the parts parameter edits change (the materials; `environment`: `environment_features`), and the
+/// scene's structure (`instances`: `instance_features`).
+pub fn features_of(ms: &[crate::scene::GpuMaterial], environment: u32, textures: bool, functions: bool, groups: [usize; GROUPS], instances: u32) -> u32 {
     // `instances` carries the structural features (instance_features): instancing is its F_INST bit.
     let instanced = instances & F_INST != 0;
-    let mut f = instances;
+    let mut f = instances | environment;
     if groups[1] + groups[3] + groups[5] + groups[7] > 0 {
         f |= F_MASKED;
-    }
-    if let Some(fog) = fog {
-        if fog.density > 0.0 {
-            f |= F_FOG;
-            if fog.volumetric.as_ref().is_some_and(|v| v.scattering > 0.0) {
-                f |= F_VOLUME;
-            }
-        }
     }
     if textures {
         f |= F_TEX;
@@ -1609,6 +2158,26 @@ fn stamp() {
 }
 ";
 
+/// Reopen the selected Vulkan adapter with NGX's instance and device extensions. Keep the original adapter
+/// available for fallback, and never replace a non-Vulkan adapter (e.g. when WGPU_BACKEND requests DX12).
+#[cfg(dlss)]
+async fn open_dlss(
+    info: &wgpu::AdapterInfo, desc: &wgpu::DeviceDescriptor<'_>,
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue, DlssSdk, bool)> {
+    const PROJECT: uuid::Uuid = uuid::uuid!("7e2053f1-3c7a-4d3c-9a60-d28593bcfdb7");
+    let mut support = dlss_wgpu::FeatureSupport::default();
+    let instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    let instance = dlss_wgpu::create_instance(PROJECT, &instance_desc, &mut support)?;
+    anyhow::ensure!(support.super_resolution_supported, "missing NGX Vulkan instance extensions");
+    let adapter = instance.enumerate_adapters(wgpu::Backends::VULKAN).await.into_iter()
+        .find(|adapter| adapter.get_info() == *info)
+        .ok_or_else(|| anyhow!("the selected Vulkan adapter is unavailable in the NGX instance"))?;
+    let (device, queue) = dlss_wgpu::request_device(PROJECT, &adapter, desc, &mut support, Some(desc.required_limits.clone()))?;
+    anyhow::ensure!(support.super_resolution_supported, "missing NGX Vulkan device extensions");
+    let sdk = dlss_wgpu::DlssSdk::new(PROJECT, device.clone())?;
+    Ok((instance, adapter, device, queue, sdk, support.ray_reconstruction_supported))
+}
+
 impl Gpu {
     /// The GPU, waited for (the native shell; a browser has `new_async`: nothing may block there).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1667,24 +2236,51 @@ impl Gpu {
         // Compiled pipelines kept between runs, where a host gave a directory and the backend has a cache.
         let cache_feature = options.pipeline_cache.as_ref().and_then(|_| crate::pipeline_cache::PipelineCache::feature(&adapter, &adapter_info));
         features |= cache_feature.unwrap_or(wgpu::Features::empty());
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+        let device_desc = wgpu::DeviceDescriptor {
             label: Some("threert"),
             required_features: features,
             required_limits: limits,
             // Ray queries are still flagged experimental in wgpu 30.
             experimental_features: if hwrt { unsafe { wgpu::ExperimentalFeatures::enabled() } } else { wgpu::ExperimentalFeatures::disabled() },
             ..Default::default()
-        }).await?;
+        };
+        #[cfg(dlss)]
+        let (instance, adapter, device, queue, dlss_sdk, dlss_rr) = {
+            let dlss = if adapter_info.backend == wgpu::Backend::Vulkan && adapter_info.vendor == 0x10de
+                && std::env::var("THREERT_DLSS").is_ok_and(|v| v == "1")
+            {
+                match open_dlss(&adapter_info, &device_desc).await {
+                    Ok(opened) => Some(opened),
+                    Err(err) => {
+                        eprintln!("DLSS unavailable: {err:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            match dlss {
+                Some((instance, adapter, device, queue, sdk, rr)) => (instance, adapter, device, queue, Some(sdk), rr),
+                None => {
+                    let (device, queue) = adapter.request_device(&device_desc).await?;
+                    (instance, adapter, device, queue, None, false)
+                }
+            }
+        };
+        #[cfg(not(dlss))]
+        let (device, queue) = adapter.request_device(&device_desc).await?;
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));
+        let whole_tables = !merged && !options.table_views_on(merged, cfg!(target_os = "android"));
         let switches = options.kernel;
+        let approx = options.approx.unwrap_or(A_LIVE) & A_LIVE;
         let src = kernel_template();
         // Bounds checks are not needed: all indices come from our own BVH / scene builder.
         let module = unsafe {
-            let wgsl = kernel_wgsl(&src, &KernelVariant { merged, uniform_tables, guard: loop_guard_of(false), ..KernelVariant::new(hwrt, switches, 0) });
+            let wgsl = kernel_wgsl(&src, &KernelVariant { merged, uniform_tables, whole_tables, guard: loop_guard_of(false), ..KernelVariant::new(hwrt, switches, 0) });
             device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("pathtrace"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }, kernel_checks())
         };
-        let [entries, vis_entries, tl_entries] = kernel_layout_entries(LayoutShape { hwrt, merged, uniform_tables, guard: guard_room(hwrt) });
+        let [entries, vis_entries, tl_entries] = kernel_layout_entries(LayoutShape { hwrt, merged, uniform_tables, whole_tables, guard: guard_room(hwrt) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
         let vis_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("vis"), entries: &vis_entries });
         let one = device.create_texture(&wgpu::TextureDescriptor {
@@ -1712,16 +2308,33 @@ impl Gpu {
             ],
         });
         let no_vis_bufs = KernelBufs::new(&device, merged, guard_room(hwrt), 1, 64, 64, 64, 64);
-        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs);
+        let no_vis = vis_bind_group(&device, &vis_layout, &no_vis_view, &no_vis_bufs, true);
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout), Some(&vis_layout)], immediate_size: 0 });
-        let (tl_layout, tl_pipeline_layout) = if hwrt {
+        let (tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl) = if hwrt {
             let l = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("translucent"), entries: &tl_entries });
-            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vis_layout), Some(&l)], immediate_size: 0 });
-            (Some(l), Some(tpl))
+            let tl_vis: Vec<_> = vis_entries.iter().filter(|e| merged || e.binding != crate::merged::DEFERRED_BINDING).copied().collect();
+            let vl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("vis, translucent"), entries: &tl_vis });
+            let tpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("translucent"), bind_group_layouts: &[Some(&layout), Some(&vl), Some(&l)], immediate_size: 0 });
+            let nv = vis_bind_group(&device, &vl, &no_vis_view, &no_vis_bufs, false);
+            (Some(l), Some(tpl), Some(vl), Some(nv))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
-        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_pipelines: Default::default(), media_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
+        Ok(Gpu {
+            #[cfg(dlss)]
+            dlss_sdk,
+            #[cfg(dlss)]
+            dlss_rr,
+            instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, whole_tables, switches, approx, approx_default: approx, pipeline_cache, source: std::sync::Arc::new(src), module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), warming: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, fill: Default::default(), hwrt, pages: Default::default(), streams: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default(),
+        })
+    }
+
+    /// Whether this device successfully initialized NGX with DLSS Super Resolution support.
+    pub fn dlss_supported(&self) -> bool {
+        #[cfg(dlss)]
+        { self.dlss_sdk.is_some() }
+        #[cfg(not(dlss))]
+        { false }
     }
 
     /// Whether this device's kernel buffers have the loop guard's count (`guard_room`; always in the merged layout).
@@ -1743,122 +2356,134 @@ impl Gpu {
         }
     }
 
+    /// The approximations of the live views made on this device from now on (`A_*`; None: the options').
+    pub fn set_approx(&mut self, approx: Option<u32>) {
+        self.approx = approx.unwrap_or(self.approx_default) & A_LIVE;
+    }
+
     /// The path-tracing kernel specialised for a scene (feature mask + material functions), compiled on first use.
     pub fn pipeline(&self, k: &Kernel, live: bool) -> wgpu::ComputePipeline {
-        let mut cache = self.pipelines.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, live))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
-                let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
-                    layout: Some(&self.pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                    cache: self.cache(),
-                });
-                self.save_pipeline_cache();
-                p
-            })
-            .clone()
-    }
-
-    /// The kernel module for a scene: the shared one, or with its material functions spliced in.
-    fn kernel_module(&self, k: &Kernel) -> wgpu::ShaderModule {
-        let patches = k.features & F_SOURCE;
-        if patches == 0 && k.functions.is_empty() && k.volume_functions.is_empty() && k.geometry_functions.is_empty() {
-            return self.module.clone();
+        let (p, made) = self.maker().pipeline(k, live, self.cache());
+        if made {
+            self.save_pipeline_cache();
         }
-        let mut mods = self.modules.lock().unwrap();
-        mods.entry((k.hash, patches))
-            .or_insert_with(|| {
-                let splice = |src: &str, marker: &str, code: &str| -> String {
-                    if code.is_empty() {
-                        return src.to_string();
-                    }
-                    let (head, rest) = src.split_once(&format!("// @{marker}-begin")).unwrap();
-                    let (_, tail) = rest.split_once(&format!("// @{marker}-end")).unwrap();
-                    format!("{head}{code}{tail}")
-                };
-                let src = splice(&splice(&splice(&self.source, "material-functions", &k.functions), "volume-functions", &k.volume_functions), "geometry-functions", &k.geometry_functions);
-                // The variant: this device's traversal, switches, layout and loop guard, this scene's features.
-                let v = KernelVariant { merged: self.merged, uniform_tables: self.uniform_tables, guard: loop_guard_of(patches & F_UNITS != 0), ..KernelVariant::new(self.hwrt, self.switches, patches) };
-                // A scene's functions that do not compile (a game's own WGSL) cost the game its functions, not the
-                // app its renderer: the kernel is made without them, and the game's log says why. (A panic here took
-                // the engine down, and ThreeRT for Android then took the device for one without a renderer.)
-                let wgsl = try_kernel_wgsl(&src, &v).unwrap_or_else(|e| {
-                    let msg = format!("this scene's material, volume or geometry functions do not compile, so it is drawn without them: {e}");
-                    #[cfg(not(target_arch = "wasm32"))]
-                    crate::script::engine_log("error", &msg);
-                    #[cfg(target_arch = "wasm32")]
-                    eprintln!("{msg}");
-                    kernel_wgsl(&self.source, &v)
-                });
-                unsafe { self.device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("pathtrace+functions"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }, kernel_checks()) }
-            })
-            .clone()
+        p
     }
 
-    /// A live media pass of a scene's kernel variant: `media_train` (the volume voxels) or `media_composite` (camera
-    /// rays through media, after the trace).
-    pub fn media_pipeline(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
-        let mut cache = self.media_passes.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, entry))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = [("LIVE", 1.0), ("FEAT", k.features as f64)];
-                let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(entry),
-                    layout: Some(&self.pipeline_layout),
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                    cache: self.cache(),
-                });
-                self.save_pipeline_cache();
-                p
-            })
-            .clone()
+    /// The entries of the live passes made so far (`kernel_pass`), for tests: which were made, and when.
+    #[cfg(test)]
+    pub fn kernel_passes_made(&self) -> Vec<&'static str> {
+        self.kernel_passes.lock().unwrap().keys().map(|k| k.2).collect()
+    }
+
+    /// A live pass of a scene's kernel variant beside `main`: `finish` (the pixels a sample's trace left), `media_train`
+    /// (the volume voxels) or `media_composite` (camera rays through media, after the trace).
+    pub fn kernel_pass(&self, k: &Kernel, entry: &'static str) -> wgpu::ComputePipeline {
+        let (p, made) = self.maker().pass(k, entry, self.cache());
+        if made {
+            self.save_pipeline_cache();
+        }
+        p
     }
 
     /// The translucency pass's pipelines for a scene's kernel variant.
     pub fn translucent_pipelines(&self, k: &Kernel, live: bool) -> TranslucentPipelines {
-        let mut cache = self.tl_pipelines.lock().unwrap();
-        cache
-            .entry((k.features, k.hash, live))
-            .or_insert_with(|| {
-                let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
-                let make = |entry: &str| {
-                    self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(entry),
-                        layout: self.tl_pipeline_layout.as_ref(),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                        cache: self.cache(),
-                    })
-                };
-                let made = TranslucentPipelines { draw: make("translucent"), train: make("volume_train"), up: make("translucent_up") };
-                self.save_pipeline_cache();
-                made
-            })
-            .clone()
+        let (p, made) = self.maker().translucent(k, live, self.cache());
+        if made {
+            self.save_pipeline_cache();
+        }
+        p
     }
 
+    /// What makes this device's kernel modules and pipelines, for whichever thread makes them.
+    fn maker(&self) -> KernelMaker {
+        KernelMaker {
+            device: self.device.clone(),
+            source: self.source.clone(),
+            module: self.module.clone(),
+            variant: KernelVariant { merged: self.merged, uniform_tables: self.uniform_tables, whole_tables: self.whole_tables, ..KernelVariant::new(self.hwrt, self.switches, 0) },
+            layout: self.pipeline_layout.clone(),
+            tl_layout: self.tl_pipeline_layout.clone(),
+            modules: self.modules.clone(),
+            pipelines: self.pipelines.clone(),
+            passes: self.kernel_passes.clone(),
+            tl: self.tl_pipelines.clone(),
+        }
+    }
+
+    /// Whether what a live frame asks of kernel `k` is made: its `main`, the passes named, and the translucency
+    /// pass's pipelines if `translucent`.
+    pub fn kernel_ready(&self, k: &Kernel, passes: &[&'static str], translucent: bool) -> bool {
+        self.pipelines.lock().unwrap().contains_key(&(k.features, k.hash, true, k.approx_of(true)))
+            && passes.iter().all(|e| self.kernel_passes.lock().unwrap().contains_key(&(k.features, k.hash, *e, k.approx)))
+            && (!translucent || self.tl_pipelines.lock().unwrap().contains_key(&(k.features, k.hash, true, k.approx_of(true))))
+    }
+
+    /// Makes what `kernel_ready` asks of `k` on another thread, each pipeline on one of its own (a driver compiles a
+    /// kernel variant for half a second to tens of seconds): the frame goes on with the kernel it has and takes this
+    /// one when it is ready. Nothing if it is ready, or being made.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn warm_kernel(&self, k: &Kernel, passes: &[&'static str], translucent: bool) {
+        if self.kernel_ready(k, passes, translucent) || !self.warming.lock().unwrap().insert((k.features, k.hash, k.approx)) {
+            return;
+        }
+        let (maker, k, passes, warming) = (self.maker(), k.clone(), passes.to_vec(), self.warming.clone());
+        let work = move || {
+            // (The module first: every pipeline is made of it.)
+            let _ = maker.module(&k);
+            std::thread::scope(|s| {
+                s.spawn(|| maker.pipeline(&k, true, None));
+                for entry in &passes {
+                    s.spawn(|| maker.pass(&k, entry, None));
+                }
+                if translucent {
+                    s.spawn(|| maker.translucent(&k, true, None));
+                }
+            });
+            warming.lock().unwrap().remove(&(k.features, k.hash, k.approx));
+        };
+        std::thread::spawn(work);
+    }
+
+    /// (A browser has no thread to give, and its device is one thread's: its frame makes its kernel itself,
+    /// live/frame.rs `choose_kernel`.)
+    #[cfg(target_arch = "wasm32")]
+    pub fn warm_kernel(&self, _: &Kernel, _: &[&'static str], _: bool) {}
+
     /// The translucency pass's bind group (group 2) drawing into `target` (live: the composed image; offline: sums);
-    pub fn translucent_bind_group(&self, t: &Translucent, target: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// `low`: (colour, transmittance) per traced pixel, where a live view draws below full resolution
+    /// (`translucent_low`; translucent.wgsl `tlow`).
+    pub fn translucent_bind_group(&self, t: &Translucent, target: &wgpu::Buffer, low: &wgpu::Buffer) -> wgpu::BindGroup {
         fn e(b: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry { binding: b, resource: buf.as_entire_binding() }
         }
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("translucent"),
             layout: self.tl_layout.as_ref().unwrap(),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: t.tlas.as_binding() }, e(1, &t.params), e(2, target), e(3, &t.points), e(4, &t.count), e(5, &t.low)],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: t.tlas.as_binding() }, e(1, &t.params), e(2, target), e(3, &t.points), e(4, &t.count), e(5, low)],
         })
+    }
+
+    /// A view's buffer of the trace's samples (`Uploaded::accum`): a `Pixel` a pixel, the largest buffer a view holds
+    /// (`view_fits`).
+    pub fn accum_buffer(&self, w: u32, h: u32) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("accum"), size: w as u64 * h as u64 * SAMPLE_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+    }
+
+    /// Whether this device holds a view of `w` x `h` (its samples in one buffer).
+    pub fn view_fits(&self, w: u32, h: u32) -> bool {
+        self.buffer_fits(w as u64 * h as u64 * SAMPLE_BYTES)
+    }
+
+    /// A view's buffer for translucent particles drawn below full resolution (`translucent_bind_group`'s `low`).
+    pub fn translucent_low(&self, w: u32, h: u32) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent low"), size: (w as u64 * h as u64).max(1) * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
+    }
+
+    /// Another buffer for the trace's samples (a view of another size): the scene bound again with it.
+    pub fn set_accum(&self, up: &mut Uploaded, accum: &wgpu::Buffer) {
+        up.accum = accum.clone();
+        self.rebind_scene(up);
     }
 
     /// The radiance cache's per-frame resolve (pathtrace.wgsl `cache_resolve`; kernel bind groups).
@@ -1880,25 +2505,14 @@ impl Gpu {
     fn texture_pages(&self, scene: &Scene, timings: &mut Vec<(String, f64)>) -> (wgpu::TextureView, std::sync::Arc<Vec<[f32; 4]>>) {
         let key = crate::texpack::set_key(&scene.textures);
         let mut cache = self.pages.lock().unwrap();
-        if let Some((k, view, info)) = cache.as_ref() {
-            if *k == key {
-                return (view.clone(), info.clone());
+        if let Some(p) = cache.as_ref() {
+            if p.key == key {
+                return (p.view.clone(), p.info.clone());
             }
         }
         let t = Instant::now();
-        let d = &self.device;
         let packed = crate::texpack::pack(&scene.textures);
-        let side = packed.side;
-        let tex = d.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture pages"),
-            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: packed.layers.len() as u32 },
-            mip_level_count: crate::texpack::MIPS,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let tex = self.pages_texture(packed.side, packed.layers.len() as u32);
         for (z, chain) in packed.layers.iter().enumerate() {
             for (lvl, img) in chain.iter().enumerate() {
                 self.queue.write_texture(
@@ -1911,15 +2525,143 @@ impl Gpu {
         }
         let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let info = std::sync::Arc::new(packed.info);
+        // Streams show their last picture, not the one the scene was described with.
+        let last = self.streams.lock().unwrap();
+        for (name, place) in &packed.streams {
+            if let Some(img) = last.get(name) {
+                self.write_place(&tex, place, img);
+            }
+        }
         timings.push(("texture_pages_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
-        *cache = Some((key, view.clone(), info.clone()));
+        let keys = scene.textures.iter().map(|t| (t.key.clone(), t.width, t.height, t.wrap)).collect();
+        *cache = Some(Pages { key, texture: tex, view: view.clone(), info: info.clone(), streams: packed.streams, atlas: packed.atlas, keys });
         (view, info)
+    }
+
+    /// The pages' texture: `layers` square layers of `side`, `texpack::MIPS` levels. (A source of copies too: the
+    /// pages grow by a copy on the GPU, `place_texture`.)
+    fn pages_texture(&self, side: u32, layers: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture pages"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+            mip_level_count: crate::texpack::MIPS,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// The slot of texture `t` in the uploaded scene's pages; a texture they have not got is placed in them now
+    /// (`texpack::Atlas::place`) and its pixels written there, every level. Nothing is packed again: where the pages
+    /// have no room they become a texture with a layer more, or a longer side, and what they hold is copied there
+    /// on the GPU. (A texture the scene no longer uses keeps its place until the scene is loaded again.)
+    pub fn place_texture(&self, t: &crate::scene::Texture) -> Result<PagesEdit> {
+        use crate::texpack::{set_key_of, stream_name, MIPS};
+        let mut cache = self.pages.lock().unwrap();
+        let pages = cache.as_mut().ok_or_else(|| anyhow!("no scene's pages to place a texture in"))?;
+        if let Some(slot) = pages.keys.iter().position(|k| k.0 == t.key) {
+            return Ok(PagesEdit { slot: slot as i32, info: None, view: None });
+        }
+        let rows = crate::merged::UNIFORM_TABLES.iter().find(|u| u.table == crate::heap::Table::TexInfo).map_or(u32::MAX, |u| u.len);
+        if self.uniform_tables && (pages.keys.len() as u32 + 1) * 2 > rows {
+            return Err(anyhow!("more textures than this device's texture table holds ({})", rows / 2));
+        }
+        let (side, layers) = (pages.atlas.side, pages.atlas.layers());
+        // (On a copy: one that finds no room leaves the pages' record as it was.)
+        let mut atlas = pages.atlas.clone();
+        let place = atlas.place(t.width, t.height, t.wrap, self.device.limits().max_texture_array_layers).ok_or_else(|| anyhow!("no room in the texture pages"))?;
+        pages.atlas = atlas;
+        let mut view = None;
+        if (pages.atlas.side, pages.atlas.layers()) != (side, layers) {
+            let tex = self.pages_texture(pages.atlas.side, pages.atlas.layers());
+            let mut e = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("texture pages grow") });
+            for level in 0..MIPS {
+                let at = |texture| wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+                let s = (side >> level).max(1);
+                e.copy_texture_to_texture(at(&pages.texture), at(&tex), wgpu::Extent3d { width: s, height: s, depth_or_array_layers: layers });
+            }
+            self.queue.submit([e.finish()]);
+            pages.view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            pages.texture = tex;
+            view = Some(pages.view.clone());
+        }
+        // (A stream shows its last picture, as in pages packed whole.)
+        let last = stream_name(&t.key).and_then(|n| self.streams.lock().unwrap().get(n).cloned());
+        self.write_place(&pages.texture, &place, last.as_deref().unwrap_or(&t.rgba));
+        if let Some(n) = stream_name(&t.key) {
+            pages.streams.push((n.to_string(), place));
+        }
+        pages.keys.push((t.key.clone(), t.width, t.height, t.wrap));
+        pages.key = set_key_of(pages.keys.iter().map(|k| (k.0.as_str(), k.1, k.2, k.3)));
+        pages.info = std::sync::Arc::new(pages.atlas.info());
+        Ok(PagesEdit { slot: pages.keys.len() as i32 - 1, info: Some(pages.info.clone()), view })
+    }
+
+    /// The slot of the texture of `key` (`scene::Texture::key_of`) in the uploaded scene's pages, if they have it.
+    pub fn texture_slot(&self, key: &str) -> Option<i32> {
+        self.pages.lock().unwrap().as_ref()?.keys.iter().position(|k| k.0 == key).map(|s| s as i32)
+    }
+
+    /// New pixels for the texture in `slot`, written over the old ones in the pages: where their size in the pages
+    /// and their wrap are the same. False, and nothing written, where they are not (the texture is then placed as
+    /// another: `place_texture`).
+    pub fn rewrite_texture(&self, slot: i32, t: &crate::scene::Texture) -> bool {
+        let mut cache = self.pages.lock().unwrap();
+        let Some(pages) = cache.as_mut() else { return false };
+        let Some(place) = pages.atlas.places.get(slot as usize).copied() else { return false };
+        if crate::texpack::content_size(t.width, t.height) != place.size || t.wrap != place.wrap || crate::texpack::stream_name(&t.key).is_some() {
+            return false;
+        }
+        self.write_place(&pages.texture, &place, &t.rgba);
+        pages.keys[slot as usize] = (t.key.clone(), t.width, t.height, t.wrap);
+        pages.key = crate::texpack::set_key_of(pages.keys.iter().map(|k| (k.0.as_str(), k.1, k.2, k.3)));
+        true
+    }
+
+    /// The pages' textures as they are now, by slot: (key, width, height, wrap), their side and their layers.
+    #[cfg(test)]
+    pub fn pages_state(&self) -> (Vec<(String, u32, u32, bool)>, u32, u32, Vec<crate::texpack::Place>) {
+        let cache = self.pages.lock().unwrap();
+        let p = cache.as_ref().expect("pages");
+        (p.keys.clone(), p.atlas.side, p.atlas.layers(), p.atlas.places.clone())
+    }
+
+    fn write_place(&self, pages: &wgpu::Texture, place: &crate::texpack::Place, img: &image::RgbaImage) {
+        for l in crate::texpack::patch(place, img) {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: pages, mip_level: l.level, origin: wgpu::Origin3d { x: l.x, y: l.y, z: place.layer }, aspect: wgpu::TextureAspect::All },
+                &l.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(l.width * 4), rows_per_image: Some(l.height) },
+                wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// New pixels for the stream texture `name` (world.rs `TextureSource::Stream`): written into its place in the
+    /// texture pages, every mip level, before the next frame's passes. Nothing of the scene is rebuilt. True when the
+    /// uploaded scene has the stream; the picture is kept either way, for the pages a later scene packs.
+    pub fn write_stream(&self, name: &str, width: u32, height: u32, rgba: &[u8]) -> Result<bool> {
+        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or_else(|| anyhow::anyhow!("stream {name}: {} bytes are not {width}x{height} RGBA8 pixels", rgba.len()))?;
+        let img = std::sync::Arc::new(img);
+        self.streams.lock().unwrap().insert(name.to_string(), img.clone());
+        let cache = self.pages.lock().unwrap();
+        let Some(pages) = cache.as_ref() else { return Ok(false) };
+        let mut found = false;
+        for (n, place) in &pages.streams {
+            if n == name {
+                self.write_place(&pages.texture, place, &img);
+                found = true;
+            }
+        }
+        Ok(found)
     }
 
     /// Uploads a prepared scene (geometry, materials, textures, environment, acceleration structures) and returns the
     /// bind group used by both the offline and the live kernels. `accum` holds one 80-byte Pixel per output pixel.
     #[allow(clippy::too_many_arguments)]
-    pub fn upload(&self, scene: &Scene, w: u32, h: u32, tri_verts: &[[f32; 4]], groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], timings: &mut Vec<(String, f64)>) -> Result<Uploaded> {
+    pub fn upload(&self, scene: &Scene, accum: &wgpu::Buffer, groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], emitter_tris: &[crate::GpuEmitterTri], emitter_runs: &crate::EmitterRuns, light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], timings: &mut Vec<(String, f64)>) -> Result<Uploaded> {
         let d = &self.device;
         let t0 = Instant::now();
         // (The vertices too: the kernel's tree over no triangle is a leaf of triangle 0, which these zeros make a
@@ -1943,82 +2685,39 @@ impl Gpu {
         let records: Vec<crate::scene::GpuInstance> = scene.gpu_instances.iter().chain(&scene.proc_records).copied().collect();
         // (Software traversal's units have room as hardware traversal's instances do: `prepare` sized their trees'
         // by the same figures.)
-        let room = EditRoom::for_scene(scene, tri_verts.len() / 3, records.len(), self.hwrt, scene.units.is_some());
+        let room = EditRoom::for_scene(scene, scene.indexed.rows.len(), records.len(), self.hwrt, scene.units.is_some());
         let st = wgpu::BufferUsages::STORAGE;
         // (COPY_SRC: the live view's in-place edits grow these past their room by a copy, live/edits.rs `edit_geometry`.)
         let edit = st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-        let b_verts = buf_room("verts", bytemuck::cast_slice(tri_verts), room.tris * 48, edit | wgpu::BufferUsages::COPY_SRC);
         let dynamic_first: usize = groups[..4].iter().sum();
-        // The dynamic tail (groups 4..8; the instanced pool follows it, its deforming meshes first: theirs too).
-        let dynamic_end: usize = groups.iter().sum::<usize>() + crate::scene::deforming_pool(&scene.meshes);
-        let prev = &tri_verts[(dynamic_first * 3).min(tri_verts.len())..(dynamic_end * 3).min(tri_verts.len())];
-        let b_prev = buf("prev verts", bytemuck::cast_slice(prev), edit);
+        // A particle's triangle's first vertex: three vertices a triangle, from the first vertex that moves (a dynamic
+        // world-space triangle) or the first translucent one.
+        let (moving, translucent, trans_first) = (scene.indexed.dynamic.0, scene.indexed.translucent, scene.trans_first);
+        let vertex_of = move |tri: u32, trans: bool| if trans { translucent + (tri - trans_first) * 3 } else { moving + (tri - dynamic_first as u32) * 3 };
+        // The vertices, with room for three a triangle of the edit room; and those that move, as they are (their
+        // previous frame's).
+        let ix = &scene.indexed;
+        anyhow::ensure!(scene.meshes.iter().all(|m| m.sect_count as usize <= crate::scene::MESH_SECTIONS), "a mesh with more than 65,536 sections");
+        let b_vertices = buf_room("vertices", bytemuck::cast_slice(&ix.vertices), room.tris * 3 * crate::indexed::VERTEX_BYTES, edit | if self.hwrt { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() });
+        let b_prev = buf("previous vertices", bytemuck::cast_slice(&ix.vertices[ix.dynamic.0 as usize..(ix.dynamic.0 + ix.dynamic.1) as usize]), edit);
+        // (A particle pass's own last positions of the vertices that move: 16 bytes each.)
+        let last_bytes = ix.dynamic.1.max(1) as u64 * 16;
         // The vertex colours' bytes on the GPU (the edit room's included).
         timings.push(("vcolor_mb".into(), if scene.gpu_vcolors.is_empty() { 0.0 } else { (scene.gpu_vcolors.len() * 4 + room.tris * 12) as f64 / (1 << 20) as f64 }));
-        let b_attrs = buf_room("attrs", bytemuck::cast_slice(&scene.attrs), room.tris * std::mem::size_of::<crate::scene::GpuTriAttr>(), edit);
         // (With units, edits write trees into it: units.rs.)
-        let b_nodes = buf("nodes", nodes, if scene.units.is_some() { st | wgpu::BufferUsages::COPY_DST } else { st });
-        // What the triangles hold on the GPU besides their BLASes: vertices (a, e1, e2), attributes, the software BVH's nodes
+        // (COPY_SRC: read back by the test that holds a refit tree to its triangles.)
+        let b_nodes = buf("nodes", nodes, if scene.units.is_some() { st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC } else { st });
+        // (Software traversal: the trees' leaves, with the edit room's.)
+        let b_leaves = buf_room("leaves", bytemuck::cast_slice(&ix.leaves), if self.hwrt { 0 } else { room.tris * crate::indexed::LEAF_BYTES }, edit);
+        // What the triangles hold on the GPU besides their BLASes: vertices (48 B each), indices (12 B a triangle), the
+        // rows of those that have one (16 B), and the software BVH: its nodes and its leaves' triangles (48 B each)
         // (ROADMAP § 6 step 2's table: a meshed representation against voxel data).
-        timings.push(("tri_data_mb".into(), (std::mem::size_of_val(tri_verts) + std::mem::size_of_val(&scene.attrs[..]) + nodes.len()) as f64 / (1 << 20) as f64));
-        let (words, region_words, proc_room) = self.upload_words(scene, env_cdf, room.proc_words, room.tris, timings)?;
+        timings.push(("tri_data_mb".into(), (ix.vertices.len() * crate::indexed::VERTEX_BYTES + ix.indices.len() * 12 + ix.gpu_rows().len() * 16 + ix.leaves.len() * crate::indexed::LEAF_BYTES + nodes.len()) as f64 / (1 << 20) as f64));
+        let (words, region_words, proc_room) = self.upload_words(scene, env_cdf, room.proc_words, room.tris, room.records, timings)?;
         let room = EditRoom { proc_words: proc_room, ..room };
-        // Density grids: field A of each in the atlas (stacked along z), their data; for a grid with a program, its
-        // other textures (A', B, B'), its two half steps and its sources.
-        let grids = (!scene.grids.is_empty()).then(|| {
-            let dims = [scene.grids.iter().map(|g| g.dims[0]).max().unwrap(), scene.grids.iter().map(|g| g.dims[1]).max().unwrap(), scene.grids.iter().map(|g| g.dims[2]).sum()];
-            let atlas = grid_texture(d, "grid atlas", dims, true);
-            let atlas_view = atlas.create_view(&Default::default());
-            let smp = d.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-            let grids = scene
-                .grids
-                .iter()
-                .map(|g| {
-                    if let Some(data) = &g.data {
-                        self.write_grid(&atlas, g.z0, g.dims, data);
-                    }
-                    let sim = g.program.map(|program| {
-                        let tex = |label: &str| grid_texture(d, label, g.dims, true).create_view(&Default::default());
-                        let field_b = grid_texture(d, "grid B", g.dims, true);
-                        let (a2, b, b2) = (tex("grid A'"), field_b.create_view(&Default::default()), tex("grid B'"));
-                        let sources = d.create_buffer(&wgpu::BufferDescriptor { label: Some("grid sources"), size: (crate::world::GRID_MAX_SOURCES * 48) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                        let step = |src_a: &wgpu::TextureView, src_b: &wgpu::TextureView, dst_a: &wgpu::TextureView, dst_b: &wgpu::TextureView| {
-                            let u = d.create_buffer(&wgpu::BufferDescriptor { label: Some("grid step"), size: std::mem::size_of::<GridStepGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                            fn tv(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-                                wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
-                            }
-                            let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("grid step"),
-                                layout: &self.grid_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
-                                    tv(1, src_a),
-                                    tv(2, src_b),
-                                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&smp) },
-                                    tv(4, dst_a),
-                                    tv(5, dst_b),
-                                    wgpu::BindGroupEntry { binding: 6, resource: sources.as_entire_binding() },
-                                ],
-                            });
-                            (u, bg)
-                        };
-                        let steps = [step(&atlas_view, &b, &a2, &b2), step(&a2, &b2, &atlas_view, &b)];
-                        let m = &scene.media[g.medium as usize];
-                        GridSim { b: field_b, program, params: g.params, steps, sources, placed: std::cell::Cell::new((m.w, m.c)) }
-                    });
-                    GridGpu { id: g.id, node: g.node, dims: g.dims, z0: g.z0, made: g.made, sim }
-                })
-                .collect::<Vec<_>>();
-            let pipeline = grids.iter().any(|g| g.sim.is_some()).then(|| {
-                let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("grid sim"), source: wgpu::ShaderSource::Wgsl(grid_sim_source(scene).into()) });
-                let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grid sim"), bind_group_layouts: &[Some(&self.grid_layout)], immediate_size: 0 });
-                d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("grid sim"), layout: Some(&layout), module: &module, entry_point: Some("grid_sim"), compilation_options: Default::default(), cache: self.cache() })
-            });
-            GridsGpu { atlas, pipeline, grids, step: std::cell::Cell::new(0) }
-        });
+        let grids = self.make_grids(&scene.grids, &scene.media, &scene.grid_programs);
         let grid_view = grids.as_ref().map_or_else(|| self.no_grid_view.clone(), |g| g.atlas.create_view(&Default::default()));
-        let accum_size = (w as u64) * (h as u64) * 80;
-        let b_accum = d.create_buffer(&wgpu::BufferDescriptor { label: Some("accum"), size: accum_size, usage: st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let b_accum = accum.clone();
         let b_params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("params"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let (tex_view, tex_info) = self.texture_pages(scene, timings);
@@ -2037,27 +2736,13 @@ impl Gpu {
             (Table::Instances, bytemuck::cast_slice(if records.is_empty() { &none[..] } else { &records[..] }), room.records * std::mem::size_of::<crate::scene::GpuInstance>()),
             (Table::Media, bytemuck::cast_slice(&scene.media), 0),
             (Table::Energy, bytemuck::cast_slice(energy), 0),
+            (Table::GlassEnergy, bytemuck::cast_slice(crate::glass_energy_lut()), 0),
+            (Table::EmitterTris, bytemuck::cast_slice(emitter_tris), 0),
         ];
         assert!(parts.iter().enumerate().all(|(k, p)| p.0.index() == k), "the tables in `Table`'s order");
         let heap = Heap::filled(d, &parts.map(|p| (p.1.len() + p.2) as u64), |put| parts.iter().for_each(|p| put(p.0, 0, p.1)));
 
-        let env_tex = d.create_texture(&wgpu::TextureDescriptor {
-            label: Some("env"),
-            size: wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let half: Vec<u16> = env.texels.iter().flat_map(|t| t.iter().map(|v| half::f16::from_f32(v.min(65000.0)).to_bits())).collect();
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &env_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&half),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(env.width * 8), rows_per_image: Some(env.height) },
-            wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
-        );
+        let env_tex = self.env_texture(env);
         let env_view = env_tex.create_view(&Default::default());
         let sampler = d.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -2072,21 +2757,15 @@ impl Gpu {
         let mut accel = None;
         if self.hwrt {
             let tb = Instant::now();
-            let verts: Vec<[f32; 3]> = tri_verts
-                .chunks(3)
-                .flat_map(|t| {
-                    let v0 = [t[0][0], t[0][1], t[0][2]];
-                    crate::scene::blas_tri([v0, [v0[0] + t[1][0], v0[1] + t[1][1], v0[2] + t[1][2]], [v0[0] + t[2][0], v0[1] + t[2][1], v0[2] + t[2][2]]])
-                })
-                .collect();
-            let vbuf = buf_room("blas_verts", bytemuck::cast_slice(&verts), room.tris * 36, wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE);
             let huge_scene = huge(groups, !scene.gpu_instances.is_empty());
+            // (The indices' first word in the words' heap.)
+            let index_first = (words.at(Stream::Indices) / 4) as u32;
             let mut first = 0usize;
-            let groups: Vec<(usize, usize, u8, bool)> = groups
+            let groups: Vec<(usize, usize, u8)> = groups
                 .iter()
                 .enumerate()
                 .map(|(g, &count)| {
-                    let r = (first, count, if g % 4 < 2 { 1u8 } else { 2u8 }, g % 2 == 0);
+                    let r = (first, count, if g % 4 < 2 { 1u8 } else { 2u8 });
                     first += count;
                     r
                 })
@@ -2095,16 +2774,18 @@ impl Gpu {
             let mut t = d.create_tlas(&wgpu::CreateTlasDescriptor { label: None, max_instances: (GROUPS + scene.instances.len() + scene.procs.len() + room.records) as u32, flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build });
             let sizes: Vec<wgpu::BlasTriangleGeometrySizeDescriptor> = groups
                 .iter()
-                .map(|&(_, count, _, opaque)| wgpu::BlasTriangleGeometrySizeDescriptor {
+                .map(|&(_, count, _)| wgpu::BlasTriangleGeometrySizeDescriptor {
                     vertex_format: wgpu::VertexFormat::Float32x3,
-                    vertex_count: (count * 3) as u32,
-                    index_format: None,
-                    index_count: None,
-                    flags: if opaque { wgpu::AccelerationStructureGeometryFlags::OPAQUE } else { wgpu::AccelerationStructureGeometryFlags::empty() },
+                    // (A world-space triangle's indices count from vertex 0: any of the world-space vertices.)
+                    vertex_count: ix.flat.max(1),
+                    index_format: Some(wgpu::IndexFormat::Uint32),
+                    index_count: Some((count * 3) as u32),
+                    // (Every geometry is flagged opaque, a cutout's too: every query forces opacity, trace_hw.wgsl.)
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
                 })
                 .collect();
             let mut blases = vec![];
-            for (i, (first, count, mask, _)) in groups.iter().enumerate() {
+            for (i, (first, count, mask)) in groups.iter().enumerate() {
                 if *count == 0 {
                     continue;
                 }
@@ -2122,24 +2803,25 @@ impl Gpu {
             }
             // Instanced meshes: one opaque model-space BLAS each, a TLAS instance per placement (custom data
             // INSTANCE_BIT | record; shadow casters mask 1).
-            // Per mesh: (first triangle, count, opaque) geometries: the opaque part, then the cutout part (any-hit).
-            let mesh_parts: Vec<Vec<(u32, u32, bool)>> = scene.meshes.iter().map(|m| [(m.first, m.opaque, true), (m.first + m.opaque, m.count - m.opaque, false)].into_iter().filter(|p| p.1 > 0).collect()).collect();
+            // Per mesh: its geometries, one a section (`InstMesh::parts`): first triangle, count.
+            let mesh_parts: Vec<Vec<(u32, u32)>> = scene.meshes.iter().map(|m| m.parts(&scene.sections).into_iter().map(|(at, count)| (m.first + at, count)).collect()).collect();
             let mesh_sizes: Vec<Vec<wgpu::BlasTriangleGeometrySizeDescriptor>> = mesh_parts
                 .iter()
-                .map(|parts| {
+                .zip(&ix.meshes)
+                .map(|(parts, &(_, vertices))| {
                     parts
                         .iter()
-                        .map(|&(_, count, opaque)| wgpu::BlasTriangleGeometrySizeDescriptor {
+                        .map(|&(_, count)| wgpu::BlasTriangleGeometrySizeDescriptor {
                             vertex_format: wgpu::VertexFormat::Float32x3,
-                            vertex_count: count * 3,
-                            index_format: None,
-                            index_count: None,
-                            flags: if opaque { wgpu::AccelerationStructureGeometryFlags::OPAQUE } else { wgpu::AccelerationStructureGeometryFlags::empty() },
+                            vertex_count: vertices.max(1),
+                            index_format: Some(wgpu::IndexFormat::Uint32),
+                            index_count: Some(count * 3),
+                            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
                         })
                         .collect()
                 })
                 .collect();
-            // Deforming meshes (shared poses) are rebuilt every new pose: built fast rather than traced fast, as the dynamic
+            // Deforming meshes (posed skinned models') are rebuilt every new pose: built fast rather than traced fast, as the dynamic
             // groups are.
             let meshes: Vec<wgpu::Blas> = mesh_sizes
                 .iter()
@@ -2149,14 +2831,15 @@ impl Gpu {
                     d.create_blas(&wgpu::CreateBlasDescriptor { label: None, flags, update_mode: wgpu::AccelerationStructureUpdateMode::Build }, wgpu::BlasGeometrySizeDescriptors::Triangles { descriptors: s.clone() })
                 })
                 .collect();
-            // What the triangle BLASes hold (Metal's own sizes; each instanced mesh once) and their vertex buffer.
-            let group_parts = groups.iter().filter(|g| g.1 > 0).map(|&(first, count, _, opaque)| vec![((first * 3) as u32, (count * 3) as u32, opaque)]);
-            let mesh_vertex_parts = mesh_parts.iter().map(|ps| ps.iter().map(|&(first, count, opaque)| ((pool_first as u32 + first) * 3, count * 3, opaque)).collect::<Vec<_>>());
+            // What the triangle BLASes hold (Metal's own sizes; each instanced mesh once). A geometry: its first vertex
+            // and how many, its first triangle and how many.
+            let group_parts = groups.iter().filter(|g| g.1 > 0).map(|&(first, count, _)| vec![(0, ix.flat.max(1), first as u32, count as u32)]);
+            let mesh_vertex_parts = mesh_parts.iter().zip(&ix.meshes).map(|(ps, &(vfirst, vcount))| ps.iter().map(|&(first, count)| (vfirst, vcount.max(1), pool_first as u32 + first, count)).collect::<Vec<_>>());
             let mut blas_per_tri = 0.0;
-            let parts: Vec<Vec<(u32, u32, bool)>> = group_parts.chain(mesh_vertex_parts).collect();
-            if let Some(bytes) = parts.iter().map(|ps| self.tri_blas_bytes(&vbuf, ps)).sum::<Option<u64>>() {
-                timings.push(("tri_blas_mb".into(), (bytes + vbuf.size()) as f64 / (1 << 20) as f64));
-                let tris: u64 = parts.iter().flatten().map(|p| p.1 as u64 / 3).sum();
+            let parts: Vec<Vec<(u32, u32, u32, u32)>> = group_parts.chain(mesh_vertex_parts).collect();
+            if let Some(bytes) = parts.iter().map(|ps| self.tri_blas_bytes(&b_vertices, &words.buffer, index_first, ps)).sum::<Option<u64>>() {
+                timings.push(("tri_blas_mb".into(), bytes as f64 / (1 << 20) as f64));
+                let tris: u64 = parts.iter().flatten().map(|p| p.3 as u64).sum();
                 blas_per_tri = bytes as f64 / tris.max(1) as f64;
             }
             let base = blases.len();
@@ -2208,28 +2891,28 @@ impl Gpu {
                     blas,
                     geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
                         size,
-                        vertex_buffer: &vbuf,
-                        first_vertex: (*first * 3) as u32,
-                        vertex_stride: 12,
-                        index_buffer: None,
-                        first_index: None,
+                        vertex_buffer: &b_vertices,
+                        first_vertex: 0,
+                        vertex_stride: VERTEX_STRIDE,
+                        index_buffer: Some(&words.buffer),
+                        first_index: Some(index_first + (*first * 3) as u32),
                         transform_buffer: None,
                         transform_buffer_offset: None,
                     }]),
                 })
-                .chain(meshes.iter().zip(&mesh_sizes).zip(&mesh_parts).map(|((blas, sizes), parts)| wgpu::BlasBuildEntry {
+                .chain(meshes.iter().zip(&mesh_sizes).zip(&mesh_parts).zip(&ix.meshes).map(|(((blas, sizes), parts), &(first_vertex, _))| wgpu::BlasBuildEntry {
                     blas,
                     geometry: wgpu::BlasGeometries::TriangleGeometries(
                         sizes
                             .iter()
                             .zip(parts)
-                            .map(|(size, &(first, _, _))| wgpu::BlasTriangleGeometry {
+                            .map(|(size, &(first, _))| wgpu::BlasTriangleGeometry {
                                 size,
-                                vertex_buffer: &vbuf,
-                                first_vertex: ((pool_first + first as usize) * 3) as u32,
-                                vertex_stride: 12,
-                                index_buffer: None,
-                                first_index: None,
+                                vertex_buffer: &b_vertices,
+                                first_vertex,
+                                vertex_stride: VERTEX_STRIDE,
+                                index_buffer: Some(&words.buffer),
+                                first_index: Some(index_first + ((pool_first + first as usize) * 3) as u32),
                                 transform_buffer: None,
                                 transform_buffer_offset: None,
                             })
@@ -2241,13 +2924,39 @@ impl Gpu {
                     geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry { size, stride: 24, aabb_buffer: boxes, primitive_offset: 0 }]),
                 }))
                 .collect();
-            let mut enc = d.create_command_encoder(&Default::default());
-            enc.build_acceleration_structures(entries.iter(), [&t]);
-            self.queue.submit([enc.finish()]);
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            // In batches of at most BLAS_BATCH_TRIS triangles (a BLAS larger alone), each submitted and waited for, the
+            // TLAS with the last: wgpu-core gives one build a single scratch buffer for all its BLASes, the sum of theirs,
+            // and on a GPU of 8 GB a city's (a few thousand meshes) did not fit beside the scene.
+            let tris_of = |e: &wgpu::BlasBuildEntry<'_>| -> u64 {
+                match &e.geometry {
+                    wgpu::BlasGeometries::TriangleGeometries(g) => g.iter().map(|x| x.size.index_count.unwrap_or(x.size.vertex_count) as u64 / 3).sum(),
+                    wgpu::BlasGeometries::AabbGeometries(g) => g.iter().map(|x| x.size.primitive_count as u64).sum(),
+                }
+            };
+            let mut start = 0;
+            loop {
+                let mut end = start;
+                let mut tris = 0;
+                while end < entries.len() && (end == start || tris + tris_of(&entries[end]) <= BLAS_BATCH_TRIS) {
+                    tris += tris_of(&entries[end]);
+                    end += 1;
+                }
+                let mut enc = d.create_command_encoder(&Default::default());
+                if end == entries.len() {
+                    enc.build_acceleration_structures(entries[start..end].iter(), [&t]);
+                } else {
+                    enc.build_acceleration_structures(entries[start..end].iter(), std::iter::empty::<&wgpu::Tlas>());
+                }
+                self.queue.submit([enc.finish()]);
+                self.device.poll(wgpu::PollType::wait_indefinitely())?;
+                if end == entries.len() {
+                    break;
+                }
+                start = end;
+            }
             drop(entries);
             let mesh_geo = mesh_parts.into_iter().zip(mesh_sizes).collect();
-            accel = Some(Accel { tlas: t, verts: vbuf, blases, meshes, mesh_geo, pool_first, inst_base: base, proc_base, blas_per_tri });
+            accel = Some(Accel { tlas: t, vertices: b_vertices.clone(), indices: words.buffer.clone(), index_first, mesh_verts: ix.meshes.clone(), flat_verts: ix.flat, blases, meshes, mesh_geo, pool_first, inst_base: base, proc_base, blas_per_tri });
             timings.push(("accel_build_ms".into(), tb.elapsed().as_secs_f64() * 1000.0));
         }
         fn e(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -2262,9 +2971,9 @@ impl Gpu {
             }
             self.uniform_copies(&heap)
         });
-        let bg_parts = BindParts { nodes: b_nodes, tex_view, env_view, sampler, grid_view };
-        let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, verts: &b_verts, attrs: &b_attrs, heap: &heap, words: &words, prev_verts: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
-        let kernel = Kernel::new(scene, groups);
+        let bg_parts = BindParts { nodes: b_nodes, leaves: b_leaves, tex_view, env_view, sampler, grid_view };
+        let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, vertices: &b_vertices, heap: &heap, words: &words, prev_vertices: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
+        let kernel = Kernel { approx: self.approx, ..Kernel::new(scene, groups) };
         // Translucent particles (hardware RT): their own BLAS + TLAS, rebuilt after the particle pass.
         let translucent = match &accel {
             Some(_) if !scene.trans_tris.is_empty() => {
@@ -2276,12 +2985,10 @@ impl Gpu {
                 );
                 let mut tlas = d.create_tlas(&wgpu::CreateTlasDescriptor { label: Some("translucent"), max_instances: 1, flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build });
                 tlas[0] = Some(wgpu::TlasInstance::new(&blas, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0, 0xff));
-                let verts = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent blas verts"), size: n as u64 * 36, usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
                 let points = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume points"), size: VOLUME_TRAIN_CAP as u64 * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let count = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume point count"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let low = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent low"), size: (w as u64 * h as u64).max(1) * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-                let t = Translucent { blas, tlas, size, verts, first: scene.trans_first, params, points, count, low };
+                let t = Translucent { blas, tlas, size, vertices: b_vertices.clone(), first_vertex: ix.translucent, first: scene.trans_first, params, points, count };
                 // Built once now (collapsed quads): bind groups may use the TLAS before the first particle pass.
                 let mut enc = d.create_command_encoder(&Default::default());
                 t.build(&mut enc);
@@ -2300,8 +3007,8 @@ impl Gpu {
                 let sm = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("stamp"), source: wgpu::ShaderSource::Wgsl(STAMP_WGSL.into()) });
                 let sp = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("stamp"), layout: None, module: &sm, entry_point: Some("stamp"), compilation_options: Default::default(), cache: self.cache() });
                 // The stamps depend on what is rebuilt last: the translucent TLAS when there is one.
-                let (sv, stl) = translucent.as_ref().map_or((&a.verts, &a.tlas), |t| (&t.verts, &t.tlas));
-                let sbg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("stamp"), layout: &sp.get_bind_group_layout(0), entries: &[e(0, sv), wgpu::BindGroupEntry { binding: 1, resource: stl.as_binding() }] });
+                let stl = translucent.as_ref().map_or(&a.tlas, |t| &t.tlas);
+                let sbg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("stamp"), layout: &sp.get_bind_group_layout(0), entries: &[e(0, &b_vertices), wgpu::BindGroupEntry { binding: 1, resource: stl.as_binding() }] });
                 let stamp = (sp, sbg);
                 let systems: Vec<ParticleSystemGpu> = scene
                     .particles
@@ -2311,22 +3018,21 @@ impl Gpu {
                         let mut p = [0.0f32; 32];
                         p.copy_from_slice(&ps.params);
                         // (A system hidden at build runs nothing: its quads stay collapsed at the node.)
-                        ParticleSystemGpu { a: [ps.final_first, if ps.hidden { 0 } else { ps.count }, ps.object, ps.func], b: [ps.seed, dynamic_first as u32, ps.translucent as u32, scene.trans_first], c: [o[0], o[1], o[2], 0.0], p, d: ps.custom }
+                        ParticleSystemGpu { a: [vertex_of(ps.final_first, ps.translucent), if ps.hidden { 0 } else { ps.count }, ps.object, ps.func], b: [ps.seed, ix.dynamic.0, ps.translucent as u32, 0], c: [o[0], o[1], o[2], 0.0], p, d: ps.custom }
                     })
                     .collect();
                 // COPY_DST: pivot updates (`set_particle_pivot`).
                 let b_sys = buf("particle systems", bytemuck::cast_slice(&systems), edit);
                 let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("particle params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let last = d.create_buffer(&wgpu::BufferDescriptor { label: Some("particles last"), size: b_prev.size(), usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-                let no_trans = d.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-                let written = ParticleTargets { verts: &b_verts, prev_verts: &b_prev, blas_verts: &a.verts, heap: &heap, attrs: &b_attrs };
-                let pbg = particle_bind_group(d, &pipeline, "particles", &[(0, &params), (1, &b_sys), (7, &last), (8, translucent.as_ref().map_or(&no_trans, |t| &t.verts))], &written);
+                let last = d.create_buffer(&wgpu::BufferDescriptor { label: Some("particles last"), size: last_bytes, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+                let written = ParticleTargets { vertices: &b_vertices, prev_vertices: &b_prev, heap: &heap };
+                let pbg = particle_bind_group(d, &pipeline, "particles", &[(0, &params), (1, &b_sys), (7, &last)], &written);
                 let nodes = scene.particles.iter().map(|p| p.seed).collect();
                 let opaque = scene.particles.iter().any(|p| !p.translucent);
                 let counts = scene.particles.iter().map(|p| p.count).collect();
                 let translucent_sys = scene.particles.iter().map(|p| p.translucent).collect();
                 let hidden = std::cell::RefCell::new(scene.particles.iter().map(|p| if p.hidden { Hidden::Idle } else { Hidden::Shown }).collect());
-                Some(ParticleGpu { pipeline, stamp, bg: pbg, params, table: b_sys, last, no_trans, nodes, systems: systems.len() as u32, max_count: scene.particles.iter().map(|p| p.count).max().unwrap_or(0), fresh: std::cell::Cell::new(true), opaque, counts, translucent: translucent_sys, hidden })
+                Some(ParticleGpu { pipeline, stamp, bg: pbg, params, table: b_sys, last, nodes, systems: systems.len() as u32, max_count: scene.particles.iter().map(|p| p.count).max().unwrap_or(0), fresh: std::cell::Cell::new(true), opaque, counts, translucent: translucent_sys, hidden })
             }
             _ => None,
         };
@@ -2342,7 +3048,7 @@ impl Gpu {
                     .map(|ps| {
                         let c = &ps.collide;
                         let flags = u32::from(c.plane.is_some()) | if c.voxels { 2 } else { 0 };
-                        GpuParticleSystemGpu { a: [ps.final_first, ps.capacity, ps.object, ps.program], b: [ps.seed, dynamic_first as u32, 0, 0], c: [ps.pivot[0], ps.pivot[1], ps.pivot[2], flags as f32], d: [c.plane.unwrap_or(0.0), c.restitution, c.friction, 0.0], e: [0; 4], p: ps.params }
+                        GpuParticleSystemGpu { a: [vertex_of(ps.final_first, false), ps.capacity, ps.object, ps.program], b: [ps.seed, ix.dynamic.0, 0, 0], c: [ps.pivot[0], ps.pivot[1], ps.pivot[2], flags as f32], d: [c.plane.unwrap_or(0.0), c.restitution, c.friction, 0.0], e: [0; 4], p: ps.params }
                     })
                     .collect();
                 let table = buf("gpu particle systems", bytemuck::cast_slice(&systems), edit);
@@ -2350,7 +3056,7 @@ impl Gpu {
                 let state = d.create_buffer(&wgpu::BufferDescriptor { label: Some("gpu particle states"), size: states, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let spawns = d.create_buffer(&wgpu::BufferDescriptor { label: Some("gpu particle spawns"), size: (MAX_SPAWNS * 32) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
                 let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("gpu particle params"), size: 80, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let last = d.create_buffer(&wgpu::BufferDescriptor { label: Some("gpu particles last"), size: b_prev.size(), usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+                let last = d.create_buffer(&wgpu::BufferDescriptor { label: Some("gpu particles last"), size: last_bytes, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let occ = scene.voxel_occupancy.as_ref().filter(|_| scene.gpu_particles.iter().any(|p| p.collide.voxels)).map(|o| o.read().unwrap().clone());
                 let (grid, grid_o, grid_n) = match &occ {
                     Some(o) => (buf("voxel occupancy", bytemuck::cast_slice(&o.words), edit), [o.origin[0], o.origin[1], o.origin[2], o.cell], [o.dims[0], o.dims[1], o.dims[2], o.row_words() as u32]),
@@ -2359,22 +3065,30 @@ impl Gpu {
                 if let Some(o) = &scene.voxel_occupancy {
                     o.write().unwrap().dirty.clear();
                 }
-                let written = ParticleTargets { verts: &b_verts, prev_verts: &b_prev, blas_verts: &a.verts, heap: &heap, attrs: &b_attrs };
+                let written = ParticleTargets { vertices: &b_vertices, prev_vertices: &b_prev, heap: &heap };
                 let bg = particle_bind_group(d, &pipeline, "gpu particles", &[(0, &params), (1, &table), (7, &last), (8, &state), (9, &spawns), (10, &grid)], &written);
                 let host = scene.gpu_particles.iter().map(|ps| (0u32, 0.0f32, ps.rate)).collect();
                 let sm = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("stamp"), source: wgpu::ShaderSource::Wgsl(STAMP_WGSL.into()) });
                 let sp = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("stamp"), layout: None, module: &sm, entry_point: Some("stamp"), compilation_options: Default::default(), cache: self.cache() });
-                let sbg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("stamp"), layout: &sp.get_bind_group_layout(0), entries: &[e(0, &a.verts), wgpu::BindGroupEntry { binding: 1, resource: a.tlas.as_binding() }] });
+                let sbg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("stamp"), layout: &sp.get_bind_group_layout(0), entries: &[e(0, &b_vertices), wgpu::BindGroupEntry { binding: 1, resource: a.tlas.as_binding() }] });
                 Some(GpuParticlesGpu { pipeline, stamp: (sp, sbg), bg, params, table, last, state, spawns, grid, systems: std::cell::RefCell::new(systems), host: std::cell::RefCell::new(host), nodes: scene.gpu_particles.iter().map(|p| p.node).collect(), max_cap: scene.gpu_particles.iter().map(|p| p.capacity).max().unwrap_or(0), frame: std::cell::Cell::new(0), fresh: std::cell::Cell::new(true), grid_o, grid_n })
             }
             _ => None,
         };
+        // The skinning pass, a job each mesh that deforms: under hardware traversal (it writes the BLASes' input too),
+        // and under software traversal where such a mesh is a unit.
+        let skin = (!scene.retained.skinned.is_empty() && (accel.is_some() || scene.units.is_some())).then(|| self.skin_pass(scene, &b_vertices, scene.units.is_some().then_some((&words.buffer, &bg_parts.leaves))));
         self.queue.submit([]);
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         timings.push(("upload_ms".into(), t0.elapsed().as_secs_f64() * 1000.0));
         // (The scene's own pipelines, made above: particles, grid programs.)
         self.save_pipeline_cache();
-        Ok(Uploaded { bg, bg_parts, heap, uniform, accum: b_accum, params: b_params, width: w, height: h, kernel, verts: b_verts, attrs: b_attrs, prev_verts: b_prev, dynamic_first, accel, units: scene.units.clone(), particles, gpu_particles, grids, translucent, vcolors: !scene.gpu_vcolors.is_empty(), media_nodes: scene.media_nodes.clone(), media_hidden: std::cell::RefCell::new(scene.media.iter().map(|m| m.a[1] == crate::scene::MEDIUM_HIDDEN).collect()), room, words, cdf_words: env_cdf.len(), region_words, env_tex })
+        // (What moves emitters after the load needs hardware ray tracing: triangles reposed in place, the particle passes.)
+        let fills = match &accel {
+            Some(_) => EmitterFills { moved: self.emitter_fill(&emitter_runs.moved, &b_vertices, &heap, &words), particles: self.emitter_fill(&emitter_runs.particles, &b_vertices, &heap, &words) },
+            None => EmitterFills::default(),
+        };
+        Ok(Uploaded { bg, bg_parts, heap, uniform, accum: b_accum, params: b_params, kernel, vertices: b_vertices, prev_vertices: b_prev, accel, units: scene.units.clone(), particles, gpu_particles, skin, fills, grids, translucent, vcolors: !scene.gpu_vcolors.is_empty(), media_nodes: scene.media_nodes.clone(), media_hidden: std::cell::RefCell::new(scene.media.iter().map(|m| m.a[1] == crate::scene::MEDIUM_HIDDEN).collect()), room, words, cdf_words: env_cdf.len(), region_words, env_tex })
     }
 
     /// Bytes Metal allocates for an AABB BLAS over `count` boxes in `boxes` (its own size query through wgpu-hal; None
@@ -2396,26 +3110,27 @@ impl Gpu {
         }
     }
 
-    /// Bytes Metal allocates for a triangle BLAS over the (first vertex, vertex count, opaque) geometries of `verts`
-    /// (non-indexed Float32x3, as every triangle BLAS here; None on other backends).
-    fn tri_blas_bytes(&self, verts: &wgpu::Buffer, parts: &[(u32, u32, bool)]) -> Option<u64> {
+    /// Bytes Metal allocates for a triangle BLAS over geometries (first vertex, vertices, first triangle, triangles) of
+    /// the vertices and the indices from word `index_first` of `words` (flagged opaque, as every triangle
+    /// BLAS here; None on other backends).
+    fn tri_blas_bytes(&self, vertices: &wgpu::Buffer, words: &wgpu::Buffer, index_first: u32, parts: &[(u32, u32, u32, u32)]) -> Option<u64> {
         #[cfg(target_vendor = "apple")]
         {
             use wgpu::hal::{api::Metal, Device as _};
             let d = unsafe { self.device.as_hal::<Metal>() }?;
-            let b = unsafe { verts.as_hal::<Metal>() }?;
+            let (b, i) = unsafe { (vertices.as_hal::<Metal>()?, words.as_hal::<Metal>()?) };
             let entries = wgpu::hal::AccelerationStructureEntries::Triangles(
                 parts
                     .iter()
-                    .map(|&(first_vertex, vertex_count, opaque)| wgpu::hal::AccelerationStructureTriangles {
+                    .map(|&(first_vertex, vertex_count, first, count)| wgpu::hal::AccelerationStructureTriangles {
                         vertex_buffer: Some(&*b),
                         vertex_format: wgpu::VertexFormat::Float32x3,
                         first_vertex,
                         vertex_count,
-                        vertex_stride: 12,
-                        indices: None,
+                        vertex_stride: VERTEX_STRIDE,
+                        indices: Some(wgpu::hal::AccelerationStructureTriangleIndices { format: wgpu::IndexFormat::Uint32, buffer: Some(&*i), offset: (index_first + first * 3) * 4, count: count * 3 }),
                         transform: None,
-                        flags: if opaque { wgpu::hal::AccelerationStructureGeometryFlags::OPAQUE } else { wgpu::hal::AccelerationStructureGeometryFlags::empty() },
+                        flags: wgpu::hal::AccelerationStructureGeometryFlags::OPAQUE,
                     })
                     .collect(),
             );
@@ -2424,7 +3139,7 @@ impl Gpu {
         }
         #[allow(unreachable_code)]
         {
-            let _ = (verts, parts);
+            let _ = (vertices, words, index_first, parts);
             None
         }
     }
@@ -2434,13 +3149,20 @@ impl Gpu {
     /// (`room_words` after the region, as much of it as the binding limit leaves; `room_tris` triangles' colours).
     /// Written straight into the new buffer's mapping; the blobs are copied on the GPU from the last upload when its
     /// geometries are the same. Returns the heap, the region's words in use and the room it got.
-    fn upload_words(&self, scene: &Scene, env_cdf: &[f32], room_words: usize, room_tris: usize, timings: &mut Vec<(String, f64)>) -> Result<(Heap<Stream>, usize, usize)> {
+    fn upload_words(&self, scene: &Scene, env_cdf: &[f32], room_words: usize, room_tris: usize, room_rows: usize, timings: &mut Vec<(String, f64)>) -> Result<(Heap<Stream>, usize, usize)> {
         let t = Instant::now();
         let l = scene.proc_layout.as_ref();
         let (head, blob_words) = l.map_or((0, 0), |l| (l.head.len(), l.blob_words));
         let colors: &[u8] = bytemuck::cast_slice(&scene.gpu_vcolors);
         let color_bytes = if colors.is_empty() { 0 } else { colors.len() + room_tris * 12 };
-        let sizes = |room: usize| [(env_cdf.len() * 4) as u64, ((head + blob_words + room) * 4) as u64, color_bytes as u64];
+        let rows: &[u8] = bytemuck::cast_slice(&scene.rows);
+        let row_bytes = if rows.is_empty() && room_rows == 0 { 0 } else { rows.len() + room_rows * 16 };
+        // The triangles' indices (one at least: the triangle a tree over nothing names, of vertex 0), and the rows of
+        // those that have one (no mesh's triangle has, nor do those an edit places).
+        let ix = &scene.indexed;
+        let tri_rows = ix.gpu_rows();
+        let (index_bytes, tri_bytes) = ((ix.indices.len() + room_tris).max(1) * 12, tri_rows.len().max(1) * 16);
+        let sizes = |room: usize| [(env_cdf.len() * 4) as u64, ((head + blob_words + room) * 4) as u64, color_bytes as u64, row_bytes as u64, index_bytes as u64, tri_bytes as u64];
         let (used, limit) = (Heap::<Stream>::size_for(&sizes(0)), self.device.limits().max_storage_buffer_binding_size as u64);
         if used > limit {
             return Err(anyhow!("procedural geometry: {} MB of data, more than this device binds in one buffer ({} MB)", used >> 20, limit >> 20));
@@ -2451,24 +3173,32 @@ impl Gpu {
         let blob_at = (head * 4) as u64;
         let blob_bytes = (blob_words * 4) as u64;
         let key = l.map(|l| l.key());
+        // (The BLASes are built from the indices' section.)
+        let usage = crate::heap::USAGE | if self.hwrt { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() };
         let mut cache = self.proc_cache.lock().unwrap();
         let reuse = cache.as_ref().filter(|c| blob_bytes > 0 && Some(&c.key) == key.as_ref() && c.bytes == blob_bytes);
         // Reused blobs: the small parts written through the queue, the blobs copied on the GPU (a mapped buffer of the
         // whole size would be zero-filled on the CPU first: 17 ms for 256 MB). New ones: written into the mapping.
         let heap = match (reuse, l) {
             (Some(c), Some(l)) => {
-                let heap = Heap::new(&self.device, &sizes);
+                let heap = Heap::new_with(&self.device, &sizes, usage);
                 heap.write(&self.queue, Stream::EnvCdf, 0, bytemuck::cast_slice(env_cdf));
                 heap.write(&self.queue, Stream::Procs, 0, bytemuck::cast_slice(&l.head));
                 heap.write(&self.queue, Stream::VertexColors, 0, colors);
+                heap.write(&self.queue, Stream::Rows, 0, rows);
+                heap.write(&self.queue, Stream::Indices, 0, bytemuck::cast_slice(&ix.indices));
+                heap.write(&self.queue, Stream::Triangles, 0, bytemuck::cast_slice(&tri_rows));
                 let mut e = self.device.create_command_encoder(&Default::default());
                 e.copy_buffer_to_buffer(&c.buf, c.offset, &heap.buffer, heap.at(Stream::Procs) + blob_at, c.bytes);
                 self.queue.submit([e.finish()]);
                 heap
             }
-            _ => Heap::filled(&self.device, &sizes, |put| {
+            _ => Heap::filled_with(&self.device, &sizes, usage, |put| {
                 put(Stream::EnvCdf, 0, bytemuck::cast_slice(env_cdf));
                 put(Stream::VertexColors, 0, colors);
+                put(Stream::Rows, 0, rows);
+                put(Stream::Indices, 0, bytemuck::cast_slice(&ix.indices));
+                put(Stream::Triangles, 0, bytemuck::cast_slice(&tri_rows));
                 let Some(l) = l else { return };
                 put(Stream::Procs, 0, bytemuck::cast_slice(&l.head));
                 for (blob, off) in &l.blobs {
@@ -2557,6 +3287,43 @@ impl Gpu {
         }
     }
 
+    fn emitter_fill_bind_group(&self, runs: &wgpu::Buffer, vertices: &wgpu::Buffer, heap: &Heap<Table>, words: &Heap<Stream>) -> wgpu::BindGroup {
+        let entries = [buffer_entry(0, runs), buffer_entry(1, vertices), wgpu::BindGroupEntry { binding: 2, resource: heap.binding(Table::EmitterTris) }, wgpu::BindGroupEntry { binding: 3, resource: heap.binding(Table::Instances) }, wgpu::BindGroupEntry { binding: 4, resource: words.binding(Stream::Indices) }];
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("emitter fill"), layout: &self.emitter_fill_pipeline().get_bind_group_layout(0), entries: &entries })
+    }
+
+    fn emitter_fill_pipeline(&self) -> &wgpu::ComputePipeline {
+        self.fill.get_or_init(|| {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("emitter fill"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/emitter_fill.wgsl").into()) });
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("emitter fill"), layout: None, module: &module, entry_point: Some("fill"), compilation_options: Default::default(), cache: self.cache() })
+        })
+    }
+
+    /// The fill of `runs` of the light list (none: no fill).
+    fn emitter_fill(&self, runs: &[[u32; 2]], vertices: &wgpu::Buffer, heap: &Heap<Table>, words: &Heap<Stream>) -> Option<EmitterFill> {
+        let longest = runs.iter().map(|r| r[1]).max()?;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("emitter runs"), size: (runs.len() * 8) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(runs));
+        Some(EmitterFill { bg: self.emitter_fill_bind_group(&buffer, vertices, heap, words), runs: buffer, count: runs.len() as u32, longest })
+    }
+
+    /// `runs` of the light list taken again now (the instances an edit just moved: their records are queued).
+    pub fn fill_emitter_runs(&self, up: &Uploaded, runs: &[[u32; 2]]) {
+        let Some(f) = self.emitter_fill(runs, &up.vertices, &up.heap, &up.words) else { return };
+        let mut e = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("emitter fill") });
+        self.fill_emitters(&f, &mut e);
+        self.queue.submit([e.finish()]);
+    }
+
+    /// The runs of `f` taken again from their triangles as the encoder's earlier commands, and the writes queued
+    /// before it is submitted, leave them.
+    pub fn fill_emitters(&self, f: &EmitterFill, e: &mut wgpu::CommandEncoder) {
+        let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("emitter fill"), timestamp_writes: None });
+        pass.set_pipeline(self.emitter_fill_pipeline());
+        pass.set_bind_group(0, &f.bg, &[]);
+        pass.dispatch_workgroups(f.longest.div_ceil(64), f.count, 1);
+    }
+
     /// One frame of the stateful GPU particles (gpu_particles.wgsl): each system's emissions (its rate over `dt`, and the
     /// game's spawns, `spawns` per node, 8 floats each), the update, collision and retirement of the rest, their quads;
     /// with `rebuild`, the dynamic BLASes after (else the stateless pass that follows rebuilds them).
@@ -2637,6 +3404,11 @@ impl Gpu {
     /// again from its data: any structural change in a game (an object hidden, a texture) wiped its smoke.
     pub fn carry_grids(&self, old: &Uploaded, new: &Uploaded) {
         let (Some(from), Some(to)) = (&old.grids, &new.grids) else { return };
+        self.carry(from, to);
+    }
+
+    /// `carry_grids`, of the grids themselves.
+    fn carry(&self, from: &GridsGpu, to: &GridsGpu) {
         let mut e = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("carry grids") });
         let mut any = false;
         for g in &to.grids {
@@ -2783,21 +3555,62 @@ impl Gpu {
         }
     }
 
-    /// A volume node moved or changed its customData: its medium's world -> local rows / `custom` (None: unchanged).
-    /// Replaces the environment map and its sampling CDF in place (a dynamic sky's new bake). Both keep their sizes.
-    pub fn write_env(&self, up: &Uploaded, env: &EnvMap, cdf: &[f32]) {
-        let size = up.env_tex.size();
-        if (env.width, env.height) != (size.width, size.height) || cdf.len() != up.cdf_words {
-            return;
-        }
+    /// An environment map's texture, with its texels.
+    fn env_texture(&self, env: &EnvMap) -> wgpu::Texture {
+        let t = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("env"),
+            size: wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.write_env_texels(&t, env);
+        t
+    }
+
+    fn write_env_texels(&self, t: &wgpu::Texture, env: &EnvMap) {
         let half: Vec<u16> = env.texels.iter().flat_map(|t| t.iter().map(|v| half::f16::from_f32(v.min(65000.0)).to_bits())).collect();
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &up.env_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&half),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(env.width * 8), rows_per_image: Some(env.height) },
-            size,
+            wgpu::Extent3d { width: env.width, height: env.height, depth_or_array_layers: 1 },
         );
+    }
+
+    /// Whether a buffer of `bytes` can be made and bound (the device's buffer and storage binding limits).
+    pub fn buffer_fits(&self, bytes: u64) -> bool {
+        let l = self.device.limits();
+        bytes <= (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size)
+    }
+
+    /// A sky's environment map and its sampling CDF (a dynamic sky's new bake, another sky): written in place where
+    /// they are as large as the ones they replace, else a new texture, the CDF's section grown where it has to, and
+    /// the scene bound again. False, with nothing changed, when the grown buffer would pass the device's limits (a
+    /// build lays the scene's words out again, with less room for edits: the caller rebuilds).
+    pub fn put_env(&self, up: &mut Uploaded, env: &EnvMap, cdf: &[f32]) -> bool {
+        let size = up.env_tex.size();
+        if (env.width, env.height) == (size.width, size.height) && cdf.len() == up.cdf_words {
+            self.write_env_texels(&up.env_tex, env);
+            up.words.write(&self.queue, Stream::EnvCdf, 0, bytemuck::cast_slice(cdf));
+            return true;
+        }
+        let bytes = cdf.len() as u64 * 4;
+        if bytes > up.words.cap(Stream::EnvCdf) {
+            if !self.buffer_fits(up.words.size_with(Stream::EnvCdf, bytes)) {
+                return false;
+            }
+            up.words.grow(&self.device, &self.queue, Stream::EnvCdf, bytes);
+        }
+        up.env_tex = self.env_texture(env);
+        up.bg_parts.env_view = up.env_tex.create_view(&Default::default());
         up.words.write(&self.queue, Stream::EnvCdf, 0, bytemuck::cast_slice(cdf));
+        up.cdf_words = cdf.len();
+        self.rebind_scene(up);
+        true
     }
 
     /// A volume node shown or hidden by its own `visible`, in place: its media keep their place in the table with
@@ -2814,6 +3627,148 @@ impl Gpu {
             up.heap.write(&self.queue, Table::Media, at as u64, bytemuck::bytes_of(&if hide { crate::scene::MEDIUM_HIDDEN } else { shape }));
         }
         found
+    }
+
+    /// The scene's density grids on the GPU: field A of each in the atlas (stacked along z), their data; for a grid
+    /// with a program, its other textures (A', B, B'), its two half steps and its sources; the programs' pipeline.
+    /// `media`: the media table (a grid's program runs in its volume's box); `programs`: every grid program, in the
+    /// order of their numbers. None: no grid.
+    fn make_grids(&self, grids: &[crate::scene::GridBuild], media: &[crate::scene::MediumGpu], programs: &[(String, String, String)]) -> Option<GridsGpu> {
+        if grids.is_empty() {
+            return None;
+        }
+        let d = &self.device;
+        let dims = [grids.iter().map(|g| g.dims[0]).max().unwrap(), grids.iter().map(|g| g.dims[1]).max().unwrap(), grids.iter().map(|g| g.dims[2]).sum()];
+        let atlas = grid_texture(d, "grid atlas", dims, true);
+        let atlas_view = atlas.create_view(&Default::default());
+        let smp = d.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let made = grids
+            .iter()
+            .map(|g| {
+                if let Some(data) = &g.data {
+                    self.write_grid(&atlas, g.z0, g.dims, data);
+                }
+                let sim = g.program.map(|program| {
+                    let tex = |label: &str| grid_texture(d, label, g.dims, true).create_view(&Default::default());
+                    let field_b = grid_texture(d, "grid B", g.dims, true);
+                    let (a2, b, b2) = (tex("grid A'"), field_b.create_view(&Default::default()), tex("grid B'"));
+                    let sources = d.create_buffer(&wgpu::BufferDescriptor { label: Some("grid sources"), size: (crate::world::GRID_MAX_SOURCES * 48) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                    let step = |src_a: &wgpu::TextureView, src_b: &wgpu::TextureView, dst_a: &wgpu::TextureView, dst_b: &wgpu::TextureView| {
+                        let u = d.create_buffer(&wgpu::BufferDescriptor { label: Some("grid step"), size: std::mem::size_of::<GridStepGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                        fn tv(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+                            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+                        }
+                        let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("grid step"),
+                            layout: &self.grid_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
+                                tv(1, src_a),
+                                tv(2, src_b),
+                                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&smp) },
+                                tv(4, dst_a),
+                                tv(5, dst_b),
+                                wgpu::BindGroupEntry { binding: 6, resource: sources.as_entire_binding() },
+                            ],
+                        });
+                        (u, bg)
+                    };
+                    let steps = [step(&atlas_view, &b, &a2, &b2), step(&a2, &b2, &atlas_view, &b)];
+                    let m = &media[g.medium as usize];
+                    GridSim { b: field_b, program, params: g.params, steps, sources, placed: std::cell::Cell::new((m.w, m.c)) }
+                });
+                GridGpu { id: g.id, node: g.node, dims: g.dims, z0: g.z0, made: g.made, sim }
+            })
+            .collect::<Vec<_>>();
+        let pipeline = made.iter().any(|g| g.sim.is_some()).then(|| {
+            let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("grid sim"), source: wgpu::ShaderSource::Wgsl(grid_sim_source(programs).into()) });
+            let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grid sim"), bind_group_layouts: &[Some(&self.grid_layout)], immediate_size: 0 });
+            d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("grid sim"), layout: Some(&layout), module: &module, entry_point: Some("grid_sim"), compilation_options: Default::default(), cache: self.cache() })
+        });
+        let programs = if pipeline.is_some() { programs.to_vec() } else { vec![] };
+        Some(GridsGpu { atlas, pipeline, programs, grids: made, step: std::cell::Cell::new(0) })
+    }
+
+    /// The uploaded scene's density grids as `grids`, in place: a volume with a grid came or went, a grid has other
+    /// cells or another program, a program's code changed. Grids that are the same still take their parameters,
+    /// their volumes and the volumes' placement; else all are made again, and what the programs had simulated goes with the grids that are the same (`carry`).
+    /// Whether they were made again (the atlas is another texture: the bind groups hold the old one).
+    pub fn put_grids(&self, up: &mut Uploaded, grids: &[crate::scene::GridBuild], media: &[crate::scene::MediumGpu], programs: &[(String, String, String)]) -> bool {
+        let same = match &mut up.grids {
+            None => grids.is_empty(),
+            Some(have) => {
+                // (The same grids in the same order lie at the same places.)
+                let same = have.grids.len() == grids.len()
+                    && have.grids.iter().zip(grids).all(|(h, g)| (h.id, h.dims, h.made) == (g.id, g.dims, g.made) && h.sim.as_ref().map(|s| s.program) == g.program)
+                    && (have.pipeline.is_none() || have.programs == programs);
+                if same {
+                    // (And its volume, with the volume's box and customData as the table has them now: its program
+                    // runs there.)
+                    for (h, g) in have.grids.iter_mut().zip(grids) {
+                        h.node = g.node;
+                        if let Some(sim) = &mut h.sim {
+                            let m = &media[g.medium as usize];
+                            (sim.params, sim.placed) = (g.params, std::cell::Cell::new((m.w, m.c)));
+                        }
+                    }
+                }
+                same
+            }
+        };
+        if same {
+            return false;
+        }
+        let made = self.make_grids(grids, media, programs);
+        if let (Some(from), Some(to)) = (&up.grids, &made) {
+            self.carry(from, to);
+        }
+        up.bg_parts.grid_view = made.as_ref().map_or_else(|| self.no_grid_view.clone(), |g| g.atlas.create_view(&Default::default()));
+        up.grids = made;
+        true
+    }
+
+    /// The scene's density grids as they are now: each one's id, volume node, cells, first layer in the atlas and
+    /// program; the atlas's size.
+    #[cfg(test)]
+    pub fn grids_state(&self, up: &Uploaded) -> (Vec<(u32, u32, [u32; 3], u32, Option<u32>)>, [u32; 3]) {
+        let Some(gs) = &up.grids else { return (vec![], [0; 3]) };
+        let size = gs.atlas.size();
+        (gs.grids.iter().map(|g| (g.id, g.node, g.dims, g.z0, g.sim.as_ref().map(|s| s.program))).collect(), [size.width, size.height, size.depth_or_array_layers])
+    }
+
+    /// Field A of one cell of density grid `id`, read back.
+    #[cfg(test)]
+    pub fn grid_cell(&self, up: &Uploaded, id: u32, cell: [u32; 3]) -> [f32; 4] {
+        let gs = up.grids.as_ref().expect("grids");
+        let g = gs.grids.iter().find(|g| g.id == id).expect("the grid");
+        let to = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 8, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut e = self.device.create_command_encoder(&Default::default());
+        e.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &gs.atlas, mip_level: 0, origin: wgpu::Origin3d { x: cell[0], y: cell[1], z: g.z0 + cell[2] }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &to, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: None, rows_per_image: None } },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([e.finish()]);
+        to.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let halves: [half::f16; 4] = bytemuck::pod_read_unaligned(&to.slice(..).get_mapped_range().unwrap());
+        halves.map(|h| h.to_f32())
+    }
+
+    /// The media table as `media` (each one's node in `nodes`), in place: volumes that came, went or were set again
+    /// while the scene runs. Whether the table is another buffer now (it grew: the bind groups hold the old one).
+    pub fn put_media(&self, up: &mut Uploaded, media: &[crate::scene::MediumGpu], nodes: Vec<u32>) -> bool {
+        let bytes: &[u8] = bytemuck::cast_slice(media);
+        let grew = bytes.len() as u64 > up.heap.cap(Table::Media);
+        if grew {
+            up.heap.grow(&self.device, &self.queue, Table::Media, bytes.len() as u64);
+        }
+        if !bytes.is_empty() {
+            up.heap.write(&self.queue, Table::Media, 0, bytes);
+        }
+        up.media_hidden = std::cell::RefCell::new(media.iter().map(|m| m.a[1] == crate::scene::MEDIUM_HIDDEN).collect());
+        up.media_nodes = nodes;
+        grew
     }
 
     pub fn set_medium(&self, up: &Uploaded, node: u32, rows: Option<[[f32; 4]; 3]>, custom: Option<[f32; 4]>) {
@@ -2857,28 +3812,25 @@ impl Gpu {
     }
 
     /// The BLAS vertex buffer grown to `bytes` (`grown`).
-    pub fn grow_blas_verts(&self, accel: &mut Accel, bytes: u64) {
-        accel.verts = self.grown(&accel.verts, bytes, "blas_verts");
-    }
-
     /// Mesh `k` (one an edit no longer draws) made again over `count` triangles from `first`: a new BLAS in its slot.
-    pub fn set_mesh(&self, accel: &mut Accel, k: u32, first: usize, count: u32, opaque: u32) {
-        let (blas, geo) = self.mesh_blas_for(accel, first, count, opaque);
+    pub fn set_mesh(&self, accel: &mut Accel, k: u32, first: usize, mesh: &crate::scene::InstMesh, sections: &[crate::scene::Section]) {
+        let (blas, geo) = self.mesh_blas_for(accel, first, mesh, sections);
         accel.meshes[k as usize] = blas;
         accel.mesh_geo[k as usize] = geo;
+        accel.mesh_verts[k as usize] = (mesh.vfirst, mesh.vcount);
     }
 
-    fn mesh_blas_for(&self, accel: &Accel, first: usize, count: u32, opaque: u32) -> (wgpu::Blas, (Vec<(u32, u32, bool)>, Vec<wgpu::BlasTriangleGeometrySizeDescriptor>)) {
+    fn mesh_blas_for(&self, accel: &Accel, first: usize, mesh: &crate::scene::InstMesh, sections: &[crate::scene::Section]) -> (wgpu::Blas, (Vec<(u32, u32)>, Vec<wgpu::BlasTriangleGeometrySizeDescriptor>)) {
         let rel = (first - accel.pool_first) as u32;
-        let parts: Vec<(u32, u32, bool)> = [(rel, opaque, true), (rel + opaque, count - opaque, false)].into_iter().filter(|p| p.1 > 0).collect();
+        let parts: Vec<(u32, u32)> = mesh.parts(sections).into_iter().map(|(at, count)| (rel + at, count)).collect();
         let sizes: Vec<wgpu::BlasTriangleGeometrySizeDescriptor> = parts
             .iter()
-            .map(|&(_, c, opaque)| wgpu::BlasTriangleGeometrySizeDescriptor {
+            .map(|&(_, c)| wgpu::BlasTriangleGeometrySizeDescriptor {
                 vertex_format: wgpu::VertexFormat::Float32x3,
-                vertex_count: c * 3,
-                index_format: None,
-                index_count: None,
-                flags: if opaque { wgpu::AccelerationStructureGeometryFlags::OPAQUE } else { wgpu::AccelerationStructureGeometryFlags::empty() },
+                vertex_count: mesh.vcount.max(1),
+                index_format: Some(wgpu::IndexFormat::Uint32),
+                index_count: Some(c * 3),
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
             })
             .collect();
         let flags = if std::env::var("THREERT_EDIT_BLAS").is_ok_and(|v| v == "trace") { wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE } else { wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD };
@@ -2887,13 +3839,14 @@ impl Gpu {
     }
 
     /// A new instanced mesh over `count` triangles from GPU-order index `first` (in the edit room; live/edits.rs
-    /// `edit_geometry`), its first `opaque` ones opaque: its BLAS, which `rebuild_meshes` builds. Returns its index.
-    pub fn add_mesh(&self, accel: &mut Accel, first: usize, count: u32, opaque: u32) -> u32 {
+    /// `edit_geometry`), its first `opaque` ones opaque: its BLAS, which the commit's build builds (`TopBuild::meshes`). Returns its index.
+    pub fn add_mesh(&self, accel: &mut Accel, first: usize, mesh: &crate::scene::InstMesh, sections: &[crate::scene::Section]) -> u32 {
         // Built fast rather than traced fast (edits come every frame under destruction; the batches of pieces are rebuilt
         // every frame); THREERT_EDIT_BLAS=trace for the A/B (`mesh_blas_for`).
-        let (blas, geo) = self.mesh_blas_for(accel, first, count, opaque);
+        let (blas, geo) = self.mesh_blas_for(accel, first, mesh, sections);
         accel.meshes.push(blas);
         accel.mesh_geo.push(geo);
+        accel.mesh_verts.push((mesh.vfirst, mesh.vcount));
         accel.meshes.len() as u32 - 1
     }
 
@@ -2902,34 +3855,22 @@ impl Gpu {
         &accel.meshes[k as usize]
     }
 
-    /// The AABB BLAS of a procedural geometry's boxes (live/edits.rs `edit_geometry`): the one kept by its hash or built
-    /// earlier in this edit (`fresh`), or a new one whose build goes into `e` and into `fresh`. The edit keeps `fresh`
-    /// (`keep_proc_blases`) only once `e` is submitted: an edit that falls back never submits, and a BLAS never built
-    /// must not be reused.
-    /// Its BLAS (kept by hash, or made now: its build added to `pending`, which `build_meshes` builds with the TLAS).
-    pub fn proc_blas(&self, blob: &crate::procasset::ProcBlob, pending: &mut Vec<PendingProc>, fresh: &mut Vec<([u8; 32], wgpu::Blas, u64)>) -> wgpu::Blas {
+    /// The AABB BLAS of a procedural geometry's boxes (live/edits.rs `edit_geometry`): the one kept by its hash, the
+    /// one this commit already made (`pending`), or a new one added to `pending` (`TopBuild::procs`).
+    pub fn proc_blas(&self, blob: &crate::procasset::ProcBlob, pending: &mut Vec<PendingProc>) -> wgpu::Blas {
         if let Some((blas, _)) = self.proc_blases.lock().unwrap().get(&blob.hash) {
             return blas.clone();
         }
-        if let Some((_, blas, _)) = fresh.iter().find(|f| f.0 == blob.hash) {
-            return blas.clone();
+        if let Some(p) = pending.iter().find(|p| p.hash == blob.hash) {
+            return p.blas.clone();
         }
         let d = &self.device;
         let size = wgpu::BlasAABBGeometrySizeDescriptor { primitive_count: (blob.boxes.len() / 6) as u32, flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE };
         let blas = d.create_blas(&wgpu::CreateBlasDescriptor { label: Some("proc"), flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build }, wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size.clone()] });
         let boxes = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("proc boxes"), contents: bytemuck::cast_slice(&blob.boxes), usage: wgpu::BufferUsages::BLAS_INPUT });
         let bytes = self.aabb_blas_bytes(&boxes, size.primitive_count).unwrap_or(0);
-        fresh.push((blob.hash, blas.clone(), bytes));
-        pending.push(PendingProc { blas: blas.clone(), boxes, size });
+        pending.push(PendingProc { hash: blob.hash, blas: blas.clone(), boxes, size, bytes });
         blas
-    }
-
-    /// Keeps the procedural BLASes an edit built (`proc_blas`), once its builds are submitted.
-    pub fn keep_proc_blases(&self, fresh: Vec<([u8; 32], wgpu::Blas, u64)>) {
-        let mut built = self.proc_blases.lock().unwrap();
-        for (hash, blas, bytes) in fresh {
-            built.insert(hash, (blas, bytes));
-        }
     }
 
     /// The scene's bind group (group 0: pathtrace.wgsl's declarations, the layout `Gpu::new` makes).
@@ -2938,11 +3879,10 @@ impl Gpu {
         let p = b.parts;
         let mut entries = vec![
             buffer_entry(0, b.params),
-            buffer_entry(1, b.verts),
-            buffer_entry(2, b.attrs),
+            buffer_entry(1, b.vertices),
             buffer_entry(4, &b.heap.buffer),
             buffer_entry(5, &b.words.buffer),
-            buffer_entry(6, b.prev_verts),
+            buffer_entry(6, b.prev_vertices),
             view(7, &p.tex_view),
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&p.sampler) },
             view(9, &p.env_view),
@@ -2950,9 +3890,10 @@ impl Gpu {
             buffer_entry(11, b.accum),
         ];
         if !self.hwrt {
+            entries.push(buffer_entry(2, &p.leaves));
             entries.push(buffer_entry(3, &p.nodes));
         }
-        if !self.merged {
+        if !self.merged && !self.whole_tables {
             for &(table, binding) in &crate::merged::TABLE_VIEWS {
                 let copy = b.uniform.and_then(|u| u.iter().zip(&crate::merged::UNIFORM_TABLES).find(|(_, t)| t.binding == binding).map(|(c, _)| c));
                 entries.push(match copy {
@@ -2968,17 +3909,123 @@ impl Gpu {
     }
 
     /// The bind groups that hold the scene's buffers again, from `up`'s as they are now (one that grew: the tables,
-    /// live/edits.rs): the kernel's, and the particle passes'.
+    /// live/edits.rs): the kernel's, the light list's fills', the skinning pass's and the particle passes'.
     pub fn rebind_scene(&self, up: &mut Uploaded) {
-        up.bg = self.scene_bind_group(&SceneBuffers { params: &up.params, verts: &up.verts, attrs: &up.attrs, heap: &up.heap, words: &up.words, prev_verts: &up.prev_verts, accum: &up.accum, parts: &up.bg_parts, accel: up.accel.as_ref(), uniform: up.uniform.as_ref() });
-        let Some(a) = &up.accel else { return };
-        let written = ParticleTargets { verts: &up.verts, prev_verts: &up.prev_verts, blas_verts: &a.verts, heap: &up.heap, attrs: &up.attrs };
+        for f in [&mut up.fills.moved, &mut up.fills.particles].into_iter().flatten() {
+            f.bg = self.emitter_fill_bind_group(&f.runs, &up.vertices, &up.heap, &up.words);
+        }
+        if let Some(k) = &mut up.skin {
+            k.bg = skin_bind_group(&self.device, &k.pipeline, [&k.params, &k.blocks, &k.table, &k.corners, &k.palette], &up.vertices);
+            if let Some(l) = &mut k.leaves {
+                l.bg = Some(leaf_gather_bind_group(&self.device, l, &up.vertices, &up.words.buffer, &up.bg_parts.leaves));
+            }
+        }
+        if let Some(a) = &mut up.accel {
+            (a.vertices, a.indices, a.index_first) = (up.vertices.clone(), up.words.buffer.clone(), (up.words.at(Stream::Indices) / 4) as u32);
+        }
+        if let Some(t) = &mut up.translucent {
+            t.vertices = up.vertices.clone();
+        }
+        up.bg = self.scene_bind_group(&SceneBuffers { params: &up.params, vertices: &up.vertices, heap: &up.heap, words: &up.words, prev_vertices: &up.prev_vertices, accum: &up.accum, parts: &up.bg_parts, accel: up.accel.as_ref(), uniform: up.uniform.as_ref() });
+        if up.accel.is_none() {
+            return;
+        }
+        let written = ParticleTargets { vertices: &up.vertices, prev_vertices: &up.prev_vertices, heap: &up.heap };
         if let Some(p) = &mut up.particles {
-            p.bg = particle_bind_group(&self.device, &p.pipeline, "particles", &[(0, &p.params), (1, &p.table), (7, &p.last), (8, up.translucent.as_ref().map_or(&p.no_trans, |t| &t.verts))], &written);
+            p.bg = particle_bind_group(&self.device, &p.pipeline, "particles", &[(0, &p.params), (1, &p.table), (7, &p.last)], &written);
         }
         if let Some(p) = &mut up.gpu_particles {
             p.bg = particle_bind_group(&self.device, &p.pipeline, "gpu particles", &[(0, &p.params), (1, &p.table), (7, &p.last), (8, &p.state), (9, &p.spawns), (10, &p.grid)], &written);
         }
+    }
+
+    /// The skinning pass of `scene`: its pipeline, the models' corners, a job each skinned model, and room for a frame's
+    /// work and every job's palette. `tree`: software traversal's words' heap and leaves, for the pass that takes the
+    /// leaves again.
+    fn skin_pass(&self, scene: &Scene, vertices: &wgpu::Buffer, tree: Option<(&wgpu::Buffer, &wgpu::Buffer)>) -> SkinGpu {
+        let d = &self.device;
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("skin"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skin.wgsl").into()) });
+        let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("skin"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: self.cache() });
+        // The models' vertices one model after another (`indexed::Indexed::skins`).
+        let ix = &scene.indexed;
+        let mut source_first = vec![];
+        let mut at = 0u32;
+        for (vertices, _) in &ix.skins {
+            source_first.push(at);
+            at += vertices.len() as u32;
+        }
+        let corners: Vec<crate::skin::SkinCorner> = ix.skins.iter().flat_map(|s| s.0.iter().copied()).collect();
+        let (mut jobs, mut matrices, mut blocks) = (vec![], 0u32, 0u32);
+        for g in &scene.retained.skinned {
+            let (first, count) = ix.meshes[g.mesh as usize];
+            jobs.push((SkinJob { first, count, source: source_first[g.source as usize], palette: matrices }, g.palette_len));
+            matrices += g.palette_len;
+            blocks += count.div_ceil(SKIN_BLOCK);
+        }
+        let table: Vec<SkinJob> = jobs.iter().map(|j| j.0).collect();
+        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let init = |label: &str, bytes: &[u8]| d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: storage });
+        let room = |label: &str, size: u64, usage| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size.max(16), usage, mapped_at_creation: false });
+        let (b_corners, b_table) = (init("skin corners", bytemuck::cast_slice(&corners)), init("skin jobs", bytemuck::cast_slice(&table)));
+        let params = room("skin params", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let (b_blocks, palette) = (room("skin blocks", blocks as u64 * 8, storage), room("skin palette", matrices as u64 * 48, storage));
+        let bg = skin_bind_group(d, &pipeline, [&params, &b_blocks, &b_table, &b_corners, &palette], vertices);
+        let leaves = tree.map(|(words, leaves)| {
+            let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("leaf gather"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/leaf_gather.wgsl").into()) });
+            let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("leaf gather"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: self.cache() });
+            // (A mesh's triangles follow the world-space ones: `Indexed::pool_first`.)
+            let jobs: Vec<LeafJob> = scene.retained.skinned.iter().map(|g| { let m = &scene.meshes[g.mesh as usize]; LeafJob { first: ix.pool_first + m.first, count: m.count, vertex: ix.meshes[g.mesh as usize].0, spare: 0 } }).collect();
+            let blocks: u64 = jobs.iter().map(|j| j.count.div_ceil(SKIN_BLOCK) as u64).sum();
+            let (params, b_blocks, b_jobs) = (room("leaf gather params", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST), room("leaf gather blocks", blocks * 8, storage), init("leaf gather jobs", bytemuck::cast_slice(&jobs)));
+            let mut l = LeafGather { pipeline, bg: None, params, blocks: b_blocks, table: b_jobs, jobs };
+            l.bg = Some(leaf_gather_bind_group(d, &l, vertices, words, leaves));
+            l
+        });
+        SkinGpu { pipeline, bg, params, blocks: b_blocks, table: b_table, corners: b_corners, palette, jobs, source_first, palette_end: matrices, leaves }
+    }
+
+    /// Skins the meshes of `work` (a job and its pose's palette each) on the GPU: their triangles, shading attributes
+    /// and BLAS input, in a submit of its own (before the commit builds their BLASes). False: the scene has no such
+    /// pass, or a palette is not the job's size (nothing was written).
+    pub fn skin(&self, up: &Uploaded, work: &[(u32, Vec<crate::skin::PaletteRows>)]) -> bool {
+        let Some(s) = &up.skin else { return false };
+        if work.iter().any(|(job, rows)| s.jobs.get(*job as usize).is_none_or(|j| j.1 as usize != rows.len())) {
+            return false;
+        }
+        let mut blocks: Vec<[u32; 2]> = vec![];
+        for (job, rows) in work {
+            let j = s.jobs[*job as usize].0;
+            self.queue.write_buffer(&s.palette, j.palette as u64 * 48, bytemuck::cast_slice(rows));
+            blocks.extend((0..j.count.div_ceil(SKIN_BLOCK)).map(|b| [*job, b * SKIN_BLOCK]));
+        }
+        if blocks.is_empty() {
+            return true;
+        }
+        let n = blocks.len() as u32;
+        self.queue.write_buffer(&s.blocks, 0, bytemuck::cast_slice(&blocks));
+        self.queue.write_buffer(&s.params, 0, bytemuck::cast_slice(&[n, 0, 0, 0]));
+        let mut e = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("skin"), timestamp_writes: None });
+            pass.set_pipeline(&s.pipeline);
+            pass.set_bind_group(0, &s.bg, &[]);
+            pass.dispatch_workgroups(n.min(SKIN_ROW), n.div_ceil(SKIN_ROW), 1);
+        }
+        // Software traversal: the same meshes' leaves, from the vertices just written.
+        if let Some(l) = &s.leaves {
+            let blocks: Vec<[u32; 2]> = work.iter().flat_map(|(job, _)| (0..l.jobs[*job as usize].count.div_ceil(SKIN_BLOCK)).map(|b| [*job, b * SKIN_BLOCK])).collect();
+            if !blocks.is_empty() {
+                let n = blocks.len() as u32;
+                self.queue.write_buffer(&l.blocks, 0, bytemuck::cast_slice(&blocks));
+                self.queue.write_buffer(&l.params, 0, bytemuck::cast_slice(&[n, (up.words.at(Stream::Indices) / 4) as u32, 0, 0]));
+                let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("leaf gather"), timestamp_writes: None });
+                pass.set_pipeline(&l.pipeline);
+                pass.set_bind_group(0, l.bg.as_ref().expect("made with the pass"), &[]);
+                pass.dispatch_workgroups(n.min(SKIN_ROW), n.div_ceil(SKIN_ROW), 1);
+            }
+        }
+        self.queue.submit([e.finish()]);
+        true
     }
 
     /// The loop guard's count as the GPU has it now (None: `kernel` has no guard): the invocations it stopped since
@@ -3025,7 +4072,7 @@ impl Gpu {
     }
 
     /// Software traversal's top tree again, over the units as they are now, written to its range of the node buffer
-    /// (what `rebuild_tlas` is to hardware traversal). Err: no tree can be made (more units than its range holds, a
+    /// (what the TLAS's build is to hardware traversal). Err: no tree can be made (more units than its range holds, a
     /// unit that is nowhere); nothing was written, and the caller rebuilds the scene.
     pub fn retop(&self, units: &mut crate::units::Units, nodes: &wgpu::Buffer) -> std::result::Result<(), String> {
         let top = units.top()?;
@@ -3037,7 +4084,12 @@ impl Gpu {
 
     /// A mesh tree's nodes into the node buffer at its root (`Units::add_tree` placed it).
     pub fn write_tree(&self, nodes: &wgpu::Buffer, root: u32, tree: &crate::units::MeshTree) {
-        self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(&tree.nodes));
+        self.write_nodes(nodes, root, &tree.nodes);
+    }
+
+    /// A tree's nodes written again where they lie (its boxes taken again, `units::refit`: as many, the same shape).
+    pub fn write_nodes(&self, nodes: &wgpu::Buffer, root: u32, tree: &[crate::bvh::GpuNode]) {
+        self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(tree));
     }
 
     /// A freed mesh tree's nodes (`Units::drop_tree`: its root and length) are room again: leaves that end a walk
@@ -3047,87 +4099,52 @@ impl Gpu {
         self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(&vec![crate::units::FILL; len as usize]));
     }
 
-    pub fn rebuild_tlas(&self, accel: &Accel, e: &mut wgpu::CommandEncoder) {
-        e.build_acceleration_structures(std::iter::empty::<&wgpu::BlasBuildEntry>(), [&accel.tlas]);
-    }
-
-    /// Rebuilds the BLASes of instanced meshes whose triangles changed (a new shared pose, `scene::PoseGroup`), not the
-    /// TLAS: the caller rebuilds it after (it holds their bounds).
-    pub fn rebuild_meshes(&self, accel: &Accel, meshes: &[u32], e: &mut wgpu::CommandEncoder) {
-        self.build_meshes(accel, meshes, e, false);
-    }
-
-    /// The BLASes of instanced meshes `meshes` and, with `tlas`, the TLAS in the same build (the TLAS reads the BLASes'
-    /// bounds through their resource ids, which Metal does not order a later build after: a TLAS built apart from a
-    /// BLAS it references, in the same encoder, could see it unbuilt and lose its instance; live/edits.rs `edit_geometry`).
-    pub fn build_meshes(&self, accel: &Accel, meshes: &[u32], e: &mut wgpu::CommandEncoder, tlas: bool) {
-        self.build_edit(accel, meshes, &[], e, tlas);
-    }
-
-    /// `build_meshes` with the procedural BLASes `proc_blas` left pending, all in the one build.
-    pub fn build_edit(&self, accel: &Accel, meshes: &[u32], procs: &[PendingProc], e: &mut wgpu::CommandEncoder, tlas: bool) {
-        let mut entries: Vec<wgpu::BlasBuildEntry> = meshes
-            .iter()
-            .map(|&m| {
-                let (parts, sizes) = &accel.mesh_geo[m as usize];
-                wgpu::BlasBuildEntry {
-                    blas: &accel.meshes[m as usize],
-                    geometry: wgpu::BlasGeometries::TriangleGeometries(
-                        sizes
-                            .iter()
-                            .zip(parts)
-                            .map(|(size, &(first, _, _))| wgpu::BlasTriangleGeometry {
-                                size,
-                                vertex_buffer: &accel.verts,
-                                first_vertex: ((accel.pool_first + first as usize) * 3) as u32,
-                                vertex_stride: 12,
-                                index_buffer: None,
-                                first_index: None,
-                                transform_buffer: None,
-                                transform_buffer_offset: None,
-                            })
-                            .collect(),
-                    ),
+    /// What a commit left to build above the triangles, once. Hardware traversal: the BLASes named and the TLAS in one
+    /// call: on Metal a TLAS built apart from a BLAS it references, in the next submit too, can see it unbuilt and
+    /// lose its instance until the TLAS is next built (tests/render/skinning-shared-pose-live). Software traversal:
+    /// the top tree over the units as they are now; Err: none can be made (`retop`), nothing was written, and the
+    /// caller rebuilds the scene.
+    pub fn build_top(&self, up: &mut Uploaded, b: TopBuild) -> std::result::Result<(), String> {
+        match Top::of(&mut up.accel, &mut up.units) {
+            Some(Top::Hw(accel)) => {
+                let mut meshes = b.meshes;
+                meshes.sort_unstable();
+                meshes.dedup();
+                let mut entries = mesh_entries(accel, &meshes);
+                entries.extend(b.procs.iter().map(|p| wgpu::BlasBuildEntry { blas: &p.blas, geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry { size: &p.size, stride: 24, aabb_buffer: &p.boxes, primitive_offset: 0 }]) }));
+                if b.dynamic {
+                    entries.extend(dynamic_entries(accel));
                 }
-            })
-            .collect();
-        entries.extend(procs.iter().map(|p| wgpu::BlasBuildEntry { blas: &p.blas, geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry { size: &p.size, stride: 24, aabb_buffer: &p.boxes, primitive_offset: 0 }]) }));
-        e.build_acceleration_structures(entries.iter(), tlas.then_some(&accel.tlas));
+                let mut e = self.device.create_command_encoder(&Default::default());
+                e.build_acceleration_structures(entries.iter(), [&accel.tlas]);
+                self.queue.submit([e.finish()]);
+                drop(entries);
+                // Built: kept for reuse (a commit that falls back never builds, and a BLAS never built must not be).
+                self.proc_blases.lock().unwrap().extend(b.procs.into_iter().map(|p| (p.hash, (p.blas, p.bytes))));
+                Ok(())
+            }
+            Some(Top::Sw(units)) => self.retop(units, &up.bg_parts.nodes),
+            None => Ok(()),
+        }
     }
 
+    /// The dynamic groups' BLASes and the TLAS, in a frame's encoder (the particle passes: their triangles are placed
+    /// by the GPU every frame).
     pub fn rebuild_dynamic(&self, accel: &Accel, e: &mut wgpu::CommandEncoder) {
-        let entries: Vec<wgpu::BlasBuildEntry> = accel
-            .blases
-            .iter()
-            .filter(|b| b.1 >= 4)
-            .map(|(blas, _, first, size)| wgpu::BlasBuildEntry {
-                blas,
-                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
-                    size,
-                    vertex_buffer: &accel.verts,
-                    first_vertex: (*first * 3) as u32,
-                    vertex_stride: 12,
-                    index_buffer: None,
-                    first_index: None,
-                    transform_buffer: None,
-                    transform_buffer_offset: None,
-                }]),
-            })
-            .collect();
-        e.build_acceleration_structures(entries.iter(), [&accel.tlas]);
+        e.build_acceleration_structures(dynamic_entries(accel).iter(), [&accel.tlas]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Offline translucency: the pass (translucent.wgsl) `spp` times at random points in each pixel, each with a fresh
     /// lighting estimate per hit; the mean (colour, transmittance) per pixel. Empty without translucent particles.
-    fn render_translucent(&self, up: &Uploaded, base: Params, spp: u32) -> Result<Vec<[f32; 4]>> {
+    fn render_translucent(&self, up: &Uploaded, base: Params, spp: u32, (w, h): (u32, u32)) -> Result<Vec<[f32; 4]>> {
         let Some(t) = &up.translucent else { return Ok(vec![]) };
         let d = &self.device;
-        let (w, h) = (up.width, up.height);
         let pipeline = self.translucent_pipelines(&up.kernel, false).draw;
         let size = w as u64 * h as u64 * 16;
         let sums = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent sums"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let tbg = self.translucent_bind_group(t, &sums);
+        // (Drawn at full resolution: the reduced image's buffer is bound and not read.)
+        let tbg = self.translucent_bind_group(t, &sums, &self.translucent_low(1, 1));
         let tp = TranslucentParams { size: [w, h, t.first, 0], view: [w, h, 0, 0], misc: [0.0; 4] };
         self.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
         let n = spp.max(1);
@@ -3142,7 +4159,7 @@ impl Gpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("translucent"), timestamp_writes: None });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &up.bg, &[]);
-                pass.set_bind_group(1, &self.no_vis, &[]);
+                pass.set_bind_group(1, self.no_vis_tl.as_ref().unwrap(), &[]);
                 pass.set_bind_group(2, &tbg, &[]);
                 pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
             }
@@ -3168,10 +4185,10 @@ impl Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     /// Render `spp` samples. `base` holds everything except the per-dispatch sample index.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(&self, scene: &Scene, tri_verts: &[[f32; 4]], groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], base: Params, spp: u32, timings: &mut Vec<(String, f64)>) -> Result<Frame> {
+    pub fn render(&self, scene: &Scene, groups: [usize; GROUPS], nodes: &[u8], emitters: &[[f32; 4]], emitter_tris: &[crate::GpuEmitterTri], emitter_runs: &crate::EmitterRuns, light_tree: &[[f32; 4]], env: &EnvMap, env_cdf: &[f32], energy: &[[f32; 4]], base: Params, spp: u32, timings: &mut Vec<(String, f64)>) -> Result<Frame> {
         let d = &self.device;
         let (w, h) = (scene.width, scene.height);
-        let up = self.upload(scene, w, h, tri_verts, groups, nodes, emitters, light_tree, env, env_cdf, energy, timings)?;
+        let up = self.upload(scene, &self.accum_buffer(w, h), groups, nodes, emitters, emitter_tris, emitter_runs, light_tree, env, env_cdf, energy, timings)?;
         let pipeline = self.pipeline(&up.kernel, false);
         // Particles: placed once, at the scene time and camera.
         if up.particles.is_some() {
@@ -3198,6 +4215,12 @@ impl Gpu {
                 }
                 self.queue.submit([e.finish()]);
             }
+        }
+        // The particles' emitters, where the passes above placed them.
+        if let Some(f) = &up.fills.particles {
+            let mut e = d.create_command_encoder(&Default::default());
+            self.fill_emitters(f, &mut e);
+            self.queue.submit([e.finish()]);
         }
         // Grid programs: run from the scene's start to its time at 60 frames a second (the sources of the game's setup at
         // the first), then rendered.
@@ -3251,7 +4274,7 @@ impl Gpu {
             }
         }
         let t_tl = Instant::now();
-        let overlay = self.render_translucent(&up, base, spp)?;
+        let overlay = self.render_translucent(&up, base, spp, (w, h))?;
         if up.translucent.is_some() {
             timings.push(("translucent_ms".into(), t_tl.elapsed().as_secs_f64() * 1000.0));
         }
@@ -3332,7 +4355,8 @@ mod tests {
             ("F_MASKED", F_MASKED), ("F_FOG", F_FOG), ("F_VOLUME", F_VOLUME), ("F_TEX", F_TEX), ("F_FUNC", F_FUNC),
             ("F_GLASS", F_GLASS), ("F_COAT", F_COAT), ("F_HUGE", F_HUGE), ("F_INST", F_INST), ("F_MEDIA", F_MEDIA), ("F_PEMIT", F_PEMIT),
             ("F_HMEDIA", F_HMEDIA), ("F_PROC", F_PROC), ("F_TINT", F_TINT), ("F_UNLIT", F_UNLIT), ("F_BACKGROUND", F_BACKGROUND),
-            ("F_VCOLOR", F_VCOLOR), ("F_AERIAL", F_AERIAL), ("F_GRID", F_GRID), ("F_LISTS", F_LISTS),
+            ("F_VCOLOR", F_VCOLOR), ("F_AERIAL", F_AERIAL), ("F_GRID", F_GRID), ("F_LISTS", F_LISTS), ("F_IFUNC", F_IFUNC), ("F_IGLASS", F_IGLASS),
+            ("F_DEFORM", F_DEFORM),
         ];
         let mut seen = 0u32;
         for (name, bit) in all {
@@ -3340,6 +4364,20 @@ mod tests {
             seen |= bit;
         }
         let wgsl = include_str!("../shaders/pathtrace.wgsl");
+        // The live approximations: one bit each, the shader's the same, `A_LIVE` all of them.
+        let approx = [("A_GLASS_SHADOWS", A_GLASS_SHADOWS), ("A_MEDIA_SHADOWS", A_MEDIA_SHADOWS), ("A_CUTOUT_PATHS", A_CUTOUT_PATHS), ("A_CUTOUT_EMITTERS", A_CUTOUT_EMITTERS), ("A_FAR_EMITTERS", A_FAR_EMITTERS)];
+        assert_eq!(approx.iter().fold(0, |all, a| { assert!(a.1.is_power_of_two() && all & a.1 == 0, "{} = {}", a.0, a.1); all | a.1 }), A_LIVE);
+        let declared: Vec<&str> = wgsl.lines().filter(|l| l.starts_with("const A_")).collect();
+        assert_eq!(declared.len(), approx.len());
+        for (name, bit) in approx {
+            assert!(declared.iter().any(|l| l.starts_with(&format!("const {name}: u32 = {bit}u;"))), "{name}: pathtrace.wgsl and gpu.rs differ");
+        }
+        // (The render tests' names for them: tests/render/lib.ts `APPROX`.)
+        let lib = include_str!("../../tests/render/lib.ts");
+        for (name, bit) in [("glassShadows", A_GLASS_SHADOWS), ("mediaShadows", A_MEDIA_SHADOWS), ("cutoutPaths", A_CUTOUT_PATHS), ("cutoutEmitters", A_CUTOUT_EMITTERS), ("farEmitters", A_FAR_EMITTERS)] {
+            assert!(lib.contains(&format!("{name}: {bit},")), "{name}: tests/render/lib.ts and gpu.rs differ");
+        }
+        assert!(lib.contains(&format!("all: {A_LIVE},")));
         assert!(wgsl.contains(&format!("const RIS_EXACT: u32 = {RIS_EXACT}u;")), "RIS_EXACT: pathtrace.wgsl and gpu.rs differ");
         for line in wgsl.lines().filter(|l| l.starts_with("const F_")) {
             let name = &line[6..line.find(':').unwrap()];
@@ -3347,6 +4385,105 @@ mod tests {
             let rust = all.iter().find(|(n, _)| *n == name).unwrap_or_else(|| panic!("{name}: not in gpu.rs")).1;
             assert_eq!(value, rust, "{name}: pathtrace.wgsl and gpu.rs differ");
         }
+    }
+
+    /// The level the kernel reads a texture at, less the texture's own size (`mesh_density` and `mesh_lod`, their own
+    /// text, run on the GPU): half the log of a triangle's UV area times the material's repeat over its area, times a
+    /// footprint's square, over what else divides; the repeat alone for the triangle where it or its UVs have no
+    /// area. Triangles of every size and UV scale against the same in 64-bit floats.
+    #[test]
+    fn the_kernels_texel_density_is_the_triangles() {
+        use wgpu::util::DeviceExt;
+        let g = match super::Gpu::new() {
+            Ok(g) => g,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        let part = |src: &'static str, from: &str, to: &str| {
+            let at = src.find(from).unwrap_or_else(|| panic!("the kernel has `{from}`"));
+            &src[at..at + src[at..].find(to).expect("its end") + to.len()]
+        };
+        let attr = part(include_str!("../shaders/records.wgsl"), "struct TriAttr {", "};");
+        let kernel = include_str!("../shaders/pathtrace.wgsl");
+        let density = part(kernel, "fn mesh_density(e1: vec3<f32>, e2: vec3<f32>, a: TriAttr, m: Material) -> vec2<f32> {", "\n}\n");
+        let level = part(kernel, "fn mesh_lod(density: vec2<f32>, footprint2: f32, over: f32) -> f32 {", "}\n");
+        // (A row: the two edges, with the footprint's square and the divisor in their fourth words; the attributes; the
+        // material's `uv`.)
+        let src = format!(
+            "{attr}\nstruct Material {{ uv: vec4<f32> }};\nstruct In {{ e1: vec4<f32>, e2: vec4<f32>, a: TriAttr, m: vec4<f32> }};\n\
+             @group(0) @binding(0) var<storage, read> input: array<In>;\n@group(0) @binding(1) var<storage, read_write> out: array<f32>;\n{density}\n{level}\n\
+             @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n    if (id.x >= arrayLength(&input)) {{ return; }}\n    let i = input[id.x];\n    out[id.x] = mesh_lod(mesh_density(i.e1.xyz, i.e2.xyz, i.a, Material(i.m)), i.e1.w, i.e2.w);\n}}\n"
+        );
+        // A deterministic stream in [0, 1).
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut f = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32) / (1u64 << 24) as f32
+        };
+        let (mut rows, mut want): (Vec<[f32; 32]>, Vec<f64>) = (vec![], vec![]);
+        for k in 0..512 {
+            // Sizes from a millimetre to a hundred metres, UVs from a hundredth of the texture to a hundred repeats,
+            // footprints from a tenth of a millimetre to ten metres, a divisor from a thousandth to one.
+            let (size, uvs) = (10f32.powf(f() * 5.0 - 3.0), 10f32.powf(f() * 4.0 - 2.0));
+            let (fp2, over) = (10f32.powf(f() * 10.0 - 8.0), 10f32.powf(-f() * 3.0));
+            let mut v = |s: f32| [(f() - 0.5) * s, (f() - 0.5) * s, (f() - 0.5) * s];
+            let (mut e1, mut e2) = (v(size), v(size));
+            let (uv0, mut uv1, mut uv2) = ([f() * uvs, f() * uvs], [f() * uvs, f() * uvs], [f() * uvs, f() * uvs]);
+            let rep = if k % 4 == 0 { [10f32.powf(f() * 2.0 - 1.0), -10f32.powf(f() * 2.0 - 1.0)] } else { [1.0, 1.0] };
+            match k % 16 {
+                // A triangle without area (its edges along one line, or none), UVs without area.
+                5 => e2 = e1.map(|x| x * 2.0),
+                6 => (e1, e2) = ([0.0; 3], [0.0; 3]),
+                7 => (uv1, uv2) = (uv0, uv0),
+                8 => uv2 = [uv0[0] + (uv1[0] - uv0[0]) * 3.0, uv0[1] + (uv1[1] - uv0[1]) * 3.0],
+                _ => {}
+            }
+            let mut row = [0f32; 32];
+            row[..3].copy_from_slice(&e1);
+            row[4..7].copy_from_slice(&e2);
+            (row[3], row[7]) = (fp2, over);
+            // (The attributes' UV words: n0.w, n1.w = uv0; n2.w, uv.x = uv1; uv.y, uv.z = uv2.)
+            (row[8 + 3], row[8 + 7], row[8 + 11], row[8 + 12], row[8 + 13], row[8 + 14]) = (uv0[0], uv0[1], uv1[0], uv1[1], uv2[0], uv2[1]);
+            // (The attributes: five vec4s; then the material's.)
+            (row[28], row[29]) = (rep[0], rep[1]);
+            rows.push(row);
+            let d = |a: [f32; 3]| a.map(|x| x as f64);
+            let (a, b) = (d(e1), d(e2));
+            let cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let area = 0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+            let (d1, d2) = ([(uv1[0] - uv0[0]) as f64, (uv1[1] - uv0[1]) as f64], [(uv2[0] - uv0[0]) as f64, (uv2[1] - uv0[1]) as f64]);
+            let uv_area = 0.5 * (d1[0] * d2[1] - d2[0] * d1[1]).abs();
+            let ratio = if area > 1e-12 && uv_area > 1e-14 { uv_area / area } else { 1.0 };
+            want.push(0.5 * (ratio * ((rep[0] * rep[1]).abs() as f64).max(1e-12) * fp2 as f64 / over as f64).max(1e-30).log2());
+        }
+        let d = &g.device;
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("texel density"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let pipeline = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let input = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&rows), usage: wgpu::BufferUsages::STORAGE });
+        let bytes = (rows.len() * 4) as u64;
+        let out = d.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let to = d.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() }] });
+        let mut e = d.create_command_encoder(&Default::default());
+        {
+            let mut pass = e.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(rows.len().div_ceil(64) as u32, 1, 1);
+        }
+        e.copy_buffer_to_buffer(&out, 0, &to, 0, bytes);
+        g.queue.submit([e.finish()]);
+        to.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        d.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got: Vec<f32> = bytemuck::pod_collect_to_vec(&to.slice(..).get_mapped_range().unwrap());
+        let (mut flat, mut spread) = (0, (f64::MAX, f64::MIN));
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            // (A triangle or UVs at the edge of having an area may fall on either side of it in 32 bits: not those.)
+            let edge = matches!(k % 16, 5 | 8);
+            assert!(edge || (*g as f64 - w).abs() <= 2e-4 + 2e-5 * w.abs(), "triangle {k}: the kernel's {g}, {w} in 64 bits");
+            flat += (k % 16 == 6 || k % 16 == 7) as usize;
+            spread = (spread.0.min(*w), spread.1.max(*w));
+        }
+        assert!(flat > 40 && spread.0 < -8.0 && spread.1 > 8.0, "the triangles span the levels ({spread:?}) and {flat} have no area");
     }
 
     fn naga_valid(src: &str) {
@@ -3394,9 +4531,9 @@ mod tests {
             out
         };
         let mut checked = 0;
-        for (hwrt, merged, uniform_tables) in [(true, false, false), (true, false, true), (false, false, false), (false, false, true), (false, true, false)] {
+        for (hwrt, merged, uniform_tables, whole_tables) in [(true, false, false, false), (true, false, true, false), (true, false, false, true), (false, false, false, false), (false, false, true, false), (false, false, false, true), (false, true, false, false)] {
             for room in [false, true] {
-                let mut layout: Vec<Entry> = kernel_layout_entries(LayoutShape { hwrt, merged, uniform_tables, guard: room }).iter().enumerate().flat_map(|(g, es)| es.iter().map(move |e| (g as u32, e.binding, e.ty))).collect();
+                let mut layout: Vec<Entry> = kernel_layout_entries(LayoutShape { hwrt, merged, uniform_tables, whole_tables, guard: room }).iter().enumerate().flat_map(|(g, es)| es.iter().map(move |e| (g as u32, e.binding, e.ty))).collect();
                 layout.sort_by_key(|e| (e.0, e.1));
                 for guard in [None, Some(1 << 16)] {
                     // (As written, a kernel with the guard needs the room.)
@@ -3408,20 +4545,21 @@ mod tests {
                         if guard.is_none() && !merged {
                             want.retain(|e| (e.0, e.1) != (1, crate::merged::GUARD_BINDING));
                         }
-                        let v = KernelVariant { merged, uniform_tables, guard, ..KernelVariant::new(hwrt, KernelSwitches::default(), features) };
+                        let v = KernelVariant { merged, uniform_tables, whole_tables, guard, ..KernelVariant::new(hwrt, KernelSwitches::default(), features) };
                         assert_eq!(declared(&v), want, "{v:?} in a layout {} room for the guard", if room { "with" } else { "without" });
                         checked += 1;
                     }
                 }
             }
         }
-        assert_eq!(checked, 2 * 3 + 2 * 6 + 8);
+        assert_eq!(checked, 3 * 3 + 3 * 6 + 8);
     }
 
     /// The native default has no loop guard, and the live passes are their file. Every variant the kernel's flags
     /// make is valid WGSL (naga, wgpu's front end): each traversal with no switch, each alone and all of them, by no
-    /// scene feature, each alone and all of them (units are software traversal's), with the uniform tables, and with
-    /// the loop guard. (The merged layout's: merged.rs.) Prints the default variants' SHA-256 (`--nocapture`).
+    /// scene feature, each alone and all of them (units are software traversal's), with the uniform tables, with the
+    /// tables read whole, and with the loop guard. (The merged layout's: merged.rs.) Prints the default variants'
+    /// SHA-256 (`--nocapture`).
     #[test]
     fn every_kernel_variant_is_valid() {
         use sha2::{Digest, Sha256};
@@ -3451,6 +4589,7 @@ mod tests {
                 }
                 let all_features = KernelVariant::new(hwrt, k, if hwrt { F_SOURCE & !F_UNITS } else { F_SOURCE });
                 naga_valid(&kernel_wgsl(&template, &KernelVariant { uniform_tables: true, ..all_features }));
+                naga_valid(&kernel_wgsl(&template, &KernelVariant { whole_tables: true, ..all_features }));
                 naga_valid(&kernel_wgsl(&template, &KernelVariant { guard: Some(1 << 16), ..all_features }));
             }
         }
@@ -3511,7 +4650,7 @@ mod tests {
         let desktop = GpuOptions::from_vars(&vars(&[]), false);
         assert_eq!(desktop, GpuOptions::default());
         assert_eq!(desktop.kernel, KernelSwitches { strict: false, cutout_lite: 0, last_direct: false, last_sun: false, light_pick: false });
-        assert!(!desktop.uniform_tables_on(false, false));
+        assert!(!desktop.uniform_tables_on(false, false) && desktop.table_views_on(false, false));
         for hwrt in [false, true] {
             assert!(KernelVariant::new(hwrt, desktop.kernel, 0).flags().iter().all(|&(name, on)| on == (name == "hwrt" && hwrt)));
         }
@@ -3520,16 +4659,26 @@ mod tests {
         // `sun`: the directional lights alone at the last vertex, in place of all of them, on either platform.
         let sun = GpuOptions::from_vars(&vars(&[("THREERT_LAST_DIRECT", "sun")]), true);
         assert_eq!((sun.kernel.last_direct, sun.kernel.last_sun), (false, true));
-        assert_eq!((android.uniform_tables, android.pipeline_cache.clone()), (None, None));
-        assert!(android.uniform_tables_on(false, true) && !android.uniform_tables_on(true, true));
+        assert_eq!((android.uniform_tables, android.table_views, android.pipeline_cache.clone()), (None, None, None));
+        // Android reads the tables whole (no views, so no uniform copies of four of them); with the views asked for,
+        // the uniform copies as before.
+        assert!(!android.table_views_on(false, true) && !android.uniform_tables_on(false, true) && !android.uniform_tables_on(true, true));
+        let views = GpuOptions::from_vars(&vars(&[("THREERT_TABLE_VIEWS", "1")]), true);
+        assert!(views.table_views_on(false, true) && views.uniform_tables_on(false, true) && !views.table_views_on(true, true));
         // Set: what is asked, on either platform.
         let off = GpuOptions::from_vars(&vars(&[("THREERT_UNIFORM_TABLES", "0"), ("THREERT_KERNEL_STRICT", "0"), ("THREERT_CUTOUT_LITE", "0"), ("THREERT_LAST_DIRECT", "0")]), true);
         assert_eq!((off.kernel, off.uniform_tables_on(false, true)), (KernelSwitches::default(), false));
         let on = GpuOptions::from_vars(&vars(&[("THREERT_UNIFORM_TABLES", "1"), ("THREERT_CUTOUT_LITE", "2"), ("THREERT_LIGHT_PICK", "1"), ("THREERT_PIPELINE_CACHE", "/data/cache/pipelines")]), false);
         assert!(on.uniform_tables_on(false, false) && !on.uniform_tables_on(true, false));
+        // Elsewhere the views unless asked otherwise; without them no uniform tables, whatever is asked.
+        assert!(on.table_views_on(false, false) && !on.table_views_on(true, false));
+        let whole = GpuOptions::from_vars(&vars(&[("THREERT_TABLE_VIEWS", "0"), ("THREERT_UNIFORM_TABLES", "1")]), false);
+        assert!(!whole.table_views_on(false, false) && !whole.uniform_tables_on(false, false));
         assert_eq!(on.kernel, KernelSwitches { strict: false, cutout_lite: 2, last_direct: false, last_sun: false, light_pick: true });
         assert_eq!(on.pipeline_cache.as_deref(), Some(std::path::Path::new("/data/cache/pipelines")));
         assert_eq!(GpuOptions::from_vars(&vars(&[("THREERT_PIPELINE_CACHE", "")]), true).pipeline_cache, None);
+        // The light tiles: everywhere but Android unless asked.
+        assert_eq!([light_tiles_of(None, false), light_tiles_of(None, true), light_tiles_of(Some("1"), true), light_tiles_of(Some("0"), false)], [true, false, true, false]);
         // (And the environment map's light sampling, which is the scene's preparation's: lib.rs `env_nee_on`.)
         assert_eq!([crate::env_nee_of(None, false), crate::env_nee_of(None, true), crate::env_nee_of(Some("1"), true), crate::env_nee_of(Some("0"), false)], [true, false, true, false]);
     }
@@ -3544,6 +4693,31 @@ mod tests {
             wesl_wgsl(&[RECORDS, src].concat(), &[], &[]);
         }
         wesl_wgsl(include_str!("../shaders/grid_sim.wgsl"), &[], &[]);
+        wesl_wgsl(include_str!("../shaders/skin.wgsl"), &[], &[]);
+        wesl_wgsl(include_str!("../shaders/leaf_gather.wgsl"), &[], &[]);
+    }
+
+    /// The kernel is compiled with its loops bounded and nothing else checked, unless asked.
+    #[test]
+    fn the_kernels_loops_are_bounded() {
+        let of = |v| { let c = kernel_checks_of(v); (c.force_loop_bounding, c.bounds_checks, c.ray_query_initialization_tracking) };
+        assert_eq!([of(None), of(Some(0)), of(Some(1)), of(Some(2)), of(Some(12))], [(true, false, false), (false, false, false), (true, true, true), (false, true, false), (true, false, true)]);
+    }
+
+    /// The skinning pass is valid WGSL, and its block size and dispatch row are the ones the CPU lays its work out by.
+    #[test]
+    fn the_skinning_pass_is_valid_and_its_sizes_are_the_cpus() {
+        let src = include_str!("../shaders/skin.wgsl");
+        let module = naga::front::wgsl::parse_str(src).expect("skin.wgsl parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).expect("skin.wgsl validates");
+        assert!(src.contains(&format!("@compute @workgroup_size({SKIN_BLOCK})")) && src.contains(&format!("const ROW: u32 = {SKIN_ROW}u;")));
+        assert_eq!((std::mem::size_of::<SkinJob>(), std::mem::size_of::<crate::skin::SkinCorner>(), std::mem::size_of::<crate::skin::PaletteRows>()), (16, 64, 48));
+        // (The pass that takes the leaves again after it: the same blocks and rows.)
+        let src = include_str!("../shaders/leaf_gather.wgsl");
+        let module = naga::front::wgsl::parse_str(src).expect("leaf_gather.wgsl parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).expect("leaf_gather.wgsl validates");
+        assert!(src.contains(&format!("@compute @workgroup_size({SKIN_BLOCK})")) && src.contains(&format!("const ROW: u32 = {SKIN_ROW}u;")));
+        assert_eq!(std::mem::size_of::<LeafJob>(), 16);
     }
 
     /// Each switch changes what it says, under both traversals (that every combination is valid WGSL:
@@ -3557,7 +4731,7 @@ mod tests {
             let plain = v(hwrt, KernelSwitches::default());
             let strict = v(hwrt, KernelSwitches { strict: true, ..Default::default() });
             let queries = strict.matches("rayQueryInitialize(").count();
-            assert_eq!(queries, if hwrt { 3 } else { 0 });
+            assert_eq!(queries, if hwrt { 2 } else { 0 });
             assert_eq!(strict.matches("ray_bad(o, d, tmax").count(), queries, "every ray query is guarded");
             assert_eq!(strict.matches("fn ray_bad(").count(), hwrt as usize);
             assert!(!strict.contains("env_cdf_at(y - 1u)") && !strict.contains("env_cdf_at(base + x - 1u)") && plain.contains("env_cdf_at(y - 1u)"));
@@ -3567,7 +4741,7 @@ mod tests {
             let sun = v(hwrt, KernelSwitches { last_sun: true, ..Default::default() });
             assert_eq!((sun.matches("radiance += dz;").count(), sun.matches("fn sun_light(").count(), sun.matches("sun_light(s, lobes(").count()), (1, 1, 1));
             assert!(!plain.contains("sun_light"));
-            assert_eq!(lit.matches("env_on = take_env && has_env;").count(), 1);
+            assert_eq!(lit.matches("env_on = take_env && has_env && !lights_only;").count(), 1);
             assert_eq!(lit.contains("let steps = 4u;"), hwrt);
             assert_eq!(v(hwrt, KernelSwitches { cutout_lite: 2, ..Default::default() }) == plain, !hwrt);
         }
@@ -3672,9 +4846,9 @@ mod tests {
     fn structural_features_are_not_instancing() {
         const M: usize = 1 << 23;
         let groups = [M + 5, 3, 0, 0, 0, 0, 0, 0];
-        assert_eq!(features_of(&[], None, false, false, groups, F_PEMIT) & F_HUGE, 0);
-        assert_eq!(features_of(&[], None, false, false, groups, F_MEDIA) & F_HUGE, 0);
-        assert_ne!(features_of(&[], None, false, false, groups, F_INST) & F_HUGE, 0);
+        assert_eq!(features_of(&[], 0, false, false, groups, F_PEMIT) & F_HUGE, 0);
+        assert_eq!(features_of(&[], 0, false, false, groups, F_MEDIA) & F_HUGE, 0);
+        assert_ne!(features_of(&[], 0, false, false, groups, F_INST) & F_HUGE, 0);
     }
 
     #[test]
@@ -3688,7 +4862,7 @@ mod tests {
         assert!(huge([M, 5, 0, 0, 0, 0, 0, 0], false));
         // Empty groups past 2^24 have no instance.
         assert!(!huge([M + 7, 0, 0, 0, 0, 0, 0, 0], false));
-        // The 3 x 3 Kabukicho district (37.75 M triangles, opaque shadow casters first).
+        // A 3 x 3 street district of 37.75 M triangles (opaque shadow casters first).
         assert!(huge([36_000_000, 900_000, 500_000, 352_799, 0, 0, 0, 0], false));
         // With model instances, group custom data must stay below the instance bit (2^23).
         assert!(!huge([M - 1, 5, 0, 0, 0, 0, 0, 0], false));

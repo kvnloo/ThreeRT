@@ -5,26 +5,29 @@ use super::*;
 
 /// Headless runner: renders at a fixed frame rate and saves snapshots on request (tools/bench-live.ts).
 pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
-    let (w, h) = (opts.width, opts.height);
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     spawn_stdin_reader(cmd_tx);
-    let (mut game, mut core) = crate::script::GameSession::start(&opts.bundle, &opts.room, &opts.assets, gpu::Gpu::new()?, presets, w, h)?;
+    if let Some(store) = &opts.store {
+        crate::files::set_user_root(Some(store));
+    }
+    let (mut game, mut core) = crate::script::GameSession::start(&opts.bundle, &opts.room, &opts.assets, gpu::Gpu::new()?, presets, opts.width, opts.height)?;
     // The host channel: this runner is the app. How the game was opened, once after setup; what the game posts goes
     // out on stdout (`emit_posts`), and whoever drives the runner answers with `{"cmd":"host"}`.
-    if let Err(e) = game.host_messages(&mut core, &[crate::host::launch_message(opts.launch.as_ref())]) {
+    if let Err(e) = game.host_messages(&mut core, &[crate::host::launch_message_with_caps(opts.launch.as_ref(), &opts.caps.iter().map(String::as_str).collect::<Vec<_>>())]) {
         eprintln!("live: launch: {e:#}");
     }
     emit_posts(&mut game);
     // Frame-script cost (script + commit), reported every 2 s.
     let (mut fs_sum, mut fs_max, mut fs_n) = (0.0f32, 0.0f32, 0u32);
     core.bounces = opts.bounces;
+    core.set_scale(opts.scale.unwrap_or(0.0));
+    core.set_rendering(opts.rendering.clone());
     core.set_display_scale(opts.display_scale);
-    if let Some(s) = opts.scale {
-        core.set_scale(s);
-    }
     eprintln!("live: load {}", serde_json::Value::Object(core.load_timings().iter().map(|(k, v)| (k.clone(), (*v).into())).collect()));
-    eprintln!("live: {}x{} @{} fps on {} ({})", w, h, opts.fps, core.g.adapter_info.name, if core.g.hwrt { "HW RT" } else { "BVH" });
-    let staging = core.g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("snapshot"), size: (w * h * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    eprintln!("live: {}x{} @{} fps on {} ({})", core.w, core.h, opts.fps, core.g.adapter_info.name, if core.g.hwrt { "HW RT" } else { "BVH" });
+    // A snapshot's pixels, at the view's size.
+    let staging_for = |core: &LiveCore| core.g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("snapshot"), size: core.targets.out.size(), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    let mut staging = staging_for(&core);
     let frame_dt = Duration::from_secs_f64(1.0 / opts.fps as f64);
     let mut next = Instant::now();
     let mut snapshots: Vec<(PathBuf, u32, u32)> = vec![]; // path, min history, first eligible frame
@@ -77,7 +80,18 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 Cmd::Time(t) => core.set_time(t),
                 Cmd::Mode(m) => core.view_mode = m,
                 Cmd::Bounces(b) => core.bounces = b,
+                Cmd::Rendering(r) => core.set_rendering(r),
                 Cmd::Scale(s) => core.set_scale(s),
+                Cmd::Resize(w, h) => {
+                    let t = Instant::now();
+                    match core.resize(w, h) {
+                        Ok(()) => {
+                            staging = staging_for(&core);
+                            eprintln!("live: resized to {}x{} in {:.1} ms", core.w, core.h, t.elapsed().as_secs_f64() * 1e3);
+                        }
+                        Err(e) => eprintln!("live: resize: {e:#}"),
+                    }
+                }
                 Cmd::Event(kind, payload) => {
                     if let Err(e) = game.event(&mut core, &kind, payload) {
                         eprintln!("live: event {kind} failed: {e:#}");
@@ -120,7 +134,7 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         let pending = !snapshots.is_empty();
         core.render(spp, |e, out| {
             if pending {
-                e.copy_buffer_to_buffer(out, 0, &staging, 0, (w * h * 4) as u64);
+                e.copy_buffer_to_buffer(out, 0, &staging, 0, staging.size());
             }
         });
         game.click_shown();
@@ -154,7 +168,7 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         }
                         let _ = std::fs::write(path, bytemuck::cast_slice(hdr.as_deref().unwrap_or(&[])));
                     } else {
-                        save_bgra(path, &px, w, h);
+                        save_bgra(path, &px, core.w, core.h);
                     }
                     eprintln!("live: snapshot {} at history {hist} ({spp} spp/frame, GPU {:.2} ms, scale {:.2})", path.display(), core.gpu_ms, core.render_scale);
                     false
@@ -167,12 +181,12 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
             use std::io::Write;
             let line = serde_json::json!({
                 "t": start.elapsed().as_secs_f64() * 1e3, "interval": last_frame.elapsed().as_secs_f64() * 1e3, "start": t_frame.duration_since(prev_start).as_secs_f64() * 1e3,
-                "cpu": t_frame.elapsed().as_secs_f64() * 1e3, "script": game.frame_ms, "js": game.js_ms, "commit": game.commit_ms, "skin": core.cpu_skin_ms, "upload": core.cpu_upload_ms, "blas": core.gpu_blas_ms, "wait": core.cpu_wait_ms, "gpu": core.gpu_ms, "trace": core.gpu_trace_ms, "edit": core.edit_ms, "instanced": core.instanced_ms, "edit_split": [core.edit_split.tris, core.edit_split.upload, core.edit_split.blas, core.edit_split.added, core.edit_split.deformed, core.edit_split.objects], "rebuild": core.rebuild_ms, "fallback": core.fallback, "fallbacks": core.fallbacks, "room": core.room_stats(), "top": core.top_stats(), "voxel": std::mem::take(&mut game.host.voxels.borrow_mut().ticks), "physics": game.host.physics.borrow_mut().as_mut().map(|p| { let s = p.take_stats(); serde_json::json!({ "ticks": s.ticks, "step": s.step_ms, "sync": s.sync_ms, "bodies": s.bodies, "moved": s.moved, "kicks": s.kicks }) }), "scale": core.render_scale, "history": core.history_len, "guard": core.guard_count(),
+                "cpu": t_frame.elapsed().as_secs_f64() * 1e3, "script": game.frame_ms, "js": game.js_ms, "commit": game.commit_ms, "skin": core.cpu_skin_ms, "upload": core.cpu_upload_ms, "blas": core.gpu_blas_ms, "wait": core.cpu_wait_ms, "gpu": core.gpu_ms, "trace": core.gpu_trace_ms, "edit": core.edit_ms, "instanced": core.instanced_ms, "build": core.build_ms, "edit_split": [core.edit_split.tris, core.edit_split.upload, core.edit_split.blas, core.edit_split.added, core.edit_split.deformed, core.edit_split.objects], "rebuild": core.rebuild_ms, "fallback": core.fallback, "fallbacks": core.fallbacks, "room": core.room_stats(), "top": core.top_stats(), "voxel": std::mem::take(&mut game.host.voxels.borrow_mut().ticks), "physics": game.host.physics.borrow_mut().as_mut().map(|p| { let s = p.take_stats(); serde_json::json!({ "ticks": s.ticks, "step": s.step_ms, "sync": s.sync_ms, "bodies": s.bodies, "moved": s.moved, "kicks": s.kicks }) }), "reconstruction": core.reconstruction().name(), "reconstruction_fallback": core.reconstruction_status().fallback.map(Skip::name), "scale": core.render_scale, "history": core.history_len, "guard": core.guard_count(),
             });
             writeln!(l, "{line}")?;
         }
         // (Summed over the frame's commits, a game event's and the frame script's: reset once logged.)
-        (core.edit_ms, core.instanced_ms, core.edit_split, core.rebuild_ms, core.fallback) = (0.0, 0.0, EditSplit::default(), 0.0, None);
+        (core.edit_ms, core.instanced_ms, core.build_ms, core.edit_split, core.rebuild_ms, core.fallback) = (0.0, 0.0, 0.0, EditSplit::default(), 0.0, None);
         prev_start = t_frame;
         last_frame = Instant::now();
         core.govern_resolution(opts.fps);
@@ -273,7 +287,12 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
         "mode" => Cmd::Mode(v["mode"].as_u64()? as u32),
         "bounces" => Cmd::Bounces(v["bounces"].as_u64()?.clamp(1, 16) as u32),
         "spp" => Cmd::SppCap(v["max"].as_u64()?.clamp(1, 16) as u32),
+        // `{"cmd":"rendering","reconstruction":["metalfx-denoised","builtin"],"quality":"performance"}`; the older
+        // `{"cmd":"reconstruction","mode":"fsr"}` is the same with one setting.
+        "rendering" => Cmd::Rendering(RenderingRequest::from_json(&v).map_err(|e| eprintln!("live: {e:#}")).ok()?),
+        "reconstruction" => Cmd::Rendering(RenderingRequest { reconstruction: Some(Reconstruction::from_json(&v["mode"]).map_err(|e| eprintln!("live: {e:#}")).ok()?), ..Default::default() }),
         "scale" => Cmd::Scale(v["scale"].as_f64()? as f32),
+        "resize" => Cmd::Resize(v["width"].as_u64()? as u32, v["height"].as_u64()? as u32),
         "sync" => Cmd::Sync(v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string()), v["frames"].as_u64().unwrap_or(1) as u32),
         "quit" => Cmd::Quit,
         _ => return None,
@@ -284,6 +303,7 @@ pub fn parse_opts(args: &[String]) -> Result<LiveOpts> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let num = |name: &str, d: u32| -> Result<u32> { flag(name).map(|v| v.parse().map_err(|_| anyhow!("{name} must be a number"))).transpose().map(|v| v.unwrap_or(d)) };
     Ok(LiveOpts {
+        rendering: RenderingRequest::from_flags(&flag)?,
         width: num("--width", 1280)?,
         height: num("--height", 720)?,
         fps: num("--fps", 60)?,
@@ -296,6 +316,8 @@ pub fn parse_opts(args: &[String]) -> Result<LiveOpts> {
         frame_log: flag("--frame-log").map(PathBuf::from),
         display_scale: flag("--display-scale").map(|v| v.parse::<f32>()).transpose()?.unwrap_or(1.0),
         launch: parse_launch(flag("--launch").as_deref())?,
+        caps: flag("--caps").map(|c| c.split(',').map(str::trim).filter(|c| !c.is_empty()).map(String::from).collect()).unwrap_or_default(),
+        store: flag("--store").map(PathBuf::from),
     })
 }
 

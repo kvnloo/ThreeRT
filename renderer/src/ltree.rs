@@ -239,33 +239,49 @@ impl LightTree {
         self.checked();
     }
 
-    /// The moving emitters moved: their leaves' spheres from their triangles now (`verts(k)`: entry k's vertices),
-    /// then each moving node's and the root's from its children's, bottom-up (children come after their parent). The
-    /// topology, codes and powers stay.
-    pub fn refit_moving(&mut self, verts: &dyn Fn(usize) -> [[f32; 3]; 3]) {
+    /// The moving emitters moved: their leaves' spheres from their triangles now (`verts(e)`: emitter e's vertices;
+    /// None: it is not there now, a hidden instance's), then each moving node's and the root's from its children's,
+    /// bottom-up (children come after their parent). What is not there bounds nothing: its leaf keeps its sphere and
+    /// widens no node above it. The topology, codes and powers stay.
+    pub fn refit_moving(&mut self, verts: &dyn Fn(usize) -> Option<[[f32; 3]; 3]>) {
         if self.moving_count == 0 {
             return;
         }
+        let mut empty = vec![false; self.nodes.len()];
         for i in (self.moving_nodes..self.nodes.len()).rev().chain([2, 0]) {
             let w = self.nodes[i][3].to_bits();
             let s = if w & LEAF != 0 {
                 let (a, b) = self.ranges[i];
                 let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-                for k in a..b {
-                    let (l, h) = bounds(&verts(k as usize));
+                for v in (a..b).filter_map(|k| verts(self.order[k as usize] as usize)) {
+                    let (l, h) = bounds(&v);
                     for j in 0..3 {
                         lo[j] = lo[j].min(l[j]);
                         hi[j] = hi[j].max(h[j]);
                     }
                 }
-                box_sphere(lo, hi)
+                (lo[0] <= hi[0]).then(|| box_sphere(lo, hi))
             } else {
-                union_sphere(sphere_of(&self.nodes[w as usize]), sphere_of(&self.nodes[w as usize + 1]))
+                let (l, r) = (w as usize, w as usize + 1);
+                match (empty[l], empty[r]) {
+                    (false, false) => Some(union_sphere(sphere_of(&self.nodes[l]), sphere_of(&self.nodes[r]))),
+                    (false, true) => Some([self.nodes[l][0], self.nodes[l][1]]),
+                    (true, false) => Some([self.nodes[r][0], self.nodes[r][1]]),
+                    (true, true) => None,
+                }
             };
-            self.nodes[i][0] = s[0];
-            self.nodes[i][1] = s[1];
+            match s {
+                Some(s) => (self.nodes[i][0], self.nodes[i][1]) = (s[0], s[1]),
+                None => empty[i] = true,
+            }
         }
         self.checked();
+    }
+
+    /// The moving subtree's sphere (centre, radius), if there is one.
+    #[cfg(test)]
+    pub(crate) fn moving_sphere(&self) -> Option<([f32; 3], f32)> {
+        (self.moving_count > 0).then(|| sphere_of(&self.nodes[2]))
     }
 
     /// `check` in tests and debug builds (bvh.rs `build_tris` says why not always).
@@ -350,29 +366,28 @@ impl LightTree {
     }
 }
 
-/// The tree over the emitters that are not particles and have power (`weight`), from their triangles (`tri_verts`: v0,
-/// e1, e2 per triangle, as prepared): the static ones; with moving ones too, a root over the static subtree (node 1)
+/// The tree over the emitters that are not particles and have power (`weight`), from their triangles in world space
+/// (`verts(e)`: emitter e's vertices): the static ones; with moving ones too, a root over the static subtree (node 1)
 /// and the moving one (node 2). None below MIN_STATIC static emitters.
-pub fn build(tris: &[EmitterTri], tri_verts: &[[f32; 4]], weight: &dyn Fn(usize) -> f32) -> Option<LightTree> {
-    build_with(tris, tri_verts, weight, false)
+pub fn build(tris: &[EmitterTri], verts: &dyn Fn(usize) -> [[f32; 3]; 3], weight: &dyn Fn(usize) -> f32) -> Option<LightTree> {
+    build_with(tris, verts, weight, false)
 }
 
 /// As `build`, with a slot for emitters added in place (scenes whose geometry the live view can edit): the root over
 /// the static subtree (node 1, path bit 0 = 0) and theirs (node 2, bit 0 = 1, empty until `set_dynamic`). Without the
 /// slot when there are moving emitters (their subtree is node 2; emitters added in place then go by power share).
-pub fn build_slotted(tris: &[EmitterTri], tri_verts: &[[f32; 4]], weight: &dyn Fn(usize) -> f32) -> Option<LightTree> {
-    build_with(tris, tri_verts, weight, true)
+pub fn build_slotted(tris: &[EmitterTri], verts: &dyn Fn(usize) -> [[f32; 3]; 3], weight: &dyn Fn(usize) -> f32) -> Option<LightTree> {
+    build_with(tris, verts, weight, true)
 }
 
-fn build_with(tris: &[EmitterTri], tri_verts: &[[f32; 4]], weight: &dyn Fn(usize) -> f32, slot: bool) -> Option<LightTree> {
+fn build_with(tris: &[EmitterTri], verts: &dyn Fn(usize) -> [[f32; 3]; 3], weight: &dyn Fn(usize) -> f32, slot: bool) -> Option<LightTree> {
     let (mut fixed, mut moving): (Vec<Item>, Vec<Item>) = (vec![], vec![]);
     for (i, t) in tris.iter().enumerate() {
         let w = weight(i);
         if t.nominal || !(w > 0.0) {
             continue;
         }
-        let k = t.tri as usize * 3;
-        let (lo, hi) = bounds(&tri_vertices(&tri_verts[k..k + 3]));
+        let (lo, hi) = bounds(&verts(i));
         let it = Item { e: i as u32, lo, hi, c: t.c, w };
         if t.moves {
             moving.push(it);
@@ -418,7 +433,7 @@ mod tests {
     use super::*;
 
     fn tri(i: u32, x: f32) -> (EmitterTri, [[f32; 4]; 3]) {
-        (EmitterTri { tri: i, mat: 0, obj: 0, area: 0.5, c: [x + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false }, [[x, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        (EmitterTri { tri: i, mat: 0, obj: 0, area: 0.5, c: [x + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: crate::NO_INST, part: 0 }, [[x, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
     }
 
     /// Garbage in: emitters whose triangles are not finite, that coincide, or carry weights near f32's limit make a
@@ -438,7 +453,7 @@ mod tests {
         }
         let w = |i: usize| if i % 11 == 0 { 3.0e38 } else { 1.0 };
         for slot in [false, true] {
-            let mut t = build_with(&tris, &verts, &w, slot).expect("a tree");
+            let mut t = build_with(&tris, &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &w, slot).expect("a tree");
             t.check().unwrap();
             t.refit(&|k| if k % 5 == 0 { f32::NAN } else { 2.0 });
             t.set_dynamic((0..300).map(|k| DynItem { e: k, lo: [f32::NAN; 3], hi: [0.0; 3], c: [(k % 3) as f32, f32::INFINITY, 0.0], w: 1.0 }).collect());
@@ -452,7 +467,7 @@ mod tests {
         let (tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, i as f32 * 2.0)).unzip();
         let verts: Vec<[f32; 4]> = verts.into_iter().flatten().collect();
         let w = |i: usize| 1.0 + i as f32;
-        let t = build(&tris, &verts, &w).unwrap();
+        let t = build(&tris, &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &w).unwrap();
         assert!((t.power - (0..n).map(|i| 1.0 + i as f32).sum::<f32>()).abs() < 1.0);
         let mut seen = vec![false; n as usize];
         for k in 0..n as usize {
@@ -488,9 +503,9 @@ mod tests {
     fn few_or_moving_emitters_make_no_tree() {
         let (tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..300).map(|i| tri(i, i as f32)).unzip();
         let verts: Vec<[f32; 4]> = verts.into_iter().flatten().collect();
-        assert!(build(&tris[..100], &verts, &|_| 1.0).is_none());
+        assert!(build(&tris[..100], &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &|_| 1.0).is_none());
         let moving: Vec<EmitterTri> = tris.iter().map(|t| EmitterTri { moves: true, ..*t }).collect();
-        assert!(build(&moving, &verts, &|_| 1.0).is_none());
+        assert!(build(&moving, &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &|_| 1.0).is_none());
     }
 
     /// With the slot: static codes under node 1 (bit 0 = 0); emitters added in place get node 2's subtree, their entries
@@ -500,7 +515,7 @@ mod tests {
         let n = 300u32;
         let (tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, i as f32 * 2.0)).unzip();
         let verts: Vec<[f32; 4]> = verts.into_iter().flatten().collect();
-        let mut t = build_slotted(&tris, &verts, &|_| 1.0).unwrap();
+        let mut t = build_slotted(&tris, &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &|_| 1.0).unwrap();
         let (fixed, ns) = t.dynamic.unwrap();
         assert_eq!(ns, n);
         assert!(t.code.iter().all(|c| c & 1 == 0), "static entries under node 1");
@@ -536,13 +551,15 @@ mod tests {
     #[test]
     fn moving_emitters_get_a_subtree_that_refits() {
         let n = 400u32;
-        let (mut tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, i as f32 * 2.0)).unzip();
+        // (The movers are not along x in the list's order: their leaf order is another, so an entry is not its emitter.)
+        let (mut tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, if i < 300 { i as f32 * 2.0 } else { 600.0 + (i * 37 % 100) as f32 * 2.0 })).unzip();
         for t in tris.iter_mut().skip(300) {
             t.moves = true;
         }
         let verts: Vec<[f32; 4]> = verts.into_iter().flatten().collect();
-        let mut t = build(&tris, &verts, &|_| 1.0).unwrap();
+        let mut t = build(&tris, &|i| tri_vertices(&verts[i * 3..i * 3 + 3]), &|_| 1.0).unwrap();
         assert_eq!((t.moving_first, t.moving_count), (300, 100));
+        assert!((300..400).any(|k| t.order[k] != k as u32), "the movers' leaf order is not the list's");
         assert!((t.power - n as f32).abs() < 1e-3);
         for k in 0..n as usize {
             let moving = tris[t.order[k] as usize].moves;
@@ -551,20 +568,16 @@ mod tests {
         }
         // The moving ones move 50 m up: every leaf and its ancestors hold them there.
         let codes = t.code.clone();
-        let moved = |k: usize| {
-            let i = t.order[k] as usize * 3;
-            tri_vertices(&verts[i..i + 3]).map(|v| [v[0], v[1] + 50.0, v[2]])
-        };
-        let order = t.order.clone();
-        let vs: Vec<[[f32; 3]; 3]> = (0..n as usize).map(|k| if tris[order[k] as usize].moves { moved(k) } else { [[0.0; 3]; 3] }).collect();
-        t.refit_moving(&|k| vs[k]);
+        let moved = |e: usize| tri_vertices(&verts[e * 3..e * 3 + 3]).map(|v| [v[0], v[1] + 50.0, v[2]]);
+        let vs: Vec<[[f32; 3]; 3]> = (0..n as usize).map(|e| if tris[e].moves { moved(e) } else { [[0.0; 3]; 3] }).collect();
+        t.refit_moving(&|e| Some(vs[e]));
         assert_eq!(t.code, codes);
         for k in t.moving_first as usize..n as usize {
             let mut node = 0usize;
             let depth = (t.code[k] >> PATH_BITS) - 1;
             for l in 0..=depth {
                 let (c, r) = sphere_of(&t.nodes[node]);
-                for v in vs[k] {
+                for v in vs[t.order[k] as usize] {
                     let d = ((v[0] - c[0]).powi(2) + (v[1] - c[1]).powi(2) + (v[2] - c[2]).powi(2)).sqrt();
                     assert!(d <= r * 1.001 + 1e-3, "entry {k} outside node {node} at level {l}: {d} > {r}");
                 }
@@ -573,5 +586,14 @@ mod tests {
                 }
             }
         }
+        // One of them far away and not there (a hidden instance's): the moving subtree is no wider for it.
+        let (_, r) = sphere_of(&t.nodes[2]);
+        let far = |e: usize| vs[e].map(|v| [v[0], v[1] + 5000.0, v[2]]);
+        t.refit_moving(&|e| if e == 350 { Some(far(e)) } else { Some(vs[e]) });
+        assert!(sphere_of(&t.nodes[2]).1 > 2000.0, "there: the subtree reaches it");
+        t.refit_moving(&|e| (e != 350).then(|| vs[e]));
+        assert!(sphere_of(&t.nodes[2]).1 <= r * 1.001, "not there: the subtree is as wide as without it ({} for {r})", sphere_of(&t.nodes[2]).1);
+        t.refit_moving(&|e| (!tris[e].moves).then(|| vs[e]));
+        assert!(sphere_of(&t.nodes[2]).1 <= r * 1.001, "none there: the spheres stay");
     }
 }

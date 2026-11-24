@@ -34,9 +34,9 @@
 </p>
 
 <p align="center">
-  <a href="https://threert.dev"><img src="docs/images/reel.webp" width="100%" alt="Twelve scenes path-traced live by ThreeRT: Bistro at night with a crowd, Tokyo at dusk, Kabukichō in the rain, a voxel city, product and interior scenes, and a first-person shooter"></a>
+  <a href="https://threert.dev"><img src="docs/images/reel.webp" width="100%" alt="Twelve scenes path-traced live by ThreeRT: Bistro at night with a crowd, OpenStrike, Tokyo at dusk, Beeple's Zero-Day, a voxel city demolished, glowing balls down a staircase, a wrecking ball through a tower of glowing bricks, 400 lanterns, and product and interior scenes"></a>
   <br>
-  <sub>ThreeRT, live on an Apple M3 Max: this repository's demos and OpenStrike, a shooter built on the engine.</sub>
+  <sub>ThreeRT, live on an Apple M3 Max: this repository's demos and OpenStrike, a shooter built on the engine, on its own map.</sub>
 </p>
 
 ## Three + RT
@@ -113,6 +113,19 @@ threert dev        # bundles on save, serves every client on your network, print
 
 The same address in any browser shows the game as three.js. The full walk-through is at [threert.dev/docs](https://threert.dev/docs/).
 
+### Build your own app on the engine
+
+To put ThreeRT inside a native app of your own, start from the **[native app templates](https://github.com/threert/native-app-template)**: one repository with an app per platform in its own UI framework, macOS (SwiftUI) first. It is the recommended way to embed the engine, and it is set up for building with a coding agent:
+
+- a SwiftUI app whose window is a live path-traced view (the engine's `LiveCore` on a `CAMetalLayer`, behind a small C ABI), with a sample scene that uses physics, glass, metal and moving lights;
+- the Claude Code or Codex already on the machine, in a side panel over the [Agent Client Protocol](https://agentclientprotocol.com): ask for a change and the agent edits the scene's TypeScript, which the view hot-reloads within a second;
+- a code viewer with syntax highlighting that follows the agent's edits, a console, and a `scene check` / `scene shot` command line the agent uses to verify its own work.
+
+```bash
+git clone --recursive https://github.com/threert/native-app-template my-app
+cd my-app && bun tools/macos.ts --run
+```
+
 ### Packages
 
 | Package | What |
@@ -143,6 +156,12 @@ node tools/three/open.ts scenes/bistro.ts # the same scene in three.js, in your 
 
 In the window: drag to orbit, right-drag to pan, wheel to zoom, WASD/QE to fly, `R` to reset, `P` for a snapshot.
 
+`play` and `live` take `--quality` (`auto`, `native`, `quality`, `balanced`, `performance`, `ultra-performance`),
+`--reconstruction` (`builtin`, `auto`, an upscaler: `fsr`, `metalfx`, `dlss`; a joint denoiser: `metalfx-denoised`,
+`dlss-rr`; or a list in order of preference) and `--latency`. FSR 1 also runs on WebGPU; DLSS requires an opt-in NVIDIA
+SDK build; MetalFX requires supported Apple hardware. See
+[live rendering settings and the TypeScript API](docs/RUNTIME.md#live-rendering-settings).
+
 ```bash
 npm test && npm run typecheck && (cd renderer && cargo test --release)   # scene API, gameplay, runtime and engine tests
 npm run test:render                                                      # the render test suite, on the GPU
@@ -153,12 +172,11 @@ npm run test:render                                                      # the r
 | Demo | What | Run |
 |---|---|---|
 | **Light Room** | A small game: click coins, the floor, the balls, the crate and the walls | `threert-render play out/bundles/light-room.js` |
-| **Kabukichō Night** | A Shinjuku night street, procedural, lit almost entirely by ~120 emissive signs; rain, fog, a taxi. `R` rain, `L` closing time, `V` viewpoint | `threert-render play out/bundles/kabukicho.js` |
 | **Bistro** | Amazon Lumberyard Bistro at night: a slice, the district, and a crowd of 150 walkers and 60 vans | [`games/bistro-slice`](games/bistro-slice), [`bistro-district`](games/bistro-district), [`bistro-crowd`](games/bistro-crowd) |
 | **Zero-Day** | Beeple's Zero-Day (Measure One), animated | [`games/zero-day`](games/zero-day) |
 | **Tokyo** | Shinjuku and Shiba from the PLATEAU city model, with a live time of day | [`games/tokyo`](games/tokyo), [`tools/tokyo`](tools/tokyo) |
-| **Voxel level** | A destructible voxel city: explosions, falling pieces, fire and smoke | [`games/voxel-level`](games/voxel-level), [`docs/VOXEL.md`](docs/VOXEL.md) |
-| **Playground** | A macOS editor around the live viewport: outliner, live editing, Play-in-Editor, A/B against UE5 | `bun playground/build.ts && bun playground/run.ts` |
+| **Voxel level** | A destructible voxel city: explosions, cuts, whole buildings brought down in pieces, dust and smoke | [`games/voxel-level`](games/voxel-level), [`docs/VOXEL.md`](docs/VOXEL.md) |
+| **Showreel** | Light and physics together: glowing balls down a staircase, a wrecking ball through a tower of glowing bricks, 400 lanterns | [`games/showreel`](games/showreel) |
 
 ## Repository layout
 
@@ -171,7 +189,6 @@ npm run test:render                                                      # the r
 | [`tools/`](tools) | Bundling, benches and gates, the three.js comparison, the Tokyo pipeline |
 | [`compare/`](compare) | Hello-world scenes side by side in three.js and ThreeRT |
 | [`ue5/`](ue5) | UE5 reference captures (Lumen and the Path Tracer): the ground truth the renderer is measured against |
-| [`playground/`](playground) | ThreeRT Playground, the macOS editor |
 | [`site/`](site) | [threert.dev](https://threert.dev): the landing page, Download and Docs (the apps themselves are on [threert.app](https://threert.app)) |
 
 ## Documentation
@@ -180,11 +197,12 @@ npm run test:render                                                      # the r
 - [`docs/RUNTIME.md`](docs/RUNTIME.md): how scene code runs in the engine: setup, handlers, world handlers, frame scripts, physics
 - [`docs/MATERIAL_FUNCTIONS.md`](docs/MATERIAL_FUNCTIONS.md): a WGSL body on a material, run by the path tracer at every hit
 - [`docs/VOXEL.md`](docs/VOXEL.md): the voxel engine, measured on a destructible level
+- [`docs/PORTS.md`](docs/PORTS.md): a game written once for ThreeRT, and ports of it to devices the engine does not run on
 - [`docs/COMPARE.md`](docs/COMPARE.md): three.js at its strongest against ThreeRT, in frame rate and image quality
-- [`docs/PARITY.md`](docs/PARITY.md): Kabukichō against the same brief built in UE 5.8, and what the engine gained from it
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/REPORT.md`](docs/REPORT.md): the serverless gameplay and rendering runtime the engine was built for
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): the goal, the plan, and what each step measured
 - [Scene authoring skill](.claude/skills/threert-scene-authoring/SKILL.md): photo-referenced scenes with a coding agent
+- [Native app templates](https://github.com/threert/native-app-template): the engine embedded in a native app (macOS/SwiftUI first), with a local coding agent that edits the scene live; start here to build an app on ThreeRT
 
 ## Contributing
 
@@ -201,7 +219,6 @@ The assets are not in the repository; `bun scripts/setup.ts` fetches them. Third
 - **Amazon Lumberyard Bistro**: Amazon Lumberyard (2017). **Zero-Day**: Mike Winkelmann (Beeple) and Kate Anderson (2019). Both from NVIDIA's Open Research Content Archive (ORCA), CC BY 4.0, converted from FBX to glTF.
 - **Tokyo**: the 3D city model is Project PLATEAU (MLIT Japan); elevation and aerial photos are GSI; roads and places are © OpenStreetMap contributors (ODbL). The compiler in `tools/city` is from [jeantimex/tokyo](https://github.com/jeantimex/tokyo) (MIT).
 - Poly Haven and Quaternius assets are CC0; the glTF sample models are Khronos'.
-- The maps in the OpenStrike clips above (cs_assault, de_inferno, de_dust2) are Counter-Strike maps, © Valve, and part of neither project.
 
 three.js is an independent open-source project; ThreeRT is not affiliated with it.
 

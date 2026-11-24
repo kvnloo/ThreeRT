@@ -3,7 +3,7 @@
 //! colour / intensity, material parameters, wetness / rain / fog, camera); `LiveCore::commit` uploads them.
 
 use crate::desc;
-use crate::scene::{self, CameraData, GpuLight, GpuMaterial, Retained};
+use crate::scene::{self, GpuLight, GpuMaterial, Retained};
 use crate::world::{Changes, Kind, World};
 use crate::EmitterTri;
 use anyhow::{anyhow, Result};
@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 pub struct Dirty {
     pub materials: bool,
     pub lights: bool,
+    /// A light came, went or changed class: the table was listed again in a build's order (`list_lights`).
+    pub lights_listed: bool,
     /// A local light moved, or went dark or lit: the light groups are sorted again (`Tables::regroup_lights`).
     pub lights_moved: bool,
     pub objects: bool,
@@ -22,14 +24,14 @@ pub struct Dirty {
     /// Power edits held back (`Tables::defer_powers`): the live view's emitter worker rebuilds the CDF and the tree's
     /// powers for them, and they land together.
     pub deferred: bool,
-    /// Wetness / rain / fog kernel parameters.
-    pub environment: bool,
-    pub camera: bool,
+    /// A material's class changed (glass or not, a cutout or not): the instances with a row of one have their rows
+    /// remade (live/edits.rs `remake_classes`).
+    pub reclassed: bool,
 }
 
 impl Dirty {
     pub fn any(&self) -> bool {
-        self.materials || self.lights || self.objects || self.emitters || self.deferred || self.environment || self.camera
+        self.materials || self.lights || self.objects || self.emitters || self.deferred
     }
 }
 
@@ -43,22 +45,19 @@ pub struct Tables {
     pub light_tree: Option<crate::ltree::LightTree>,
     /// Materials that have emitter triangles (others cannot start emitting without a rebuild).
     pub(crate) emissive: HashSet<u32>,
-    pub wetness: f32,
-    pub rain: f32,
-    /// Cloud cover (0..1): a change re-bakes the sky and dims the sun (live/edits.rs `move_sun`).
-    pub cloud_cover: f32,
-    pub fog: Option<desc::Fog>,
-    /// three.js `scene.background` (`Params::background`).
-    pub background: Option<[f32; 3]>,
-    /// A material that starts emitting gets emitter entries in place (the live view sets these up, `prepare`'s
-    /// `mat_runs` / `fixed_mats`): it is queued in `started_emitting` for live/edits.rs `add_material_emitters`, unless its
-    /// triangles include pool or dynamic ones (fixed: a rebuild flattens them). Off: such a material rebuilds.
+    /// A material that starts emitting gets emitter entries in place (the live view sets this up): it is queued in
+    /// `started_emitting` for live/edits.rs `add_material_emitters`, which gives them to its still world-space
+    /// triangles (`prepare`'s `mat_runs`) and to the instances with a row of it. Off: such a material rebuilds.
     pub emit_in_place: bool,
-    pub fixed_mats: HashSet<u32>,
+    /// Materials of still world-space triangles (what the build flattened): whether one is a cutout decides its
+    /// triangles' traversal group, so that changing is a rebuild's.
+    pub static_mats: HashSet<u32>,
+    /// Materials of dynamic world-space triangles (particles'): their class is the triangle's, and they get no
+    /// emitters in place. One that starts emitting, or whose class changes, rebuilds.
+    pub moving_mats: HashSet<u32>,
     pub started_emitting: Vec<u32>,
-    /// `scene::aerial_params` of the sky.
-    pub aerial: [f32; 4],
-    pub camera: Option<CameraData>,
+    /// Materials whose class changed in the last `apply` (`Dirty::reclassed`).
+    pub reclassed: Vec<u32>,
     /// Object -> its entries in `lights`.
     pub light_index: HashMap<u32, Vec<usize>>,
     /// vec4s an object in `objects` (`scene::object_stride`).
@@ -84,16 +83,11 @@ impl Tables {
             emissive: emitter_tris.iter().map(|e| e.mat).collect(),
             emitter_tris,
             light_tree,
-            wetness: sc.wetness,
-            rain: sc.rain,
-            cloud_cover: sc.cloud_cover,
-            fog: sc.fog.clone(),
-            background: sc.background.map(|b| b.to_array()),
             emit_in_place: false,
-            fixed_mats: HashSet::new(),
+            static_mats: HashSet::new(),
+            moving_mats: HashSet::new(),
             started_emitting: vec![],
-            aerial: sc.aerial,
-            camera: None,
+            reclassed: vec![],
             light_index,
             stride: sc.object_stride(),
             defer_powers: false,
@@ -111,7 +105,8 @@ impl Tables {
 
     /// Applies parameter changes; Err / Ok(None) means the scene must be rebuilt instead.
     pub fn apply(&mut self, w: &World, c: &Changes, now: f32) -> Result<Option<Dirty>> {
-        if c.structural || !c.poses.is_empty() || !c.moved.is_empty() {
+        // (A texture that was replaced is the live view's to place again, before this: live/edits.rs `place_textures`.)
+        if c.structural || !c.poses.is_empty() || !c.moved.is_empty() || !c.textures.is_empty() {
             return Ok(None);
         }
         let mut d = Dirty::default();
@@ -124,14 +119,18 @@ impl Tables {
         }
         for id in &c.powers {
             let o = w.objects.get(id).ok_or_else(|| anyhow!("unknown object {id}"))?;
-            if let Some(&oi) = self.retained.objects.get(id) {
+            if let Some(oi) = self.retained.object(*id) {
                 let row = oi as usize * self.stride;
+                // (The row of a mesh or a model that is hidden, or placed without size, has no power: its instance's emitters at
+                // no weight until it comes back.)
+                let unseen = matches!(o.kind, Kind::Mesh { .. } | Kind::Model { .. }) && (!w.shown(*id) || scene::placed_world(w.world_matrix(*id), glam::Vec3::ZERO).1);
+                let power = if unseen { 0.0 } else { o.power.max(0.0) };
                 if self.defer_powers {
                     self.deferred.retain(|p| p.0 != row);
-                    self.deferred.push((row, o.power.max(0.0), now));
+                    self.deferred.push((row, power, now));
                     d.deferred = true;
                 } else {
-                    self.put_powers(&[(row, o.power.max(0.0), now)]);
+                    self.put_powers(&[(row, power, now)]);
                     d.objects = true;
                     d.emitters = true;
                 }
@@ -140,14 +139,18 @@ impl Tables {
         }
         for id in &c.customs {
             let o = w.objects.get(id).ok_or_else(|| anyhow!("unknown object {id}"))?;
-            if let Some(&oi) = self.retained.objects.get(id) {
+            if let Some(oi) = self.retained.object(*id) {
                 self.objects[oi as usize * self.stride + 2] = o.custom;
                 d.objects = true;
             }
         }
         for id in &c.lights {
-            let o = w.objects.get(id).ok_or_else(|| anyhow!("unknown object {id}"))?;
-            if let (Some(&mat), Kind::Light(desc::Light::Rect { color, intensity, visible: true, .. })) = (self.retained.cards.get(id), &o.kind) {
+            // (A light that is gone: its entries with it.)
+            let Some(o) = w.objects.get(id) else {
+                self.drop_light(*id, &mut d);
+                continue;
+            };
+            if let (Some(mat), Kind::Light(desc::Light::Rect { color, intensity, visible: true, .. })) = (self.retained.proxies.get(id).and_then(|p| p.card), &o.kind) {
                 let m = scene::card_material(*color, *intensity);
                 if !self.can_emit(mat, &m) {
                     return Ok(None);
@@ -156,6 +159,9 @@ impl Tables {
                 d.materials = true;
             }
             self.update_light(w, *id, &mut d);
+        }
+        if d.lights_listed {
+            self.list_lights(w);
         }
         for id in &c.materials {
             let Some(&mi) = self.retained.materials.get(id) else { return Ok(None) };
@@ -166,41 +172,101 @@ impl Tables {
             if !self.can_emit(mi, &gm) {
                 return Ok(None);
             }
+            // A material whose class changes (it turns glass or stops being glass, becomes a cutout or stops being
+            // one, gets a function or loses it): the instances with a row of it say so again, in place
+            // (`Dirty::reclassed`). Its world-space triangles cannot: still ones are in a traversal group by whether
+            // they are cutouts, dynamic ones carry their class.
+            let old = &self.materials[mi as usize];
+            let cutout = (gm.uv2[3] > 0.0) != (old.uv2[3] > 0.0);
+            let other = (gm.tex1[3] != 0) != (old.tex1[3] != 0) || (gm.layer[0] > 0.0) != (old.layer[0] > 0.0);
+            if (cutout && self.static_mats.contains(&mi)) || ((cutout || other) && self.moving_mats.contains(&mi)) {
+                return Ok(None);
+            }
+            if cutout || other {
+                self.reclassed.push(mi);
+                d.reclassed = true;
+            }
             self.materials[mi as usize] = gm;
             d.materials = true;
-        }
-        if c.environment {
-            self.wetness = w.environment.wetness.clamp(0.0, 1.0);
-            self.rain = w.environment.rain.clamp(0.0, 1.0);
-            self.cloud_cover = w.environment.cloud_cover.clamp(0.0, 1.0);
-            self.fog = w.environment.fog.clone();
-            self.background = w.environment.background;
-            self.aerial = scene::aerial_params(&w.environment.sky);
-            d.environment = true;
-        }
-        if c.camera {
-            let Some(cid) = w.settings.camera else { return Ok(None) };
-            let Some(Kind::Camera(cam)) = w.objects.get(&cid).map(|o| &o.kind) else { return Ok(None) };
-            self.camera = Some(scene::camera_data(w.world_matrix(cid), cam));
-            d.camera = true;
         }
         Ok(Some(d))
     }
 
-    fn update_light(&mut self, w: &World, id: u32, d: &mut Dirty) {
+    /// The atmosphere's sun: its light's entries as the world has it now (its direction, its size), with the colour the
+    /// atmosphere leaves it (`colour`: illuminance through the atmosphere). Whether any entry was written.
+    pub fn set_sun_light(&mut self, w: &World, id: u32, colour: glam::Vec3) -> bool {
+        let (Some(idx), Some(o)) = (self.light_index.get(&id), w.objects.get(&id)) else { return false };
+        let Kind::Light(l) = &o.kind else { return false };
+        // (The sun: hidden with a rebuild, `World::set_visible`.)
+        let Some(mut gl) = scene::gpu_light(l, w.world_matrix(id), o.power) else { return false };
+        gl.color = [colour.x, colour.y, colour.z, 0.0];
+        for &i in idx {
+            self.lights[i] = gl;
+        }
+        !idx.is_empty()
+    }
+
+    /// A light's entries as its description and place say (not the atmosphere's sun: `retained.sun`).
+    pub fn update_light(&mut self, w: &World, id: u32, d: &mut Dirty) {
         if self.retained.sun == Some(id) {
             return; // colour comes from the sky bake
         }
-        let (Some(idx), Some(o)) = (self.light_index.get(&id), w.objects.get(&id)) else { return };
+        let Some(o) = w.objects.get(&id) else { return };
         let Kind::Light(l) = &o.kind else { return };
-        if let Some(gl) = scene::gpu_light_shown(l, w.world_matrix(id), o.power, w.shown(id)) {
-            // A local light somewhere else, or lit where it was dark: the groups are sorted again (`regroup_lights`).
-            let moved = idx.iter().any(|&i| self.lights[i].pos != gl.pos || (self.lights[i].color[..3] == [0.0; 3]) != (gl.color[..3] == [0.0; 3]));
-            for &i in idx {
-                self.lights[i] = gl;
+        let Some(gl) = scene::gpu_light_shown(l, w.world_matrix(id), o.power, w.shown(id)) else { return };
+        match self.light_index.get(&id) {
+            Some(idx) => {
+                // A local light somewhere else, or lit where it was dark: the groups are sorted again
+                // (`regroup_lights`); so is the table for a light of another class (directional, local, shadowed).
+                let moved = idx.iter().any(|&i| self.lights[i].pos != gl.pos || (self.lights[i].color[..3] == [0.0; 3]) != (gl.color[..3] == [0.0; 3]));
+                let reclassed = idx.iter().any(|&i| crate::light_class(&self.lights[i]) != crate::light_class(&gl));
+                for &i in idx {
+                    self.lights[i] = gl;
+                }
+                d.lights_moved |= (moved && gl.pos[3] != 0.0) || reclassed;
+                d.lights_listed |= reclassed;
             }
-            d.lights = true;
-            d.lights_moved |= moved && gl.pos[3] != 0.0;
+            // A light that came while the scene runs: an entry after the others, sorted in among them.
+            None => {
+                self.light_index.insert(id, vec![self.lights.len()]);
+                self.lights.push(gl);
+                self.retained.light_nodes.push(id);
+                (d.lights_moved, d.lights_listed) = (true, true);
+            }
+        }
+        d.lights = true;
+    }
+
+    /// The entries of a light that is gone, out of the table (`light_index` and the retained nodes follow).
+    fn drop_light(&mut self, id: u32, d: &mut Dirty) {
+        let Some(idx) = self.light_index.remove(&id) else { return };
+        let keep: Vec<usize> = (0..self.lights.len()).filter(|i| !idx.contains(i)).collect();
+        if self.retained.light_nodes.len() == self.lights.len() {
+            self.retained.light_nodes = keep.iter().map(|&i| self.retained.light_nodes[i]).collect();
+        }
+        self.lights = keep.iter().map(|&i| self.lights[i]).collect();
+        self.light_index.clear();
+        for (i, n) in self.retained.light_nodes.iter().enumerate() {
+            self.light_index.entry(*n).or_default().push(i);
+        }
+        (d.lights, d.lights_moved, d.lights_listed) = (true, true, true);
+    }
+
+    /// The table's lights in the order a build lists them (the world's objects' order), before they are sorted into
+    /// the kernel's (`regroup_lights`, which keeps that order among lights it has no reason to part): a view where
+    /// lights came, went or changed class then has the table a build of its world has.
+    fn list_lights(&mut self, w: &World) {
+        if self.retained.light_nodes.len() != self.lights.len() {
+            return;
+        }
+        let at: HashMap<u32, usize> = w.ordered().into_iter().enumerate().map(|(k, id)| (id, k)).collect();
+        let mut order: Vec<usize> = (0..self.lights.len()).collect();
+        order.sort_by_key(|&i| at.get(&self.retained.light_nodes[i]).copied().unwrap_or(usize::MAX));
+        self.lights = order.iter().map(|&i| self.lights[i]).collect();
+        self.retained.light_nodes = order.iter().map(|&i| self.retained.light_nodes[i]).collect();
+        self.light_index.clear();
+        for (i, n) in self.retained.light_nodes.iter().enumerate() {
+            self.light_index.entry(*n).or_default().push(i);
         }
     }
 
@@ -229,9 +295,10 @@ impl Tables {
 
     /// Whether a material may emit without a rebuild: it already has emitter entries, or (`emit_in_place`) its
     /// triangles can get them in place, queued in `started_emitting` (ROADMAP § 6 step 3).
-    /// Materials created since the build (`Changes::new_materials`: no texture, no function), as entries after the
-    /// scene's. False, and nothing added, if one of them cannot be: it emits, is glass or layered, or a cutout (the
-    /// build sorts triangles by those; the caller rebuilds).
+    /// Materials created since the build (`Changes::new_materials`: no function), as entries after the scene's,
+    /// whatever their class: what an edit draws with one is an instance, whose rows say it. Their textures are the
+    /// pages' by now (the live view places them first: live/edits.rs `place_textures`). False, and nothing added, if
+    /// one of them cannot be made.
     pub fn add_materials(&mut self, w: &World, ids: &std::collections::BTreeSet<u32>) -> bool {
         let mut fresh = vec![];
         for id in ids {
@@ -239,18 +306,15 @@ impl Tables {
                 continue;
             }
             let Some(m) = w.materials.get(id) else { return false };
-            let Ok(gm) = scene::build_material(*id, m, &w.textures, &self.retained.shaders, &mut |_, _| Err(anyhow!("a texture"))) else { return false };
-            if scene::material_class(&gm) != 0 {
-                return false;
-            }
+            let slots = &self.retained.textures;
+            let mut tex = |tid: u32, srgb: bool| slots.get(&(tid, srgb)).copied().ok_or_else(|| anyhow!("texture {tid} is not in the pages"));
+            let Ok(gm) = scene::build_material(*id, m, &w.textures, &self.retained.shaders, &mut tex) else { return false };
             fresh.push((*id, gm));
         }
         for (id, gm) in fresh {
             let mi = self.materials.len() as u32;
             self.retained.materials.insert(id, mi);
             self.materials.push(gm);
-            // (What is drawn with it are instances' triangles: it cannot start emitting in place, `can_emit`.)
-            self.fixed_mats.insert(mi);
         }
         true
     }
@@ -260,7 +324,7 @@ impl Tables {
         if lum <= 0.0 || self.emissive.contains(&mi) {
             return true;
         }
-        if !self.emit_in_place || self.fixed_mats.contains(&mi) {
+        if !self.emit_in_place || self.moving_mats.contains(&mi) {
             return false;
         }
         self.emissive.insert(mi);
