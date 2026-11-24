@@ -10,7 +10,7 @@ let geometryIds = 0;
 export const StaticDrawUsage = 35044;
 export const DynamicDrawUsage = 35048;
 
-type NumberArray = Float32Array | Uint32Array | Uint16Array | Uint8Array | Int32Array | Int16Array | Int8Array;
+type NumberArray = Float32Array | Uint32Array | Uint16Array | Uint8Array | Uint8ClampedArray | Int32Array | Int16Array | Int8Array;
 
 /**
  * A geometry's per-vertex numbers (three.js BufferAttribute): `itemSize` per vertex in `array`. After writing them
@@ -150,6 +150,31 @@ export class Uint32BufferAttribute extends BufferAttribute {
 export class Uint16BufferAttribute extends BufferAttribute {
   constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
     super(typeof array === "number" ? new Uint16Array(array) : Uint16Array.from(array), itemSize, normalized);
+  }
+}
+export class Int32BufferAttribute extends BufferAttribute {
+  constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
+    super(typeof array === "number" ? new Int32Array(array) : Int32Array.from(array), itemSize, normalized);
+  }
+}
+export class Int16BufferAttribute extends BufferAttribute {
+  constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
+    super(typeof array === "number" ? new Int16Array(array) : Int16Array.from(array), itemSize, normalized);
+  }
+}
+export class Uint8ClampedBufferAttribute extends BufferAttribute {
+  constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
+    super(typeof array === "number" ? new Uint8ClampedArray(array) : Uint8ClampedArray.from(array), itemSize, normalized);
+  }
+}
+export class Uint8BufferAttribute extends BufferAttribute {
+  constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
+    super(typeof array === "number" ? new Uint8Array(array) : Uint8Array.from(array), itemSize, normalized);
+  }
+}
+export class Int8BufferAttribute extends BufferAttribute {
+  constructor(array: ArrayLike<number> | number, itemSize: number, normalized = false) {
+    super(typeof array === "number" ? new Int8Array(array) : Int8Array.from(array), itemSize, normalized);
   }
 }
 
