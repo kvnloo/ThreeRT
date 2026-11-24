@@ -615,14 +615,16 @@ export class ConeGeometry extends CylinderGeometry {
 
 export class TorusGeometry extends BufferGeometry {
   override type = "TorusGeometry";
-  constructor(radius = 1, tube = 0.4, radialSegments = 12, tubularSegments = 48, arc = Math.PI * 2) {
+  constructor(radius = 1, tube = 0.4, radialSegments = 12, tubularSegments = 48, arc = Math.PI * 2, thetaStart = 0, thetaLength = Math.PI * 2) {
     super();
-    this.parameters = { radius, tube, radialSegments, tubularSegments, arc };
+    this.parameters = { radius, tube, radialSegments, tubularSegments, arc, thetaStart, thetaLength };
+    radialSegments = Math.floor(radialSegments);
+    tubularSegments = Math.floor(tubularSegments);
     const b = new Builder();
     for (let j = 0; j <= radialSegments; j++) {
       for (let i = 0; i <= tubularSegments; i++) {
         const u = (i / tubularSegments) * arc;
-        const v = (j / radialSegments) * Math.PI * 2;
+        const v = thetaStart + (j / radialSegments) * thetaLength;
         const x = (radius + tube * Math.cos(v)) * Math.cos(u);
         const y = (radius + tube * Math.cos(v)) * Math.sin(u);
         const z = tube * Math.sin(v);
