@@ -131,6 +131,21 @@ export class Vector3 {
   setFromMatrix3Column(m: Matrix3, index: number): this {
     return this.fromArray(m.elements, index * 3);
   }
+  /** A colour's linear r, g, b as x, y, z (three.js). */
+  setFromColor(c: { r: number; g: number; b: number }): this {
+    return this.set(c.r, c.g, c.b);
+  }
+  /** Each component uniform in [0, 1) (three.js; Math.random: not for deterministic game setup). */
+  random(): this {
+    return this.set(Math.random(), Math.random(), Math.random());
+  }
+  /** A uniformly random unit vector (three.js: sphere point picking, https://mathworld.wolfram.com/SpherePointPicking.html). */
+  randomDirection(): this {
+    const theta = Math.random() * Math.PI * 2;
+    const u = Math.random() * 2 - 1;
+    const c = Math.sqrt(1 - u * u);
+    return this.set(c * Math.cos(theta), u, c * Math.sin(theta));
+  }
   setLength(length: number): this {
     return this.normalize().multiplyScalar(length);
   }
