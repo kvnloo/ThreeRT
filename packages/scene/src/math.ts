@@ -818,6 +818,32 @@ export class Box3 {
       this.min.y <= b.min.y && b.max.y <= this.max.y &&
       this.min.z <= b.min.z && b.max.z <= this.max.z;
   }
+  /** `point` clamped into this box, written to `target` (three.js). */
+  clampPoint(point: Vector3, target = new Vector3()): Vector3 {
+    const { min, max } = this;
+    return target.set(Math.max(min.x, Math.min(max.x, point.x)), Math.max(min.y, Math.min(max.y, point.y)), Math.max(min.z, Math.min(max.z, point.z)));
+  }
+  /** The distance from `point` to this box: 0 inside (three.js). */
+  distanceToPoint(point: Vector3): number {
+    return this.clampPoint(point).distanceTo(point);
+  }
+  /** Whether `sphere` touches this box (three.js). */
+  intersectsSphere(sphere: Sphere): boolean {
+    const c = this.clampPoint(sphere.center);
+    const dx = c.x - sphere.center.x, dy = c.y - sphere.center.y, dz = c.z - sphere.center.z;
+    return dx * dx + dy * dy + dz * dz <= sphere.radius * sphere.radius;
+  }
+  /** The sphere around this box; an empty box gives an empty sphere (three.js). */
+  getBoundingSphere(target = new Sphere()): Sphere {
+    if (this.isEmpty()) {
+      target.center.set(0, 0, 0);
+      target.radius = -1;
+    } else {
+      this.getCenter(target.center);
+      target.radius = this.getSize().length() * 0.5;
+    }
+    return target;
+  }
   intersectsBox(b: Box3): boolean {
     return b.max.x >= this.min.x && b.min.x <= this.max.x && b.max.y >= this.min.y && b.min.y <= this.max.y && b.max.z >= this.min.z && b.min.z <= this.max.z;
   }
