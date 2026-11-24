@@ -184,6 +184,15 @@ export class Vector3 {
       (e[2] * x + e[6] * y + e[10] * z + e[14]) * w,
     );
   }
+  applyMatrix3(m: Matrix3): this {
+    const e = m.elements;
+    const { x, y, z } = this;
+    return this.set(e[0] * x + e[3] * y + e[6] * z, e[1] * x + e[4] * y + e[7] * z, e[2] * x + e[5] * y + e[8] * z);
+  }
+  /** Transforms a normal by `Matrix3.getNormalMatrix` output and renormalizes, as three.js does. */
+  applyNormalMatrix(m: Matrix3): this {
+    return this.applyMatrix3(m).normalize();
+  }
   transformDirection(m: Matrix4): this {
     const e = m.elements;
     const { x, y, z } = this;
@@ -499,6 +508,11 @@ export class Matrix4 {
   clone(): Matrix4 {
     return new Matrix4().copy(this);
   }
+  /** `m` as the upper 3x3, with no translation, as three.js does. */
+  setFromMatrix3(m: Matrix3): this {
+    const me = m.elements;
+    return this.set(me[0], me[3], me[6], 0, me[1], me[4], me[7], 0, me[2], me[5], me[8], 0, 0, 0, 0, 1);
+  }
   compose(p: Vector3, q: Quaternion, s: Vector3): this {
     return this.composeComponents(p.x, p.y, p.z, q.x, q.y, q.z, q.w, s.x, s.y, s.z);
   }
@@ -676,6 +690,112 @@ export class Matrix4 {
   }
   toArray<T extends { [k: number]: number } = number[]>(a: T = [] as unknown as T, offset = 0): T {
     for (let k = 0; k < 16; k++) a[k + offset] = this.elements[k];
+    return a;
+  }
+}
+
+/** A 3x3 matrix, column-major `elements`, as three.js. */
+export class Matrix3 {
+  readonly isMatrix3 = true;
+  elements: number[];
+  /** Row-major arguments, as three.js. */
+  constructor(n11?: number, n12?: number, n13?: number, n21?: number, n22?: number, n23?: number, n31?: number, n32?: number, n33?: number) {
+    this.elements = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    if (n11 !== undefined) this.set(n11, n12!, n13!, n21!, n22!, n23!, n31!, n32!, n33!);
+  }
+  /** Row-major arguments, as three.js. */
+  set(n11: number, n12: number, n13: number, n21: number, n22: number, n23: number, n31: number, n32: number, n33: number): this {
+    const te = this.elements;
+    te[0] = n11; te[1] = n21; te[2] = n31;
+    te[3] = n12; te[4] = n22; te[5] = n32;
+    te[6] = n13; te[7] = n23; te[8] = n33;
+    return this;
+  }
+  identity(): this {
+    return this.set(1, 0, 0, 0, 1, 0, 0, 0, 1);
+  }
+  copy(m: Matrix3): this {
+    for (let k = 0; k < 9; k++) this.elements[k] = m.elements[k];
+    return this;
+  }
+  clone(): Matrix3 {
+    return new Matrix3().copy(this);
+  }
+  /** The upper 3x3 of `m`. */
+  setFromMatrix4(m: Matrix4): this {
+    const me = m.elements;
+    return this.set(me[0], me[4], me[8], me[1], me[5], me[9], me[2], me[6], me[10]);
+  }
+  multiply(m: Matrix3): this {
+    return this.multiplyMatrices(this, m);
+  }
+  premultiply(m: Matrix3): this {
+    return this.multiplyMatrices(m, this);
+  }
+  multiplyMatrices(a: Matrix3, b: Matrix3): this {
+    const ae = a.elements, be = b.elements;
+    const a11 = ae[0], a12 = ae[3], a13 = ae[6];
+    const a21 = ae[1], a22 = ae[4], a23 = ae[7];
+    const a31 = ae[2], a32 = ae[5], a33 = ae[8];
+    const b11 = be[0], b12 = be[3], b13 = be[6];
+    const b21 = be[1], b22 = be[4], b23 = be[7];
+    const b31 = be[2], b32 = be[5], b33 = be[8];
+    return this.set(
+      a11 * b11 + a12 * b21 + a13 * b31, a11 * b12 + a12 * b22 + a13 * b32, a11 * b13 + a12 * b23 + a13 * b33,
+      a21 * b11 + a22 * b21 + a23 * b31, a21 * b12 + a22 * b22 + a23 * b32, a21 * b13 + a22 * b23 + a23 * b33,
+      a31 * b11 + a32 * b21 + a33 * b31, a31 * b12 + a32 * b22 + a33 * b32, a31 * b13 + a32 * b23 + a33 * b33,
+    );
+  }
+  multiplyScalar(s: number): this {
+    for (let k = 0; k < 9; k++) this.elements[k] *= s;
+    return this;
+  }
+  determinant(): number {
+    const [a, b, c, d, e, f, g, h, i] = this.elements;
+    return a * e * i - a * f * h - b * d * i + b * f * g + c * d * h - c * e * g;
+  }
+  /** The inverse (all zeros for a singular matrix, as three.js). */
+  invert(): this {
+    const [n11, n21, n31, n12, n22, n32, n13, n23, n33] = this.elements;
+    const t11 = n33 * n22 - n32 * n23, t12 = n32 * n13 - n33 * n12, t13 = n23 * n12 - n22 * n13;
+    const det = n11 * t11 + n21 * t12 + n31 * t13;
+    if (det === 0) return this.set(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const d = 1 / det;
+    const te = this.elements;
+    te[0] = t11 * d;
+    te[1] = (n31 * n23 - n33 * n21) * d;
+    te[2] = (n32 * n21 - n31 * n22) * d;
+    te[3] = t12 * d;
+    te[4] = (n33 * n11 - n31 * n13) * d;
+    te[5] = (n31 * n12 - n32 * n11) * d;
+    te[6] = t13 * d;
+    te[7] = (n21 * n13 - n23 * n11) * d;
+    te[8] = (n22 * n11 - n21 * n12) * d;
+    return this;
+  }
+  /** Transpose in place, as three.js does. */
+  transpose(): this {
+    const m = this.elements;
+    let tmp: number;
+    tmp = m[1]; m[1] = m[3]; m[3] = tmp;
+    tmp = m[2]; m[2] = m[6]; m[6] = tmp;
+    tmp = m[5]; m[5] = m[7]; m[7] = tmp;
+    return this;
+  }
+  /** Inverse transpose of `m`'s upper 3x3: transforms normals under non-uniform scale. */
+  getNormalMatrix(m: Matrix4): this {
+    return this.setFromMatrix4(m).invert().transpose();
+  }
+  equals(m: Matrix3): boolean {
+    return this.elements.every((v, k) => v === m.elements[k]);
+  }
+  /** Column-major, as `elements`. */
+  fromArray(a: ArrayLike<number>, offset = 0): this {
+    for (let k = 0; k < 9; k++) this.elements[k] = a[k + offset];
+    return this;
+  }
+  toArray<T extends { [k: number]: number } = number[]>(a: T = [] as unknown as T, offset = 0): T {
+    for (let k = 0; k < 9; k++) a[k + offset] = this.elements[k];
     return a;
   }
 }
