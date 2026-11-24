@@ -78,6 +78,31 @@ test("bulk writes: brick() and fillBrick()", () => {
   assert.equal(g.layout().stats.voxels, 1);
 });
 
+test("voxel coordinates are integers -4096..4095 on every axis: no other voxel is written for one outside", () => {
+  const g = new VoxelGrid(0.1);
+  // `x >> 3` and `x & 7` of these are voxel (5, 0, 0) or (0, 0, 0)'s: refused, not written there.
+  for (const x of [2 ** 32 + 5, NaN, 0.5, -0.5, Infinity, 4096, -4097]) {
+    assert.throws(() => g.set(x, 0, 0, 9), /not integers/, `set(${x})`);
+    assert.throws(() => g.get(0, x, 0), /not integers/, `get(${x})`);
+  }
+  assert.throws(() => g.fill(0, 0, 0.5, 1, 1, 1.5, 9), /not integers/);
+  assert.equal(g.get(5, 0, 0), 0);
+  assert.equal(g.get(0, 0, 0), 0);
+  assert.equal(g.layout().stats.voxels, 0, "nothing written");
+  // The range is the brick key's, -512..511 bricks: as far below the origin as above it.
+  g.set(-4096, -4096, -4096, 3);
+  g.set(4095, 4095, 4095, 4);
+  assert.equal(g.get(-4096, -4096, -4096), 3);
+  assert.equal(g.get(4095, 4095, 4095), 4);
+  assert.deepEqual([...g.nonEmpty()].map(([x, y, z]) => [x, y, z]).sort((a, b) => a[0] - b[0]), [[-512, -512, -512], [511, 511, 511]]);
+  g.fillBrick(-512, 0, 0, 7);
+  assert.equal(g.get(-4089, 7, 7), 7);
+  assert.throws(() => g.fillBrick(512, 0, 0, 7), /brick/);
+  assert.throws(() => g.brick(0, 1.5, 0), /brick/);
+  assert.equal(VoxelGrid.inRange(-512, 511, 0), true);
+  assert.equal(VoxelGrid.inRange(-513, 0, 0), false);
+});
+
 /** An engine for the voxel bodies' tests: the binding's (a recording engine) and the voxel calls, answering the
  *  physics' queries from a table and recording every call. */
 async function voxelEngine() {
