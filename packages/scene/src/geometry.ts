@@ -779,21 +779,54 @@ export class LatheGeometry extends BufferGeometry {
   }
 }
 
-/** A capsule: a cylinder of `length` with hemispherical caps of `radius` (three.js CapsuleGeometry). */
-export class CapsuleGeometry extends LatheGeometry {
+/** A capsule: a cylinder of `height` with hemispherical caps of `radius` (three.js r187 CapsuleGeometry): rows from the
+ *  bottom pole up, `capSegments` per cap and `heightSegments` along the side, v by arc length. */
+export class CapsuleGeometry extends BufferGeometry {
   override type = "CapsuleGeometry";
-  constructor(radius = 1, length = 1, capSegments = 4, radialSegments = 8) {
-    const points: { x: number; y: number }[] = [];
-    for (let i = 0; i <= capSegments; i++) {
-      const a = -Math.PI / 2 + (i / capSegments) * (Math.PI / 2);
-      points.push({ x: radius * Math.cos(a), y: -length / 2 + radius * Math.sin(a) });
+  constructor(radius = 1, height = 1, capSegments = 4, radialSegments = 8, heightSegments = 1) {
+    super();
+    this.parameters = { radius, height, capSegments, radialSegments, heightSegments };
+    height = Math.max(0, height);
+    capSegments = Math.max(1, Math.floor(capSegments));
+    radialSegments = Math.max(3, Math.floor(radialSegments));
+    heightSegments = Math.max(1, Math.floor(heightSegments));
+    const b = new Builder();
+    const halfHeight = height / 2;
+    const capArc = (Math.PI / 2) * radius;
+    const totalArc = 2 * capArc + height;
+    const rows = capSegments * 2 + heightSegments;
+    const perRow = radialSegments + 1;
+    for (let iy = 0; iy <= rows; iy++) {
+      let arc: number, y: number, r: number, ny: number;
+      if (iy <= capSegments) {
+        const t = iy / capSegments, a = (t * Math.PI) / 2;
+        y = -halfHeight - radius * Math.cos(a); r = radius * Math.sin(a); ny = -radius * Math.cos(a); arc = t * capArc;
+      } else if (iy <= capSegments + heightSegments) {
+        const t = (iy - capSegments) / heightSegments;
+        y = -halfHeight + t * height; r = radius; ny = 0; arc = capArc + t * height;
+      } else {
+        const t = (iy - capSegments - heightSegments) / capSegments, a = (t * Math.PI) / 2;
+        y = halfHeight + radius * Math.sin(a); r = radius * Math.cos(a); ny = radius * Math.sin(a); arc = capArc + height + t * capArc;
+      }
+      const v = Math.max(0, Math.min(1, arc / totalArc));
+      const uOffset = iy === 0 ? 0.5 / radialSegments : iy === rows ? -0.5 / radialSegments : 0;
+      for (let ix = 0; ix <= radialSegments; ix++) {
+        const u = ix / radialSegments, theta = u * Math.PI * 2;
+        const x = -r * Math.cos(theta), z = r * Math.sin(theta);
+        b.p.push(x, y, z);
+        const l = Math.hypot(x, ny, z) || 1;
+        b.n.push(x / l, ny / l, z / l);
+        b.uv.push(u + uOffset, v);
+      }
+      if (iy > 0) {
+        const prev = (iy - 1) * perRow;
+        for (let ix = 0; ix < radialSegments; ix++) {
+          const i1 = prev + ix, i2 = prev + ix + 1, i3 = iy * perRow + ix, i4 = iy * perRow + ix + 1;
+          b.idx.push(i1, i2, i3, i2, i4, i3);
+        }
+      }
     }
-    for (let i = 0; i <= capSegments; i++) {
-      const a = (i / capSegments) * (Math.PI / 2);
-      points.push({ x: radius * Math.cos(a), y: length / 2 + radius * Math.sin(a) });
-    }
-    super(points, radialSegments);
-    this.parameters = { radius, length, capSegments, radialSegments };
+    b.finish(this);
   }
 }
 
