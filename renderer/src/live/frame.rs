@@ -411,7 +411,7 @@ impl LiveCore {
         }
         let tile_at = (((halton(self.frame % 64 + 1, 2) * 8.0) as u32).min(7), ((halton(self.frame % 64 + 1, 3) * 8.0) as u32).min(7));
         // Something moves (triangles re-transformed, instances' transforms): the kernel writes motion vectors.
-        let moving = !self.sc.dynamic.1.is_empty() || self.sc.moving_instances;
+        let moving = !self.sc.dynamic.1.is_empty() || self.sc.moving_instances || gpu::Gpu::particle_meshes(&self.sc.up);
         for k in 0..spp.max(1) {
             let mut p = self.sc.base;
             p.motion[1] = reconstruction.raw_signal() as u32 as f32;
@@ -599,7 +599,7 @@ impl LiveCore {
             let target = if lp.misc2[2] > 0.0 || lp.dof[0] > 0.0 { &self.targets.buf("sb").buffer } else { &self.targets.buf("fa").buffer };
             // Below full resolution the particles are drawn per traced pixel, then laid over the output (`translucent_up`).
             let low = (iw, ih) != (w, h);
-            let tp = gpu::TranslucentParams { size: [w, h, t.first, 1], view: [iw, ih, gpu::VOLUME_TRAIN_CAP, low as u32], misc: [VOLUME_TRAIN_SHARE, translucent_hidden(self.frame) as u32 as f32, 0.0, 0.0] };
+            let tp = gpu::TranslucentParams { size: [w, h, 0, 1], view: [iw, ih, gpu::VOLUME_TRAIN_CAP, low as u32], misc: [VOLUME_TRAIN_SHARE, translucent_hidden(self.frame) as u32 as f32, 0.0, 0.0] };
             g.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
             (pipes, g.translucent_bind_group(t, target, self.targets.translucent_low.as_ref().expect("made at the frame's start")), &t.count)
         });

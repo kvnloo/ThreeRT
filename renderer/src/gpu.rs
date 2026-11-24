@@ -554,8 +554,8 @@ pub struct ParticleGpu {
     max_count: u32,
     /// Not run yet: the first run's motion vectors are zero (no last frame).
     fresh: std::cell::Cell<bool>,
-    /// Some systems are opaque (in the scene's dynamic BLASes, rebuilt every frame).
-    opaque: bool,
+    /// The systems' own meshes (`scene::ParticleSystem::mesh`): each one's BLAS is built again after the pass.
+    meshes: Vec<u32>,
     /// Per system: its particle count, whether the translucency pass draws it, and its state when hidden or shown in
     /// place (`set_particles_hidden`): `Shown`; `Collapse` (this frame's pass collapses its quads), `Collapsed` (zero
     /// its count next frame), `Idle`; `Showing` (this frame's pass is its first: no motion vectors), `ShowRan` (clear
@@ -583,12 +583,10 @@ pub const VOLUME_TRAIN_CAP: u32 = 8192;
 /// particle pass writes (`vertices` from `first_vertex`, three a triangle), from triangle `first` in the kernel's
 /// tables; the translucency pass's parameters and volume training points (translucent.wgsl).
 pub struct Translucent {
-    blas: wgpu::Blas,
     pub tlas: wgpu::Tlas,
-    size: wgpu::BlasTriangleGeometrySizeDescriptor,
-    vertices: wgpu::Buffer,
-    first_vertex: u32,
-    pub first: u32,
+    /// The systems' meshes (`scene::ParticleSystem::mesh`), an instance of the TLAS each: their BLASes are built with
+    /// the other particle meshes' after the pass (`Gpu::build_particles`).
+    meshes: Vec<u32>,
     pub params: wgpu::Buffer,
     pub points: wgpu::Buffer,
     pub count: wgpu::Buffer,
@@ -610,17 +608,6 @@ impl Uploaded {
         for (k, at) in first.iter().enumerate().take(6) {
             p.word_first[k / 4][k % 4] = *at;
         }
-    }
-}
-
-impl Translucent {
-    /// Rebuilds the BLAS from the particle pass's vertices, and the TLAS.
-    fn build(&self, e: &mut wgpu::CommandEncoder) {
-        let entry = wgpu::BlasBuildEntry {
-            blas: &self.blas,
-            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry { size: &self.size, vertex_buffer: &self.vertices, first_vertex: self.first_vertex, vertex_stride: VERTEX_STRIDE, index_buffer: None, first_index: None, transform_buffer: None, transform_buffer_offset: None }]),
-        };
-        e.build_acceleration_structures([entry].iter(), [&self.tlas]);
     }
 }
 
@@ -904,6 +891,8 @@ pub struct GpuParticlesGpu {
     fresh: std::cell::Cell<bool>,
     grid_o: [f32; 4],
     grid_n: [u32; 4],
+    /// The systems' own meshes (as `ParticleGpu`'s).
+    meshes: Vec<u32>,
 }
 
 /// gpu_particles.wgsl with the scene's particle programs (`fn pe_` / `pu_<name>`) and their dispatch.
@@ -1898,7 +1887,7 @@ impl Kernel {
 
     pub fn new(scene: &Scene, groups: [usize; GROUPS]) -> Kernel {
         // (The translucency pass's functions: those of its particles' materials.)
-        let used: std::collections::BTreeSet<i32> = scene.trans_attrs.iter().filter_map(|a| scene.materials.get(a.uv[3].to_bits() as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
+        let used: std::collections::BTreeSet<i32> = scene.translucent_mats().iter().filter_map(|&m| scene.materials.get(m as usize)).map(|m| m.tex1[3] - 1).filter(|&f| f >= 0).collect();
         let functions = Kernel::material_functions(&scene.shaders, &used);
         let volume_functions = Kernel::volume_functions_of(&scene.volume_fns);
         let mut geometry_functions = String::new();
@@ -1943,6 +1932,8 @@ pub const A_LIVE: u32 = 31;
 
 // Kernel features (`override FEAT` in pathtrace.wgsl).
 pub const F_MASKED: u32 = 1;
+/// A particle system's mesh among the instances (`scene::INST_PARTICLES`): a hit on one has its particle's object.
+pub const F_PART: u32 = 1024;
 pub const F_FOG: u32 = 64;
 pub const F_VOLUME: u32 = 128;
 pub const F_TEX: u32 = 256;
@@ -2080,7 +2071,9 @@ pub fn instance_features(scene: &Scene) -> u32 {
     let iglass = if mixed_glass { F_IGLASS } else { 0 };
     let masked = any_row(crate::scene::ROW_CUTOUT);
     let deform = if scene.meshes.iter().any(|m| m.deforms) { F_DEFORM } else { 0 };
-    media | particles | ifunc | iglass | deform | F_INST | if masked { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
+    // (Hardware traversal's: the particle passes run with it alone, and software traversal has such a mesh flat.)
+    let part = if scene.units.is_none() && !(scene.particles.is_empty() && scene.gpu_particles.is_empty()) { F_PART } else { 0 };
+    media | particles | ifunc | iglass | deform | part | F_INST | if masked { F_MASKED } else { 0 } | if scene.units.is_some() { F_UNITS } else { 0 }
 }
 
 /// `features` from the parts parameter edits change (the materials; `environment`: `environment_features`), and the
@@ -2689,11 +2682,6 @@ impl Gpu {
         let st = wgpu::BufferUsages::STORAGE;
         // (COPY_SRC: the live view's in-place edits grow these past their room by a copy, live/edits.rs `edit_geometry`.)
         let edit = st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-        let dynamic_first: usize = groups[..4].iter().sum();
-        // A particle's triangle's first vertex: three vertices a triangle, from the first vertex that moves (a dynamic
-        // world-space triangle) or the first translucent one.
-        let (moving, translucent, trans_first) = (scene.indexed.dynamic.0, scene.indexed.translucent, scene.trans_first);
-        let vertex_of = move |tri: u32, trans: bool| if trans { translucent + (tri - trans_first) * 3 } else { moving + (tri - dynamic_first as u32) * 3 };
         // The vertices, with room for three a triangle of the edit room; and those that move, as they are (their
         // previous frame's).
         let ix = &scene.indexed;
@@ -2805,10 +2793,13 @@ impl Gpu {
             // INSTANCE_BIT | record; shadow casters mask 1).
             // Per mesh: its geometries, one a section (`InstMesh::parts`): first triangle, count.
             let mesh_parts: Vec<Vec<(u32, u32)>> = scene.meshes.iter().map(|m| m.parts(&scene.sections).into_iter().map(|(at, count)| (m.first + at, count)).collect()).collect();
+            // (A translucent particle system's is not flagged opaque: the translucency pass asks for every hit.)
+            let layered: std::collections::HashSet<usize> = scene.particles.iter().filter(|p| p.translucent).map(|p| p.mesh as usize).collect();
             let mesh_sizes: Vec<Vec<wgpu::BlasTriangleGeometrySizeDescriptor>> = mesh_parts
                 .iter()
                 .zip(&ix.meshes)
-                .map(|(parts, &(_, vertices))| {
+                .enumerate()
+                .map(|(mesh, (parts, &(_, vertices)))| {
                     parts
                         .iter()
                         .map(|&(_, count)| wgpu::BlasTriangleGeometrySizeDescriptor {
@@ -2816,7 +2807,7 @@ impl Gpu {
                             vertex_count: vertices.max(1),
                             index_format: Some(wgpu::IndexFormat::Uint32),
                             index_count: Some(count * 3),
-                            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                            flags: if layered.contains(&mesh) { wgpu::AccelerationStructureGeometryFlags::empty() } else { wgpu::AccelerationStructureGeometryFlags::OPAQUE },
                         })
                         .collect()
                 })
@@ -2974,24 +2965,23 @@ impl Gpu {
         let bg_parts = BindParts { nodes: b_nodes, leaves: b_leaves, tex_view, env_view, sampler, grid_view };
         let bg = self.scene_bind_group(&SceneBuffers { params: &b_params, vertices: &b_vertices, heap: &heap, words: &words, prev_vertices: &b_prev, accum: &b_accum, parts: &bg_parts, accel: accel.as_ref(), uniform: uniform.as_ref() });
         let kernel = Kernel { approx: self.approx, ..Kernel::new(scene, groups) };
-        // Translucent particles (hardware RT): their own BLAS + TLAS, rebuilt after the particle pass.
+        // Translucent particles (hardware RT): the translucency pass's own TLAS, built again after the particle pass:
+        // an instance of it a system's mesh, the instance's record in its custom data as in the scene's TLAS.
+        let layered: Vec<(u32, u32)> = scene.particles.iter().filter(|p| p.translucent).filter_map(|p| scene.instances.iter().position(|i| i.mesh == p.mesh).map(|r| (p.mesh, r as u32))).collect();
         let translucent = match &accel {
-            Some(_) if !scene.trans_tris.is_empty() => {
-                let n = scene.trans_tris.len() as u32;
-                let size = wgpu::BlasTriangleGeometrySizeDescriptor { vertex_format: wgpu::VertexFormat::Float32x3, vertex_count: n * 3, index_format: None, index_count: None, flags: wgpu::AccelerationStructureGeometryFlags::empty() };
-                let blas = d.create_blas(
-                    &wgpu::CreateBlasDescriptor { label: Some("translucent"), flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build },
-                    wgpu::BlasGeometrySizeDescriptors::Triangles { descriptors: vec![size.clone()] },
-                );
-                let mut tlas = d.create_tlas(&wgpu::CreateTlasDescriptor { label: Some("translucent"), max_instances: 1, flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build });
-                tlas[0] = Some(wgpu::TlasInstance::new(&blas, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0, 0xff));
+            Some(a) if !layered.is_empty() => {
+                let mut tlas = d.create_tlas(&wgpu::CreateTlasDescriptor { label: Some("translucent"), max_instances: layered.len() as u32, flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build });
+                for (k, &(mesh, record)) in layered.iter().enumerate() {
+                    tlas[k] = Some(wgpu::TlasInstance::new(&a.meshes[mesh as usize], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], INSTANCE_BIT | record, 0xff));
+                }
                 let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
                 let points = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume points"), size: VOLUME_TRAIN_CAP as u64 * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
                 let count = d.create_buffer(&wgpu::BufferDescriptor { label: Some("volume point count"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let t = Translucent { blas, tlas, size, vertices: b_vertices.clone(), first_vertex: ix.translucent, first: scene.trans_first, params, points, count };
-                // Built once now (collapsed quads): bind groups may use the TLAS before the first particle pass.
+                let t = Translucent { tlas, meshes: layered.iter().map(|l| l.0).collect(), params, points, count };
+                // Built once now (collapsed quads): bind groups may use the TLAS before the first particle pass. (The
+                // systems' meshes with their TLAS, in one build.)
                 let mut enc = d.create_command_encoder(&Default::default());
-                t.build(&mut enc);
+                enc.build_acceleration_structures(mesh_entries(a, &t.meshes).iter(), [&t.tlas]);
                 self.queue.submit([enc.finish()]);
                 Some(t)
             }
@@ -3018,7 +3008,8 @@ impl Gpu {
                         let mut p = [0.0f32; 32];
                         p.copy_from_slice(&ps.params);
                         // (A system hidden at build runs nothing: its quads stay collapsed at the node.)
-                        ParticleSystemGpu { a: [vertex_of(ps.final_first, ps.translucent), if ps.hidden { 0 } else { ps.count }, ps.object, ps.func], b: [ps.seed, ix.dynamic.0, ps.translucent as u32, 0], c: [o[0], o[1], o[2], 0.0], p, d: ps.custom }
+                        // (Its mesh's first vertex: four a particle.)
+                        ParticleSystemGpu { a: [ix.meshes[ps.mesh as usize].0, if ps.hidden { 0 } else { ps.count }, ps.object, ps.func], b: [ps.seed, ix.meshes[ps.mesh as usize].0 - ix.dynamic.0, 0, 0], c: [o[0], o[1], o[2], 0.0], p, d: ps.custom }
                     })
                     .collect();
                 // COPY_DST: pivot updates (`set_particle_pivot`).
@@ -3028,11 +3019,11 @@ impl Gpu {
                 let written = ParticleTargets { vertices: &b_vertices, prev_vertices: &b_prev, heap: &heap };
                 let pbg = particle_bind_group(d, &pipeline, "particles", &[(0, &params), (1, &b_sys), (7, &last)], &written);
                 let nodes = scene.particles.iter().map(|p| p.seed).collect();
-                let opaque = scene.particles.iter().any(|p| !p.translucent);
+                let meshes = scene.particles.iter().map(|p| p.mesh).collect();
                 let counts = scene.particles.iter().map(|p| p.count).collect();
                 let translucent_sys = scene.particles.iter().map(|p| p.translucent).collect();
                 let hidden = std::cell::RefCell::new(scene.particles.iter().map(|p| if p.hidden { Hidden::Idle } else { Hidden::Shown }).collect());
-                Some(ParticleGpu { pipeline, stamp, bg: pbg, params, table: b_sys, last, nodes, systems: systems.len() as u32, max_count: scene.particles.iter().map(|p| p.count).max().unwrap_or(0), fresh: std::cell::Cell::new(true), opaque, counts, translucent: translucent_sys, hidden })
+                Some(ParticleGpu { pipeline, stamp, bg: pbg, params, table: b_sys, last, nodes, systems: systems.len() as u32, max_count: scene.particles.iter().map(|p| p.count).max().unwrap_or(0), fresh: std::cell::Cell::new(true), meshes, counts, translucent: translucent_sys, hidden })
             }
             _ => None,
         };
@@ -3048,7 +3039,7 @@ impl Gpu {
                     .map(|ps| {
                         let c = &ps.collide;
                         let flags = u32::from(c.plane.is_some()) | if c.voxels { 2 } else { 0 };
-                        GpuParticleSystemGpu { a: [vertex_of(ps.final_first, false), ps.capacity, ps.object, ps.program], b: [ps.seed, ix.dynamic.0, 0, 0], c: [ps.pivot[0], ps.pivot[1], ps.pivot[2], flags as f32], d: [c.plane.unwrap_or(0.0), c.restitution, c.friction, 0.0], e: [0; 4], p: ps.params }
+                        GpuParticleSystemGpu { a: [ix.meshes[ps.mesh as usize].0, ps.capacity, ps.object, ps.program], b: [ps.seed, ix.meshes[ps.mesh as usize].0 - ix.dynamic.0, 0, 0], c: [ps.pivot[0], ps.pivot[1], ps.pivot[2], flags as f32], d: [c.plane.unwrap_or(0.0), c.restitution, c.friction, 0.0], e: [0; 4], p: ps.params }
                     })
                     .collect();
                 let table = buf("gpu particle systems", bytemuck::cast_slice(&systems), edit);
@@ -3071,7 +3062,7 @@ impl Gpu {
                 let sm = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("stamp"), source: wgpu::ShaderSource::Wgsl(STAMP_WGSL.into()) });
                 let sp = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("stamp"), layout: None, module: &sm, entry_point: Some("stamp"), compilation_options: Default::default(), cache: self.cache() });
                 let sbg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("stamp"), layout: &sp.get_bind_group_layout(0), entries: &[e(0, &b_vertices), wgpu::BindGroupEntry { binding: 1, resource: a.tlas.as_binding() }] });
-                Some(GpuParticlesGpu { pipeline, stamp: (sp, sbg), bg, params, table, last, state, spawns, grid, systems: std::cell::RefCell::new(systems), host: std::cell::RefCell::new(host), nodes: scene.gpu_particles.iter().map(|p| p.node).collect(), max_cap: scene.gpu_particles.iter().map(|p| p.capacity).max().unwrap_or(0), frame: std::cell::Cell::new(0), fresh: std::cell::Cell::new(true), grid_o, grid_n })
+                Some(GpuParticlesGpu { pipeline, stamp: (sp, sbg), bg, params, table, last, state, spawns, grid, systems: std::cell::RefCell::new(systems), host: std::cell::RefCell::new(host), nodes: scene.gpu_particles.iter().map(|p| p.node).collect(), max_cap: scene.gpu_particles.iter().map(|p| p.capacity).max().unwrap_or(0), frame: std::cell::Cell::new(0), fresh: std::cell::Cell::new(true), grid_o, grid_n, meshes: scene.gpu_particles.iter().map(|p| p.mesh).collect() })
             }
             _ => None,
         };
@@ -3250,9 +3241,9 @@ impl Gpu {
                 }
             }
             if hidden.iter().all(|h| *h == Hidden::Idle) {
-                // (The stateful GPU particles leave the dynamic BLAS rebuild to this pass when there are stateless ones.)
+                // (The stateful GPU particles leave what they placed to this pass when there are stateless ones.)
                 if up.gpu_particles.is_some() {
-                    self.rebuild_dynamic(accel, e);
+                    self.build_particles(up, accel, false, e);
                 }
                 return;
             }
@@ -3276,12 +3267,8 @@ impl Gpu {
         if let Some((q, i)) = blas_ts {
             stamp(e, wgpu::ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(i) });
         }
-        if p.opaque {
-            self.rebuild_dynamic(accel, e);
-        }
-        if let Some(t) = &up.translucent {
-            t.build(e);
-        }
+        // (The stateful particles leave what they placed to this pass.)
+        self.build_particles(up, accel, true, e);
         if let Some((q, i)) = blas_ts {
             stamp(e, wgpu::ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(i + 1), end_of_pass_write_index: None });
         }
@@ -3380,10 +3367,23 @@ impl Gpu {
             if let Some((q, i)) = blas_ts {
                 stamp(e, wgpu::ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(i) });
             }
-            self.rebuild_dynamic(accel, e);
+            self.build_particles(up, accel, false, e);
             if let Some((q, i)) = blas_ts {
                 stamp(e, wgpu::ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(i + 1), end_of_pass_write_index: None });
             }
+        }
+    }
+
+    /// What the particle passes placed, above the triangles, in a frame's encoder: the BLASes of the systems' meshes
+    /// and the TLAS (the translucency pass's too). `stateless`: the stateless systems' too (not when every one of
+    /// them is idle).
+    fn build_particles(&self, up: &Uploaded, accel: &Accel, stateless: bool, e: &mut wgpu::CommandEncoder) {
+        let own = up.particles.as_ref().filter(|_| stateless);
+        let meshes: Vec<u32> = own.iter().flat_map(|p| &p.meshes).chain(up.gpu_particles.iter().flat_map(|p| &p.meshes)).copied().collect();
+        // (The translucent systems' meshes are among the stateless ones': their own TLAS with the scene's.)
+        let layered = up.translucent.as_ref().filter(|_| stateless).map(|t| &t.tlas);
+        if !meshes.is_empty() {
+            e.build_acceleration_structures(mesh_entries(accel, &meshes).iter(), std::iter::once(&accel.tlas).chain(layered));
         }
     }
 
@@ -3539,6 +3539,11 @@ impl Gpu {
             }
         }
         found
+    }
+
+    /// Whether a particle system's mesh is among the instances (they move every frame: motion vectors).
+    pub fn particle_meshes(up: &Uploaded) -> bool {
+        up.particles.is_some() || up.gpu_particles.is_some()
     }
 
     /// Whether the translucency pass has anything to draw: a translucent system shown (or collapsing).
@@ -3923,9 +3928,6 @@ impl Gpu {
         if let Some(a) = &mut up.accel {
             (a.vertices, a.indices, a.index_first) = (up.vertices.clone(), up.words.buffer.clone(), (up.words.at(Stream::Indices) / 4) as u32);
         }
-        if let Some(t) = &mut up.translucent {
-            t.vertices = up.vertices.clone();
-        }
         up.bg = self.scene_bind_group(&SceneBuffers { params: &up.params, vertices: &up.vertices, heap: &up.heap, words: &up.words, prev_vertices: &up.prev_vertices, accum: &up.accum, parts: &up.bg_parts, accel: up.accel.as_ref(), uniform: up.uniform.as_ref() });
         if up.accel.is_none() {
             return;
@@ -4128,12 +4130,6 @@ impl Gpu {
         }
     }
 
-    /// The dynamic groups' BLASes and the TLAS, in a frame's encoder (the particle passes: their triangles are placed
-    /// by the GPU every frame).
-    pub fn rebuild_dynamic(&self, accel: &Accel, e: &mut wgpu::CommandEncoder) {
-        e.build_acceleration_structures(dynamic_entries(accel).iter(), [&accel.tlas]);
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     /// Offline translucency: the pass (translucent.wgsl) `spp` times at random points in each pixel, each with a fresh
     /// lighting estimate per hit; the mean (colour, transmittance) per pixel. Empty without translucent particles.
@@ -4145,7 +4141,7 @@ impl Gpu {
         let sums = d.create_buffer(&wgpu::BufferDescriptor { label: Some("translucent sums"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         // (Drawn at full resolution: the reduced image's buffer is bound and not read.)
         let tbg = self.translucent_bind_group(t, &sums, &self.translucent_low(1, 1));
-        let tp = TranslucentParams { size: [w, h, t.first, 0], view: [w, h, 0, 0], misc: [0.0; 4] };
+        let tp = TranslucentParams { size: [w, h, 0, 0], view: [w, h, 0, 0], misc: [0.0; 4] };
         self.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
         let n = spp.max(1);
         for s in 0..n {
@@ -4210,8 +4206,9 @@ impl Gpu {
             }
             if up.particles.is_some() {
                 let mut e = d.create_command_encoder(&Default::default());
+                // (What the stateful systems placed: the stateless pass above built before they ran.)
                 if let Some(a) = &up.accel {
-                    self.rebuild_dynamic(a, &mut e);
+                    self.build_particles(&up, a, false, &mut e);
                 }
                 self.queue.submit([e.finish()]);
             }
@@ -4356,7 +4353,7 @@ mod tests {
             ("F_GLASS", F_GLASS), ("F_COAT", F_COAT), ("F_HUGE", F_HUGE), ("F_INST", F_INST), ("F_MEDIA", F_MEDIA), ("F_PEMIT", F_PEMIT),
             ("F_HMEDIA", F_HMEDIA), ("F_PROC", F_PROC), ("F_TINT", F_TINT), ("F_UNLIT", F_UNLIT), ("F_BACKGROUND", F_BACKGROUND),
             ("F_VCOLOR", F_VCOLOR), ("F_AERIAL", F_AERIAL), ("F_GRID", F_GRID), ("F_LISTS", F_LISTS), ("F_IFUNC", F_IFUNC), ("F_IGLASS", F_IGLASS),
-            ("F_DEFORM", F_DEFORM),
+            ("F_DEFORM", F_DEFORM), ("F_PART", F_PART),
         ];
         let mut seen = 0u32;
         for (name, bit) in all {
