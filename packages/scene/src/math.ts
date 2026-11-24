@@ -47,6 +47,102 @@ export class Vector3 {
   multiplyScalar(s: number): this {
     return this.set(this.x * s, this.y * s, this.z * s);
   }
+  // Component-wise arithmetic, as three.js r187 has it. Each goes through set(), so a tracked position reports one change.
+  setX(x: number): this {
+    return this.set(x, this.y, this.z);
+  }
+  setY(y: number): this {
+    return this.set(this.x, y, this.z);
+  }
+  setZ(z: number): this {
+    return this.set(this.x, this.y, z);
+  }
+  getComponent(index: number): number {
+    if (index === 0) return this.x;
+    if (index === 1) return this.y;
+    if (index === 2) return this.z;
+    throw new RangeError(`index is out of range: ${index}`);
+  }
+  addScalar(s: number): this {
+    return this.set(this.x + s, this.y + s, this.z + s);
+  }
+  addVectors(a: Vector3, b: Vector3): this {
+    return this.set(a.x + b.x, a.y + b.y, a.z + b.z);
+  }
+  subScalar(s: number): this {
+    return this.set(this.x - s, this.y - s, this.z - s);
+  }
+  multiply(v: Vector3): this {
+    return this.set(this.x * v.x, this.y * v.y, this.z * v.z);
+  }
+  multiplyVectors(a: Vector3, b: Vector3): this {
+    return this.set(a.x * b.x, a.y * b.y, a.z * b.z);
+  }
+  divide(v: Vector3): this {
+    return this.set(this.x / v.x, this.y / v.y, this.z / v.z);
+  }
+  divideScalar(s: number): this {
+    return this.multiplyScalar(1 / s);
+  }
+  min(v: Vector3): this {
+    return this.set(Math.min(this.x, v.x), Math.min(this.y, v.y), Math.min(this.z, v.z));
+  }
+  max(v: Vector3): this {
+    return this.set(Math.max(this.x, v.x), Math.max(this.y, v.y), Math.max(this.z, v.z));
+  }
+  /** Assumes min <= max component-wise, as three.js does. */
+  clamp(min: Vector3, max: Vector3): this {
+    return this.set(
+      Math.max(min.x, Math.min(max.x, this.x)),
+      Math.max(min.y, Math.min(max.y, this.y)),
+      Math.max(min.z, Math.min(max.z, this.z)),
+    );
+  }
+  clampScalar(minVal: number, maxVal: number): this {
+    return this.set(
+      Math.max(minVal, Math.min(maxVal, this.x)),
+      Math.max(minVal, Math.min(maxVal, this.y)),
+      Math.max(minVal, Math.min(maxVal, this.z)),
+    );
+  }
+  clampLength(min: number, max: number): this {
+    const l = this.length();
+    return this.divideScalar(l || 1).multiplyScalar(Math.max(min, Math.min(max, l)));
+  }
+  floor(): this {
+    return this.set(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z));
+  }
+  ceil(): this {
+    return this.set(Math.ceil(this.x), Math.ceil(this.y), Math.ceil(this.z));
+  }
+  round(): this {
+    return this.set(Math.round(this.x), Math.round(this.y), Math.round(this.z));
+  }
+  roundToZero(): this {
+    return this.set(Math.trunc(this.x), Math.trunc(this.y), Math.trunc(this.z));
+  }
+  negate(): this {
+    return this.set(-this.x, -this.y, -this.z);
+  }
+  manhattanLength(): number {
+    return Math.abs(this.x) + Math.abs(this.y) + Math.abs(this.z);
+  }
+  setLength(length: number): this {
+    return this.normalize().multiplyScalar(length);
+  }
+  lerpVectors(v1: Vector3, v2: Vector3, alpha: number): this {
+    return this.set(v1.x + (v2.x - v1.x) * alpha, v1.y + (v2.y - v1.y) * alpha, v1.z + (v2.z - v1.z) * alpha);
+  }
+  distanceToSquared(v: Vector3): number {
+    const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z;
+    return dx * dx + dy * dy + dz * dz;
+  }
+  manhattanDistanceTo(v: Vector3): number {
+    return Math.abs(this.x - v.x) + Math.abs(this.y - v.y) + Math.abs(this.z - v.z);
+  }
+  equals(v: Vector3): boolean {
+    return v.x === this.x && v.y === this.y && v.z === this.z;
+  }
   dot(v: Vector3): number {
     return this.x * v.x + this.y * v.y + this.z * v.z;
   }
