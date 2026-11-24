@@ -706,7 +706,11 @@ export class Object3D {
       (this as unknown as Record<string, unknown>)[k] = v instanceof Color || v instanceof Vector3 || v instanceof Vector2 ? v.clone() : v;
     }
     this.position.copy(source.position);
-    this.quaternion.copy(source.quaternion);
+    // The rotation in the source's order and angles (three.js copies the order), then its quaternion exactly; the
+    // quaternion quietly, as the two already agree.
+    const r = source.rotation, q = source.quaternion;
+    this.rotation.set(r.x, r.y, r.z, r.order);
+    this.quaternion.set(q.x, q.y, q.z, q.w, false);
     this.scale.copy(source.scale);
     this.up.copy(source.up);
     this.matrix.copy(source.matrix);
