@@ -38,7 +38,7 @@ test("EventDispatcher: a listener removed during dispatch does not stop the othe
 });
 
 test("EventDispatcher: Object3D and materials are dispatchers, with this bound; mixin onto a prototype works", () => {
-  const o = new THREE.Mesh();
+  const o = new THREE.Group();
   assert.ok(o instanceof THREE.EventDispatcher);
   let self: unknown;
   o.addEventListener("hit", function (this: unknown) { self = this; });
