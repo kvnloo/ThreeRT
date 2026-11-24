@@ -169,23 +169,51 @@ export function ssimMap(a: Float64Array, b: Float64Array, w: number, h: number):
   return map;
 }
 
-/** Bilinear resize of `img` to w x h (the reference's size), for a test rendered at another resolution. */
+/** Per output pixel along one axis: the first input pixel and the normalised Lanczos 3 weights, as the image crate's
+ *  `vertical_sample` / `horizontal_sample` (image 0.25) compute them, in f32. */
+function lanczosTaps(size: number, newSize: number): { left: number; ws: Float32Array }[] {
+  const f = Math.fround;
+  const sinc = (t: number) => (t === 0 ? 1 : f(f(Math.sin(f(t * f(Math.PI)))) / f(t * f(Math.PI))));
+  const kernel = (x: number) => (Math.abs(x) < 3 ? f(sinc(x) * sinc(f(x / 3))) : 0);
+  const ratio = f(size / newSize), sratio = ratio < 1 ? 1 : ratio, support = f(3 * sratio);
+  const taps: { left: number; ws: Float32Array }[] = [];
+  for (let o = 0; o < newSize; o++) {
+    const input = f(f(o + 0.5) * ratio);
+    const left = Math.min(Math.max(Math.floor(f(input - support)), 0), size - 1);
+    const right = Math.min(Math.max(Math.ceil(f(input + support)), left + 1), size);
+    const centre = f(input - 0.5);
+    const ws = new Float32Array(right - left);
+    let sum = 0;
+    for (let i = left; i < right; i++) sum = f(sum + (ws[i - left] = kernel(f(f(i - centre) / sratio))));
+    for (let k = 0; k < ws.length; k++) ws[k] = f(ws[k] / sum);
+    taps.push({ left, ws });
+  }
+  return taps;
+}
+
+/** Lanczos 3 resize of `img` to w x h (the reference's size), for a test rendered at another resolution: the renderer's
+ *  `compare` resize (`image::imageops::resize`, FilterType::Lanczos3), so a test at another size reads the same there
+ *  and here. Vertical pass first into f32, then horizontal, clamped and rounded to 8 bits. */
 export function resize(img: Rgb8, w: number, h: number): Rgb8 {
   if (img.width === w && img.height === h) return img;
-  const out = new Uint8Array(w * h * 3);
-  for (let y = 0; y < h; y++) {
-    const sy = Math.min(Math.max(((y + 0.5) * img.height) / h - 0.5, 0), img.height - 1);
-    const y0 = Math.floor(sy), y1 = Math.min(y0 + 1, img.height - 1), fy = sy - y0;
-    for (let x = 0; x < w; x++) {
-      const sx = Math.min(Math.max(((x + 0.5) * img.width) / w - 0.5, 0), img.width - 1);
-      const x0 = Math.floor(sx), x1 = Math.min(x0 + 1, img.width - 1), fx = sx - x0;
+  const f = Math.fround;
+  const W = img.width, H = img.height;
+  const tmp = new Float32Array(W * h * 3);
+  for (const [y, { left, ws }] of lanczosTaps(H, h).entries())
+    for (let x = 0; x < W; x++)
       for (let c = 0; c < 3; c++) {
-        const p = (yy: number, xx: number) => img.data[(yy * img.width + xx) * 3 + c];
-        const v = (p(y0, x0) * (1 - fx) + p(y0, x1) * fx) * (1 - fy) + (p(y1, x0) * (1 - fx) + p(y1, x1) * fx) * fy;
-        out[(y * w + x) * 3 + c] = Math.round(v);
+        let t = 0;
+        for (let k = 0; k < ws.length; k++) t = f(t + f(img.data[((left + k) * W + x) * 3 + c] * ws[k]));
+        tmp[(y * W + x) * 3 + c] = t;
       }
-    }
-  }
+  const out = new Uint8Array(w * h * 3);
+  for (const [x, { left, ws }] of lanczosTaps(W, w).entries())
+    for (let y = 0; y < h; y++)
+      for (let c = 0; c < 3; c++) {
+        let t = 0;
+        for (let k = 0; k < ws.length; k++) t = f(t + f(tmp[(y * W + left + k) * 3 + c] * ws[k]));
+        out[(y * w + x) * 3 + c] = Math.round(Math.min(Math.max(t, 0), 255));
+      }
   return { width: w, height: h, data: out };
 }
 

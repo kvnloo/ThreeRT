@@ -148,6 +148,36 @@ test("a test at another resolution is resized to the reference's; region bounds 
   assert.throws(() => parseRegion("x=0.5,0,0.2,1"));
 });
 
+// A gradient with a little noise, deterministic: the pair below has an answer from the renderer's `compare`.
+const gradient = (w: number, h: number, seed: number): Rgb8 => {
+  let s = seed;
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++)
+      for (let c = 0; c < 3; c++) {
+        s = (s * 1103515245 + 12345) >>> 0;
+        const base = c === 0 ? (x * 255) / (w - 1) : c === 1 ? (y * 255) / (h - 1) : 128;
+        data[(y * w + x) * 3 + c] = Math.max(0, Math.min(255, Math.round(base + ((s >>> 24) - 128) / 8)));
+      }
+  return { width: w, height: h, data };
+};
+
+test("ΔE76, p95, SSIM and luminance are the renderer's `compare` numbers on the same pair", () => {
+  // `threert-render compare a.png b.png` on these two images (renderer/src/compare.rs): mean_delta_e 9.96,
+  // p95_delta_e 19.74, ssim 0.8795, luminance_ratio 1.003.
+  const { result } = measure(gradient(24, 16, 1), gradient(24, 16, 2));
+  assert.equal(Math.round(result.overall.de76 * 100) / 100, 9.96);
+  assert.equal(result.overall.de76_p95, 19.74);
+  assert.equal(result.overall.ssim, 0.8795);
+  assert.equal(result.overall.luminance_ratio, 1.003);
+});
+
+test("a test at another size is resized as the renderer's `compare` resizes it (Lanczos 3, the image crate's)", () => {
+  // image::imageops::resize(&img, 4, 3, FilterType::Lanczos3) of gradient(6, 4, 3), as compare.rs resizes a test.
+  const want = [20, 18, 120, 87, 17, 121, 165, 16, 133, 235, 14, 128, 18, 130, 128, 81, 135, 134, 162, 129, 122, 237, 132, 122, 10, 237, 141, 90, 244, 127, 166, 242, 115, 237, 235, 130];
+  assert.deepEqual(Array.from(resize(gradient(6, 4, 3), 4, 3).data), want);
+});
+
 test("the command line: one pair and a manifest, JSON and PNGs written, the bar's exit code", async () => {
   const dir = mkdtempSync(join(tmpdir(), "delta-e-"));
   try {

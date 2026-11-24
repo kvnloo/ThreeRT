@@ -127,8 +127,10 @@ node tools/compare/delta-e.ts --manifest poses.json --bar step2   # fixed poses 
 
 - **Numbers**, overall and per region (a 3 × 3 grid by default, `--grid`, plus named `--region`s): mean / p95 / p99
   CIEDE2000, mean / p95 ΔE76, SSIM, the luminance ratio and the share of pixels over ΔE2000 5. ΔE76 and SSIM are the
-  renderer's `compare` (same Lab, same 11 × 11 Gaussian SSIM on luma), so they stay comparable with the tables above;
-  CIEDE2000 is checked against Sharma, Wu and Dalal's 34 published pairs.
+  renderer's `compare` (same Lab, same 11 × 11 Gaussian SSIM on luma, a test at another size resized as it resizes
+  one, Lanczos 3), so they stay comparable with the tables above; CIEDE2000 is checked against Sharma, Wu and Dalal's
+  34 published pairs. A region's SSIM is the whole image's SSIM map averaged over the region, where `compare --region`
+  crops first and clamps its windows at the crop's edge: the two differ in the third decimal.
 - **Files** in `--out` (default `out/delta-e`): `<name>.json`, `<name>-heat.png` (ΔE2000, white at `--scale`, default
   10; region outlines, the worst in magenta) and `<name>-sheet.png` (reference | test | heat). A manifest adds
   `summary.json`: mean and worst over the poses.
