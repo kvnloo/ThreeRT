@@ -4,6 +4,7 @@
 import { Color, type ColorLike, Euler, Matrix4, Quaternion, Vector2, Vector3 } from "./math.ts";
 import { type BufferGeometry, StaticDrawUsage } from "./geometry.ts";
 import type { ExposureDesc, Vec3 } from "./engine.ts";
+import type { Intersection, Raycaster } from "./raycaster.ts";
 
 // ---------------------------------------------------------------------------------------------
 // Change tracking: engine bindings (SceneBinding) sync only what changed
@@ -662,6 +663,13 @@ export class Object3D {
   }
 
   /** World matrix from the local transform (three.js): optionally the ancestors' first, the descendants' after. */
+  /**
+   * The object's own hits of `raycaster`'s ray, added to `intersects` (three.js: the Raycaster asks each object it
+   * visits). None here; meshes have theirs. Replace it to change what an object answers (`() => {}`: never hit);
+   * returning false keeps the Raycaster from its children.
+   */
+  raycast(_raycaster: Raycaster, _intersects: Intersection[]): boolean | void {}
+
   updateWorldMatrix(updateParents: boolean, updateChildren: boolean): void {
     if (updateParents && this.parent) this.parent.updateWorldMatrix(true, false);
     if (this.matrixAutoUpdate) this.updateMatrix();
@@ -1337,6 +1345,10 @@ export class MeshDepthMaterial extends MeshStandardMaterial {
 export class Mesh extends Object3D {
   readonly isMesh = true;
   override type = "Mesh";
+  /** Its hits of `raycaster`'s ray, added to `intersects` (three.js). */
+  override raycast(raycaster: Raycaster, intersects: Intersection[]): void {
+    raycaster._raycastOwn(this, intersects);
+  }
   declare private _geometry: BufferGeometry;
   declare private _material: MeshStandardMaterial | MeshStandardMaterial[];
   declare private _dynamicGeometry: boolean;
@@ -1789,6 +1801,10 @@ export class ProceduralGeometry {
  */
 export class ProceduralMesh extends Object3D {
   override type = "ProceduralMesh";
+  /** Its hits of `raycaster`'s ray, added to `intersects` (three.js). */
+  override raycast(raycaster: Raycaster, intersects: Intersection[]): void {
+    raycaster._raycastOwn(this, intersects);
+  }
   declare private _geometry: ProceduralGeometry;
   declare private _materials: MeshStandardMaterial[];
   constructor(geometry: ProceduralGeometry, materials: MeshStandardMaterial | MeshStandardMaterial[] = new MeshStandardMaterial()) {
@@ -1858,6 +1874,10 @@ export class InstancedBufferAttribute {
  */
 export class InstancedMesh extends Object3D {
   override type = "InstancedMesh";
+  /** Its hits of `raycaster`'s ray, added to `intersects` (three.js). */
+  override raycast(raycaster: Raycaster, intersects: Intersection[]): void {
+    raycaster._raycastOwn(this, intersects);
+  }
   readonly isMesh = true;
   readonly isInstancedMesh = true;
   readonly instanceMatrix: InstancedBufferAttribute;
