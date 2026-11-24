@@ -248,7 +248,7 @@ export function bindBody(o: Object3D, b: BoundBody): void {
       if (b.epoch !== physicsEpoch) pullPose(b, p, q);
       if (b.euler) {
         b.euler = false;
-        r.setFromQuaternion(q, false);
+        r.setFromQuaternion(q, undefined, false);
       }
       return r;
     },
@@ -333,10 +333,49 @@ export interface SwayDesc {
   phase?: number;
 }
 
+/**
+ * three.js's layers: which of 32 layers an object is on (a bit mask; layer 0 alone to begin with). `Raycaster.layers`
+ * picks by them; the renderer draws every object whatever its layers (a camera's layers select nothing yet).
+ */
+export class Layers {
+  mask = 1 | 0;
+  /** On `layer` alone. */
+  set(layer: number): void {
+    this.mask = ((1 << layer) | 0) >>> 0;
+  }
+  enable(layer: number): void {
+    this.mask |= (1 << layer) | 0;
+  }
+  enableAll(): void {
+    this.mask = 0xffffffff | 0;
+  }
+  toggle(layer: number): void {
+    this.mask ^= (1 << layer) | 0;
+  }
+  disable(layer: number): void {
+    this.mask &= ~((1 << layer) | 0);
+  }
+  disableAll(): void {
+    this.mask = 0;
+  }
+  /** Whether the two share a layer. */
+  test(layers: Layers): boolean {
+    return (this.mask & layers.mask) !== 0;
+  }
+  isEnabled(layer: number): boolean {
+    return (this.mask & ((1 << layer) | 0)) !== 0;
+  }
+}
+
+/** @internal Whether `o` is on one of `layers`, without making its `Layers` (most objects never have one). */
+export function onLayers(o: Object3D, layers: Layers): boolean {
+  return (((o as unknown as { _layers?: Layers })._layers?.mask ?? 1) & layers.mask) !== 0;
+}
+
 let objectIds = 0;
 
 /** What `Object3D.copy` does not take over as it is (transforms are copied by value, children cloned). */
-const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners", "_ref", "_up", "_matrix", "_matrixWorld", "_userData", "_tags", "_custom", "_children"]);
+const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners", "_ref", "_up", "_matrix", "_matrixWorld", "_userData", "_tags", "_custom", "_children", "_layers"]);
 const NO_CHILDREN = Object.freeze([]) as unknown as Object3D[];
 const NO_CUSTOM: readonly [number, number, number, number] = Object.freeze([0, 0, 0, 0] as [number, number, number, number]);
 /** An object's rotation changed: its quaternion follows (the object through the rotation's weak owner). */
@@ -350,7 +389,7 @@ function rotationChanged(this: Euler): void {
 function quaternionChanged(this: Quaternion): void {
   const o = this._owner?.deref() as Object3D | undefined;
   if (!o) return;
-  o.rotation.setFromQuaternion(this, false);
+  o.rotation.setFromQuaternion(this, undefined, false);
   touched(o);
 }
 
@@ -390,6 +429,14 @@ export class Object3D {
   private _movable = false;
   receiveShadow = true;
   declare private _tags: string[] | undefined;
+  declare private _layers: Layers | undefined;
+  /** The layers the object is on (`Layers`), made when first asked for. */
+  get layers(): Layers {
+    return (this._layers ??= new Layers());
+  }
+  set layers(v: Layers) {
+    this._layers = v;
+  }
   declare private _userData: Record<string, unknown> | undefined;
   get tags(): string[] {
     return (this._tags ??= []);
@@ -405,8 +452,9 @@ export class Object3D {
   }
   /**
    * The local transform as a matrix (three.js): `updateMatrix()` composes it from position / quaternion / scale, which
-   * `updateWorldMatrix` does first while `matrixAutoUpdate` is on. The engine is always sent position / rotation /
-   * scale, so a matrix set by hand moves only what reads it (`matrixWorld`, `setMatrixAt(i, o.matrix)`).
+   * `updateWorldMatrix` does first while `matrixAutoUpdate` is on. Normally the engine is sent local position /
+   * rotation / scale. With `matrixWorldAutoUpdate = false`, the binding instead derives a local transform from the
+   * authored world matrix for the renderer. Editing `matrix` alone still affects only readers of that matrix.
    */
   get matrix(): Matrix4 {
     return (this._matrix ??= new Matrix4());
@@ -418,6 +466,18 @@ export class Object3D {
     return (this._matrixWorld ??= new Matrix4());
   }
   declare private _matrixWorld: Matrix4 | undefined;
+  /** Set (only) while `matrixWorldAutoUpdate` is false: an object that leaves it on carries no field for it. */
+  declare private _matrixWorldManual: true | undefined;
+  /** Set false to retain and render a manually supplied matrixWorld, as in three.js. */
+  get matrixWorldAutoUpdate(): boolean {
+    return !this._matrixWorldManual;
+  }
+  set matrixWorldAutoUpdate(value: boolean) {
+    if (value === this.matrixWorldAutoUpdate) return;
+    if (value) delete this._matrixWorldManual;
+    else this._matrixWorldManual = true;
+    touched(this);
+  }
 
   /**
    * The stable id set by scene code (picking, gameplay events, the editor; the binding names the object by it); until
@@ -652,8 +712,10 @@ export class Object3D {
   updateWorldMatrix(updateParents: boolean, updateChildren: boolean): void {
     if (updateParents && this.parent) this.parent.updateWorldMatrix(true, false);
     if (this.matrixAutoUpdate) this.updateMatrix();
-    if (this.parent) this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
-    else this.matrixWorld.copy(this.matrix);
+    if (this.matrixWorldAutoUpdate) {
+      if (this.parent) this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
+      else this.matrixWorld.copy(this.matrix);
+    }
     if (updateChildren) for (const c of this.children) c.updateWorldMatrix(false, true);
   }
 
@@ -706,13 +768,19 @@ export class Object3D {
       (this as unknown as Record<string, unknown>)[k] = v instanceof Color || v instanceof Vector3 || v instanceof Vector2 ? v.clone() : v;
     }
     this.position.copy(source.position);
-    this.quaternion.copy(source.quaternion);
+    // The rotation in the source's order and angles (three.js copies the order), then its quaternion exactly; the
+    // quaternion quietly, as the two already agree.
+    const r = source.rotation, q = source.quaternion;
+    this.rotation.set(r.x, r.y, r.z, r.order);
+    this.quaternion.set(q.x, q.y, q.z, q.w, false);
     this.scale.copy(source.scale);
     this.up.copy(source.up);
     this.matrix.copy(source.matrix);
     this.matrixWorld.copy(source.matrixWorld);
     this.userData = JSON.parse(JSON.stringify(source.userData));
     this.tags = [...source.tags];
+    // The mask by value, as three.js (an object never asked for its layers is on layer 0).
+    if (source._layers || this._layers) this.layers.mask = source._layers?.mask ?? 1;
     if (recursive) for (const c of source.children) this.add(c.clone());
     touched(this);
     return this;
@@ -1186,6 +1254,8 @@ export interface MeshPhysicalMaterialParameters extends MeshStandardMaterialPara
   /** Scales `transmission` by its red channel (three.js / glTF transmissionTexture). */
   transmissionMap?: Texture | null;
   ior?: number;
+  /** Sets `ior` (three.js): 0..1, 0.5 = ior 1.5. */
+  reflectivity?: number;
   specularIntensity?: number;
 }
 
@@ -1234,6 +1304,13 @@ export class MeshPhysicalMaterial extends MeshStandardMaterial {
   transmissionMap: Texture | null = null;
   ior = 1.5;
   specularIntensity = 1;
+  /** The dielectric's reflectance as three.js has it: `ior` mapped to 0..1 (0.5 = ior 1.5); setting it sets `ior`. */
+  get reflectivity(): number {
+    return Math.min(Math.max((2.5 * (this.ior - 1)) / (this.ior + 1), 0), 1);
+  }
+  set reflectivity(reflectivity: number) {
+    this.ior = (1 + 0.4 * reflectivity) / (1 - 0.4 * reflectivity);
+  }
   constructor(params: MeshPhysicalMaterialParameters = {}) {
     super();
     this.setValues(params);
@@ -1424,7 +1501,7 @@ export interface ParticleBinding {
 /**
  * `count` particles that `emitter` places every frame (GPU), drawn with `material` (alpha-tested materials give soft
  * streaks and sprites; the material function reads each particle's `i.custom`). Particles cast no shadow by default.
- * Hardware ray tracing only (they are dynamic triangles).
+ * Hardware ray tracing only (a GPU pass places them every frame).
  */
 export class Particles extends Object3D {
   override type = "Particles";
@@ -1506,7 +1583,7 @@ export interface ParticleCollide {
  * `spawn` (the game's own, e.g. debris turned to dust), changed by `program`, collided as `collide` says, and drawn as
  * camera-facing quads with `material` (lit; emissive materials glow, with `emitterArea` as for `Particles`). Each
  * particle's colour is the material function's `i.custom`. When more are born than there is room for, the oldest slots
- * are reused. Hardware ray tracing only (they are dynamic triangles); particles cast no shadow by default.
+ * are reused. Hardware ray tracing only (a GPU pass places them every frame); particles cast no shadow by default.
  */
 export class GpuParticles extends Object3D {
   override type = "GpuParticles";
@@ -2005,10 +2082,12 @@ export interface LightShadow {
   normalBias: number;
   radius: number;
   blurSamples: number;
+  /** three.js frees the shadow map; there is none to free. */
+  dispose(): void;
 }
 
 function lightShadow(): LightShadow {
-  return { mapSize: new Vector2(512, 512), camera: { near: 0.5, far: 500, left: -5, right: 5, top: 5, bottom: -5, fov: 90, updateProjectionMatrix() {} }, bias: 0, normalBias: 0, radius: 1, blurSamples: 8 };
+  return { mapSize: new Vector2(512, 512), camera: { near: 0.5, far: 500, left: -5, right: 5, top: 5, bottom: -5, fov: 90, updateProjectionMatrix() {} }, bias: 0, normalBias: 0, radius: 1, blurSamples: 8, dispose() {} };
 }
 
 export abstract class Light extends Object3D {
@@ -2028,6 +2107,10 @@ export abstract class Light extends Object3D {
   }
   protected override get looksDownNegativeZ(): boolean {
     return true;
+  }
+  /** three.js frees the light's shadow map; ThreeRT's lights hold no GPU resources of their own. */
+  dispose(): void {
+    this.shadow.dispose();
   }
 }
 
@@ -2133,6 +2216,8 @@ export class AmbientLight extends Object3D {
     this.color = new Color(color);
     this.intensity = intensity;
   }
+  /** three.js API; nothing to free. */
+  dispose(): void {}
 }
 
 /** three.js HemisphereLight: sky colour from above, ground colour from below; as AmbientLight, a gradient sky. */
@@ -2149,6 +2234,8 @@ export class HemisphereLight extends Object3D {
     this.groundColor = new Color(groundColor);
     this.intensity = intensity;
   }
+  /** three.js API; nothing to free. */
+  dispose(): void {}
 }
 
 const DEFAULT_EXPOSURE = { mode: "auto", compensation: 0, minEv100: -10, maxEv100: 20 } as const;
@@ -2197,9 +2284,20 @@ export class PerspectiveCamera extends Object3D {
   }
   /** Set the vertical FOV from focal length, using the film height for this aspect ratio (three.js). */
   setFocalLength(focalLength: number): void {
-    const filmHeight = this.filmGauge / Math.max(this.aspect, 1);
-    this.fov = (2 * Math.atan(0.5 * filmHeight / focalLength) * 180) / Math.PI;
+    this.fov = (2 * Math.atan((0.5 * this.getFilmHeight()) / focalLength) * 180) / Math.PI;
     this.updateProjectionMatrix();
+  }
+  /** The focal length, in film-gauge millimeters, that gives the current vertical FOV (three.js). */
+  getFocalLength(): number {
+    return (0.5 * this.getFilmHeight()) / Math.tan((this.fov * Math.PI) / 360);
+  }
+  /** The film's width for this aspect ratio: the gauge, narrowed when the view is portrait (three.js). */
+  getFilmWidth(): number {
+    return this.filmGauge * Math.min(this.aspect, 1);
+  }
+  /** The film's height for this aspect ratio: the gauge, shortened when the view is landscape (three.js). */
+  getFilmHeight(): number {
+    return this.filmGauge / Math.max(this.aspect, 1);
   }
   /** three.js API; the engine reads fov / aspect / near / far as they are. */
   updateProjectionMatrix(): void {}
