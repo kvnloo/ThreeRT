@@ -1082,6 +1082,61 @@ export class Texture {
     this.uri = uri;
     this.colorSpace = colorSpace;
   }
+  readonly isTexture = true;
+  name = "";
+  userData: Record<string, unknown> = {};
+  private _listeners?: Map<string, ((event: TextureEvent) => void)[]>;
+
+  /** Copies what the texture samples (uri / data, color space, repeat, offset, wrap), its name and a JSON copy of its
+   *  userData, and marks it for upload, as three.js does. A `DataTexture`'s pixels stay its own: they are its size. */
+  copy(source: Texture): this {
+    this.uri = source.uri;
+    this.data = source.data;
+    this.colorSpace = source.colorSpace;
+    this.repeat.copy(source.repeat);
+    this.offset.copy(source.offset);
+    this.wrapS = source.wrapS;
+    this.wrapT = source.wrapT;
+    this.name = source.name;
+    this.userData = JSON.parse(JSON.stringify(source.userData));
+    this.needsUpdate = true;
+    return this;
+  }
+  /** A new texture (its own uuid) sampling the same image, as three.js's clone shares its source. */
+  clone(): Texture {
+    return new Texture(this.uri, this.colorSpace).copy(this);
+  }
+
+  addEventListener(type: string, listener: (event: TextureEvent) => void): void {
+    const all = (this._listeners ??= new Map());
+    const listeners = all.get(type);
+    if (!listeners) all.set(type, [listener]);
+    else if (!listeners.includes(listener)) listeners.push(listener);
+  }
+  hasEventListener(type: string, listener: (event: TextureEvent) => void): boolean {
+    return this._listeners?.get(type)?.includes(listener) ?? false;
+  }
+  removeEventListener(type: string, listener: (event: TextureEvent) => void): void {
+    const listeners = this._listeners?.get(type);
+    if (listeners?.includes(listener)) listeners.splice(listeners.indexOf(listener), 1);
+  }
+  dispatchEvent(event: TextureEvent): void {
+    const listeners = this._listeners?.get(event.type);
+    if (!listeners?.length) return;
+    event.target = this;
+    for (const listener of [...listeners]) listener.call(this, event);
+    event.target = null;
+  }
+  /** Fires `dispose`, as three.js does; the engine keeps the texture while a material in the scene uses it. */
+  dispose(): void {
+    this.dispatchEvent({ type: "dispose" });
+  }
+}
+
+export interface TextureEvent {
+  type: string;
+  target?: Texture | null;
+  [key: string]: unknown;
 }
 
 let uid = 0;
@@ -2489,6 +2544,10 @@ export class DataTexture extends Texture {
     this.height = height;
     this.pixels = rgba;
   }
+  /** A new texture sharing these pixels, as three.js's clone shares its source. */
+  override clone(): DataTexture {
+    return new DataTexture(this.width, this.height, this.pixels).copy(this);
+  }
   /** three.js's `image`: the pixels and their size. */
   get image(): { data: Uint8Array; width: number; height: number } {
     return { data: this.pixels, width: this.width, height: this.height };
@@ -2506,6 +2565,10 @@ export class StreamTexture extends DataTexture {
     if (!stream || stream.length > 64 || stream.includes("|")) throw new RangeError(`StreamTexture: a stream's name is 1 to 64 characters without "|", not ${JSON.stringify(stream)}`);
     this.stream = stream;
     this.wrap = "clamp";
+  }
+  /** A new texture on the same stream, sharing these pixels until a picture arrives. */
+  override clone(): StreamTexture {
+    return new StreamTexture(this.stream, this.width, this.height, this.pixels).copy(this);
   }
 }
 
