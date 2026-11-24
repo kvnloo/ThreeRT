@@ -4,8 +4,8 @@
 
 ThreeRT's goal is that an agent writes script-like code and gets a UE-quality world it can play at 60 fps. The
 measure is how good the final work is for a given creative intent, so the platform does not need a cross-engine
-interchange format. Round 2 (docs/PARITY.md) showed where expressiveness comes from: code. The UE session's look came
-from Custom-HLSL materials, a C++ Director ticking every frame and gameplay switching material parameters. A field in
+interchange format. An early comparison with a UE 5.8 session built to the same brief showed where expressiveness comes
+from: code. The UE session's look came from Custom-HLSL materials, a C++ Director ticking every frame and gameplay switching material parameters. A field in
 a scene schema is a ceiling.
 
 So there is no scene document. The scene code runs where the scene is rendered, in the renderer's embedded JS
@@ -37,7 +37,7 @@ runtime, and drives the engine directly, the way a UE game drives its actors:
   after every commit. After setup or a replaced state `f.snap` is true: the scene shows the state settled, so a render
   of any room state is right.
 * **No interchange format.** Nothing is exported. The UE ground truth for a level comes from that level in UE
-  (docs/PARITY.md § Round 2); the old IR → UE adapter is gone.
+  (`ue5/capture.ts`); the old IR → UE adapter is gone.
 
 ## Pieces
 
@@ -46,7 +46,7 @@ runtime, and drives the engine directly, the way a UE game drives its actors:
 | Engine API | `packages/scene/src/engine.ts` (`Engine`), `renderer/src/script.rs` (`__engine` natives) | Handles (u32) for geometries (typed arrays), textures (asset path, encoded image or RGBA8 pixels), material-function code, materials, objects (group / mesh / model / light / camera) and their transform, visibility, power, light / camera parameters; the environment and render settings. Descriptors are JSON-shaped (`renderer/src/desc.rs`). |
 | Scene binding | `packages/scene/src/engine.ts` `SceneBinding` | Keeps the engine in step with a DSL scene. Objects report their own changes (core.ts change tracking: transforms, visibility, power, shadow flag, mesh geometry / material, add / remove), so a sync visits only what changed. Lights, cameras and materials are compared against what was last sent. |
 | World | `renderer/src/world.rs` | The engine's objects, resources, environment and settings, and what changed since the last commit: parameter changes (power, light / material parameters, environment, camera) or structural ones. Asset paths must stay inside the asset root (game code is untrusted on nodes). |
-| Live commit | `renderer/src/live/edits.rs` `LiveCore::commit`, `tables.rs` | Parameter changes rewrite GPU table entries in place (materials, lights, object power, emitter CDF, wetness / rain / fog, camera), and so does hiding or showing a volume, a light without a card or a particle system that is not light-sampled by its own `visible`. Anything structural rebuilds the GPU scene from the world, in memory; history survives, validated per pixel. |
+| Live commit | `renderer/src/live/edits.rs` `LiveCore::commit`, `tables.rs`, `live/state.rs` | Parameter changes rewrite GPU table entries in place (materials, lights, object power, emitter CDF), and so does hiding or showing a volume, a light without a card or a particle system that is not light-sampled by its own `visible`. Where what an object draws landed is its proxy (`scene::Retained::proxies`: its object-table entry and how its geometry is held, with its record), for what the build placed and what an edit placed alike; edits in place read and keep it. What is not the scene's data is held beside it and derived whole from the world, by the same function at load and on an edit (`live/state.rs`): the view's state (`ViewState`: the scene camera's lens, depth of field and exposure, which camera is the scene's, the render preset) and the environment (`Environment`: wetness, rain, fog or a background, appearing or going with another variant of the kernel; its sky, baked and put in place by `apply_sky`). What the edits of a commit change above the triangles (instances moved, meshes built again, triangles re-transformed) is built once at its end, every BLAS named and the TLAS in one call (`gpu::TopBuild`, `LiveCore::build_top`). Anything structural rebuilds the GPU scene from the world, in memory; history survives, validated per pixel. The view's size is the view's: `LiveCore::resize` makes the buffers that follow it again (`live/targets.rs`) and leaves the scene's data and the radiance cache; the window (`play`) follows its size and its display's density, the headless runner takes `{"cmd":"resize"}`. |
 | Scene runtime | `renderer/src/script.rs` `ScriptHost` | QuickJS (rquickjs) with no I/O (no fs, network or timers; what needs the outside is asked of the app, "The host channel"). Loads a bundle (one script) or ES modules (`game.js` + `threert-runtime.js`, the cloud layout). Memory capped at 1 GiB. Time budgets: setup 120 s, event 1 s, frame 50 ms; the interrupt handler aborts overruns. Every entry ends by running the promise jobs it left, inside its budget ("Promises", below). The time the engine spends inside a voxel call (`voxelExplode`, `voxelEdit`, `voxelFrame`) is the engine's, not the script's: the deadline moves by it as measured, up to 250 ms an entry; past that it counts against the script, and a voxel call made after the deadline throws "interrupted" at once. A prelude adds `TextEncoder`, `structuredClone`, `atob` and `console`. |
 | Node host | `packages/gameplay/src/node-host.ts` | `globalThis.__threert`: `setup(room, seed)`, `event(type, payload, ts)` (local authority: execute + commit), `commit(writes, seq)` / `setState(state, seq)` (room authority), `state()`, `frame(dt, now)`, `hostMessages(list, ts)` (the app's messages), `sync()` (the engine follows the scene once more: after an entry's promise jobs), and the editor's `outline()`, `inspect(name)`, `edit(name, path, value)`. |
 | World handlers | `packages/gameplay/src/world.ts` | `on[type](world, ev)`: an event handled on this node, changing the scene at once. `WorldContext`: `scene`, `camera`, read-only `state`, `object(id)`, `time`, `now`, `random()`, `emit(type, payload)`. |
@@ -136,10 +136,6 @@ node tools/build-scenes.ts                              bundles every catalog en
 the job's state (`setState`, settled by the frame script). A job whose scene reads files that are not under the asset
 root yet fails with `missing: [...]`; the node fetches them and retries.
 
-The playground runs the opened scene the same way: its host holds the `GameSession`; the Node backend keeps the
-catalog, the selection, the undo stack (Details edits as `{node, path, before, after}`) and the Play flow. Stop
-re-runs setup and replays the editor's edits (UE PIE: Play changes are discarded).
-
 ## World handlers
 
 A handler is a transaction on the JSON state and may run in a room, where there is no scene and no physics world; the
@@ -166,7 +162,7 @@ export default defineGame({
 });
 ```
 
-- **Where:** on the node that owns the scene and the physics world (`play`, `live`, the playground: wherever events
+- **Where:** on the node that owns the scene and the physics world (`play`, `live`, an app embedding the engine: wherever events
   arrive at a node). Not in a room.
 - **When:** as the event arrives, synchronously, before the engine's next physics tick. What it changed goes to the
   engine through the scene binding when it returns: no commit, and `frame` is not run again for it.
@@ -300,9 +296,7 @@ crate.position.set(0, 5, 0);                     // a write moves the body there
   in when bodies are cut (its `bodyA` / `anchorA`, or `bodyB` / `anchorB`, then name the part it is on), and is
   `broken` (a "broken" event) when that cell is carved or its body goes. An explosion's blast pushes the bodies near
   it, and kicks the parts it cuts loose (`push`; docs/VOXEL.md "Joints, the level's anchor and the blast", step 10
-  c1). An explosion's fire and smoke are
-  `Explosions` (`packages/voxel`, step 10 b; docs/VOXEL.md "Fire and smoke"): scene objects pooled in setup, no engine
-  call of their own. A voxel shape's limits: cells of 1 cm to 100 m, at most 2^24
+  c1). A voxel shape's limits: cells of 1 cm to 100 m, at most 2^24
   cells, each within 2^20 cells and 100 km of the shape's origin.
   - Two things the world does itself for voxel shapes, because Rapier 0.36 and parry 0.31 do them wrongly
     (`physics-core/src/world.rs` has the tests): rays are walked cell by cell (parry's ray misses every cell when it
@@ -388,6 +382,7 @@ Messages a game posts:
 | `net.fetch` | `id`, `url`, `method?`, `headers?`, `body?` | one HTTP request (`GET` unless `method`); answers `net.fetched` |
 | `hud` | `hud` | draws the HUD it describes ("HUD", below). `hud.set` posts it; a game does not post it by hand |
 | `audio.*` | below | plays sound ("Sound", below), with the engine's `audio` module. `audio.play` and the rest post them |
+| `files.*`, `store.*` | below | reads what the player picked, keeps the game's files on the device ("Files", below); each request answered once |
 
 Messages an app sends:
 
@@ -397,7 +392,9 @@ Messages an app sends:
 | `net.messages` | `id`, `list: string[]` | the text messages that arrived on `id` since the last frame, in order: one batch a socket a frame |
 | `net.closed` | `id`, `code`, `reason` | the socket closed (the close frame's code; 1005 without one), or failed (1006, `reason` says why) |
 | `net.fetched` | `id`, `status`, `body`, `error?` | the response's status and body as text; `status` 0 and `error` when the request failed |
-| `launch` | `params: { room?, name?, ... }` | once, after setup: how the app opened the game. Kept as `host.launch` (`{}` before it comes, and for an app that sends none) |
+| `launch` | `params: { room?, name?, ... }`, `caps?: string[]` | once, after setup: how the app opened the game. Kept as `host.launch` (`{}` before it comes, and for an app that sends none); `caps`, the families of requests the app answers (`"files"`, `"store"`), as `host.caps` (`[]` before, and for an app that lists none) |
+| `files.picked`, `files.data`, `store.*` | below | the answers to `files.*` and `store.*` ("Files", below) |
+| `hud.choose` | `item`, `row` | the player clicked or tapped a row of a selectable HUD table ("HUD", below) |
 | `input` | below | once a frame, before the frame script, to a game that asked for input. The node host keeps it; it has no listeners |
 
 `id` is the game's own name for a socket or a request (a string); the app's answers carry it back. Messages are text:
@@ -405,7 +402,8 @@ a binary WebSocket frame is dropped. Which addresses a game may reach is the app
 
 **What an app does** (Rust: whoever holds the `GameSession`; `renderer/src/view.rs` is the example to read):
 
-1. After the scene is built: `session.host_messages(&mut core, &[host::launch_message(params)])`.
+1. After the scene is built: `session.host_messages(&mut core, &[host::launch_message(params)])`, or
+   `launch_message_with_caps(params, &services.caps())` for an app that answers `files.*` / `store.*`.
 2. Every frame, before `session.frame`: one `host_messages` with the frame's `input` message (if the game asked:
    `session.host.pointer()` is `Some("look")` or `Some("free")`) and what its services have for the game (a
    `net.messages` batch a socket, answers). An empty batch is no entry at all.
@@ -419,11 +417,11 @@ a binary WebSocket frame is dropped. Which addresses a game may reach is the app
 
 The apps in this repository:
 
-| app | input | `net.*` | `launch` | HUD | sound |
-| --- | --- | --- | --- | --- | --- |
-| `threert-render play` (`view.rs`) | keys by physical position, mouse buttons, wheel; the pointer captured for `"look"` (a click; Esc lets go, Esc again quits) | WebSockets and HTTP on a thread each (`src/net.rs`: tungstenite and ureq on rustls; text frames of at most 1 MiB, bodies of at most 4 MiB, 16 sockets, 32 requests at once), any address | `--launch '{"room":"K7Q4MZ"}'` | not drawn; `--hud-log` prints each description | played (`audio` feature) |
-| `threert-render live` (`live/session.rs`) | whatever the driver sends | none: the driver is the app | `--launch` | on stdout with every other post | on stdout: the driver's |
-| the three.js view (`tools/three/view.ts`, `host.ts`, `hud.ts`) | keyboard, mouse, the Pointer Lock API | `WebSocket`, `fetch` (the browser's rules: same-origin policy, CORS) | the page's query (`?room=K7Q4MZ&name=Ada`) | DOM over the canvas | Web Audio by the same rules (`audio.ts`) |
+| app | input | `net.*` | `launch` | HUD | sound | files, store |
+| --- | --- | --- | --- | --- | --- | --- |
+| `threert-render play` (`view.rs`) | keys by physical position, mouse buttons, wheel; the pointer captured for `"look"` (a click; Esc lets go, Esc again quits) | WebSockets and HTTP on a thread each (`src/net.rs`: tungstenite and ureq on rustls; text frames of at most 1 MiB, bodies of at most 4 MiB, 16 sockets, 32 requests at once), any address | `--launch '{"room":"K7Q4MZ"}'`; `caps: ["files", "store"]` | not drawn; `--hud-log` prints each description | played (`audio` feature) | `--pick` and `--store` (`src/userfiles.rs`) |
+| `threert-render live` (`live/session.rs`) | whatever the driver sends | none: the driver is the app | `--launch`, `--caps files,store` | on stdout with every other post | on stdout: the driver's | the driver's; `--store` is where `user:` assets are |
+| the three.js view (`tools/three/view.ts`, `host.ts`, `hud.ts`) | keyboard, mouse, the Pointer Lock API | `WebSocket`, `fetch` (the browser's rules: same-origin policy, CORS) | the page's query (`?room=K7Q4MZ&name=Ada`); no `caps` | DOM over the canvas | Web Audio by the same rules (`audio.ts`) | none |
 
 - `live` speaks the channel as JSON lines, so a game's use of it is testable without a window: on stdin
   `{"cmd":"host","messages":[{"t":"net.opened","id":"room"}, ...]}`, on stdout one line `{"host":[...]}` with what
@@ -437,7 +435,8 @@ The apps in this repository:
   natively, without the renderer and without wasm-bindgen), which `node tools/three/open.ts <game>` builds for a
   game whose source names the physics. Bodies move and `intersectPhysics` / `Shapecaster` answer as in the renderer.
   Without the module the view is the baseline it was: bodies stay where the scene put them.
-- Checked: `packages/gameplay/test/host.test.ts` (the channel, input, the HUD's change detection, in Node);
+- Checked: `packages/gameplay/test/host.test.ts` (the channel, input, the HUD's change detection, in Node),
+  `files.test.ts` (files, store, caps, base64, `sliced`);
   `renderer/src/host.rs` and `script.rs` tests (the queue's bounds, a batch's delivery, the input message);
   `node tools/host-echo.ts` (`games/host/echo.game.ts` in `live` with the script as the app, in `play` against a
   WebSocket and HTTP server on the machine, and in the three.js view in Chrome); `node tools/fps-arena.ts` and
@@ -544,13 +543,31 @@ hud.flash("damage", 1.2);        // the player was hit from 1.2 rad clockwise of
   | `text` | `text`, `label?`, `tone?`, `size?` (`small`, `normal`, `large`) | a figure or a line, with a small label over it |
   | `bar` | `value` (0..1), `label?`, `text?`, `tone?` | health, a reload, a round's time; `text` is a figure beside it |
   | `list` | `lines: (string \| { text, tone?, ttl?, id? })[]` | short lines, newest last. A line with `ttl` is shown that many seconds from when the app first got it (the same `id`, or the same text), then left out, whether or not the game still lists it |
-  | `table` | `columns`, `rows`, `title?`, `highlight?` | a scoreboard: listed while it is to be seen (`f.input.down("Tab")`); `highlight` is the row to set apart |
+  | `table` | `columns`, `rows`, `title?`, `highlight?`, `selectable?`, `id?` | a scoreboard: listed while it is to be seen (`f.input.down("Tab")`); `highlight` is the row to set apart. A `selectable` table is a menu (below); `id` names it, unique among the tables |
 - **`crosshair`:** `style` (`dot`, `cross`, `circle`), `gap` (0..1: how far it opens, a weapon's spread), `tone?`.
   **`message`:** `title`, `subtitle?`, `tone?`, at the picture's centre.
 - **`flash`** is the one event: `hud.flash(kind, angle?)` posts the HUD as last set with `flash: { kind, angle?, n }`,
   `n` one more each time. An app plays it when `n` changes: `hit` (a hit marker at the crosshair), `kill`, `damage`
   (the player was hit; `angle`, radians clockwise from straight ahead, is where from).
 - **Tones** say what a value means, for the app to colour: `default`, `good`, `warn`, `bad`, `accent`, `dim`.
+- **Menus: selectable tables.** A table with `selectable: true` is a menu the player can click (with the pointer
+  free) or tap. The app makes each row a target and, when one is chosen, sends `{ t: "hud.choose", item, row }`:
+  `item` is the table's `id` (a string), or its index in `items` when it has none (a number); `row` is the row's
+  index in `rows`. The game takes it with `host.on("hud.choose", (m, world) => ...)` like any message of the app, and
+  decides what it means; a choice changes nothing by itself (the game moves its `highlight`, opens what was chosen).
+  Keys and a gamepad drive the same menu through the game's own `highlight`, so a menu works on a keyboard, a
+  gamepad and a touch screen alike. With the pointer captured for look there is nothing to click: a game that wants
+  clicks shows its menu with the pointer free (`pointer: "free"`, or the player lets go with Esc), and an app on a
+  touch screen has no capture to begin with. `threert-render play` draws no HUD: with `--hud-log` it prints each
+  selectable table and the stdin line that chooses a row (`{"cmd":"host","messages":[{"t":"hud.choose","item":"maps",
+  "row":0}]}`); the three.js view makes the rows clickable (`tools/three/hud.ts`). Rust apps:
+  `host::hud_selectables(hud)` lists them, `host::hud_choose_message(item, row)` is the message.
+
+  ```ts
+  hud.set({ items: [{ type: "table", anchor: "center", id: "maps", title: "Maps", columns: ["Map", "Size"],
+    rows: maps.map((m) => [m.name, m.size]), highlight: current, selectable: true }] });
+  host.on("hud.choose", (m) => { if (m.item === "maps") open(maps[m.row]); });
+  ```
 - **Text is text.** An app shows a game's strings as they are, never as markup.
 - A scene built anew in the same runtime posts its first description whatever the last one was.
 
@@ -605,6 +622,267 @@ frame(f) {
   The three.js view plays it on Web Audio by the same numbers (`tools/three/audio.ts`, held to mix.rs by
   `tools/three/test/audio.test.ts`; its low pass is a biquad, the one difference), resumed on the page's first key or
   click as browsers require. The engine's library in a browser (wasm32) has no `audio` module.
+
+### Files
+
+A game may let its player bring content they own: OpenStrikeRT, for one, plays Counter-Strike 1.x maps from the
+player's own copy of that game, converted to RT maps. Such files never leave the player's device. The player picks
+them, the game reads and converts them inside its sandbox, keeps the result in the app's storage on that device, and
+shows it as an asset. Nothing is uploaded, published or sent to other players.
+
+```ts
+import { GLTFModel } from "@threert/scene";
+import { files, host, sliced, store } from "@threert/gameplay";
+
+host.on("launch", () => { canImport = files.available() && store.available(); });   // the app's caps
+
+async function importMaps() {                                        // from the frame script (a menu's button)
+  const picked = await files.pick({ mode: "folder", accept: [".bsp", ".wad"], title: "Your Counter-Strike folder" });
+  if (!picked) return;                                               // the player closed the picker
+  for (const e of picked.entries.filter((e) => e.path.endsWith(".bsp"))) {
+    const bsp = await files.read(picked.pick, e.path);               // Uint8Array, the whole file (or { offset, length })
+    jobs.push({ name: e.path, job: sliced(convert(bsp)) });          // convert: a generator, it yields often
+  }
+}
+function frame() {                                                   // the game's frame script
+  const r = jobs[0]?.job.step(8);                                    // 8 ms of conversion this frame
+  if (r?.done) { void store.write(`maps/${slug}/map.glb`, r.value as Uint8Array); jobs.shift(); }
+}
+scene.add(new GLTFModel(store.uri("maps/de_x/map.glb")));            // "user:maps/de_x/map.glb"
+```
+
+Two families of requests on the host channel (`packages/gameplay/src/files.ts` wraps them as promises). Binary data
+travels as base64 strings. `id` is the game's name for the request; every request gets exactly one answer with the
+same `id`.
+
+- **Capabilities.** An app that answers them lists them in the `launch` message: `{ t: "launch", params, caps:
+  ["files", "store"] }`. `host.caps` is that list: `[]` until launch, and for an app that sends none. A game must not
+  wait for an answer of a family the app did not list: `files.available()` / `store.available()` say whether it did,
+  and the package refuses a request of an unlisted family at once (a `HostRequestError` with `reason:
+  "unsupported"`), without posting it. `caps` comes after setup, so a game asks in its `launch` listener or later.
+
+**`files.*`: what the player picked (read only).**
+
+| game → app | app → game |
+| --- | --- |
+| `{ t: "files.pick", id, mode: "folder" \| "files", accept?: string[], title?: string }` | `{ t: "files.picked", id, ok: true, pick, name, entries: [{ path, size }] }` or `{ t: "files.picked", id, ok: false, reason }` |
+| `{ t: "files.read", id, pick, path, offset?, length? }` | `{ t: "files.data", id, ok: true, data, offset, size }` or `{ ..., ok: false, reason }` |
+
+- `accept`: lower-case extensions with the dot (`[".bsp", ".wad", ".rad"]`); a file matches without regard to case.
+  No `accept`: every file.
+- `mode: "folder"`: the player chooses a folder; `entries` are the matching files under it, recursively (at most 6
+  levels, at most 4,000 entries, hidden files and directories left out), `path` relative to the folder with `/`
+  separators. `mode: "files"`: the player chooses one or more files; `entries` are those, `path` = the file's name.
+- `pick` is an opaque string naming the grant; `name` is what to show (the folder's or the file's name). A grant
+  lasts for the game session (until the game is closed or reloaded).
+- `reason`: `"canceled"` (the player closed the picker), `"busy"` (a picker is already open), `"unsupported"`,
+  `"denied"`, or a sentence.
+- `files.read`: `path` must be one of the grant's entries (anything else: `ok: false, reason: "denied"`). Without
+  `offset` and `length`, `data` is the whole file in base64. With them (whole numbers of bytes; `offset` 0 by default,
+  `length` to the end by default) it is `length` bytes from `offset`, fewer where the file ends first; an `offset`
+  past the end is `reason: "out of range"` (at the end: no bytes). The answer's `offset` is where `data` starts and
+  `size` is always the whole file's size. At most 64 MiB at once (`reason: "too large"`): a larger file is read in
+  parts. Read only what is needed: a 38 MB texture archive for its directory and a few textures is a few small reads,
+  where the whole of it is 50 MB of base64 in one message and a frame of a tenth of a second.
+- `files.pick(o)` resolves to `{ pick, name, entries }`, or `null` when the player canceled; `files.read(pick, path,
+  { offset?, length? }?)` to the bytes. Any other `ok: false` rejects with a `HostRequestError` whose `reason` is the
+  app's.
+- **The pointer while the picker is open.** A picker is the app's own window or sheet over the game, and the game
+  cannot let go of the pointer itself: an app that has the pointer captured for look releases it when it opens a
+  picker (as when the window loses the keyboard: everything held is let go), and the player captures it again with a
+  click once the picker is closed.
+
+**`store.*`: the app's own storage for this game (read and write, persistent, local).**
+
+| game → app | app → game |
+| --- | --- |
+| `{ t: "store.write", id, path, data?: base64, text?: string }` | `{ t: "store.done", id, ok, reason? }` |
+| `{ t: "store.read", id, path, as: "text" \| "base64" }` | `{ t: "store.data", id, ok: true, text? / data?, size }` or `{ ..., ok: false, reason: "absent" \| ... }` |
+| `{ t: "store.list", id, prefix?: string }` | `{ t: "store.listed", id, ok: true, entries: [{ path, size }] }` |
+| `{ t: "store.remove", id, path }` | `{ t: "store.done", id, ok, reason? }`: a file, or a directory and everything in it |
+
+- `path`: relative, `/`-separated, segments of `[A-Za-z0-9._-]`, no `.` or `..` segment, no leading `/`, at most 200
+  characters. Directories are made as needed. The package checks a path before it posts anything (a `TypeError`);
+  the app checks it again (`ok: false`).
+- `store.write` takes `data` (bytes in base64) or `text` (written as UTF-8), a file of at most 64 MiB. Writes are
+  atomic: a temporary file beside the file, renamed over it, so a reader sees the old file or the new one.
+  `store.read` with `as: "text"` answers `reason: "not text"` for a file that is not UTF-8. `store.list` lists the
+  files (not directories) whose path starts with `prefix` (a plain string: `"maps/"` is everything under maps),
+  sorted by path. `store.remove` of nothing is `ok: true`.
+- One storage per game identity: a published app by its name (`openstrike`), a development project by its project
+  id. It survives app updates and new versions of the game, is never uploaded, and is removed with the game's data.
+- Quota: 1 GiB per game (a write past it: `ok: false, reason: "quota"`).
+- `store.write(path, bytes | text)`, `store.read(path)` (bytes, or `null` when absent), `store.readText(path)`,
+  `store.list(prefix?)`, `store.remove(path)`; `store.uri(path)` is `"user:" + path`.
+
+**Assets from the store: `user:` URIs.** A stored file is an asset of the scene under the URI `user:<path>`:
+`new GLTFModel("user:maps/de_dust2/map.glb")`, a texture's file, a procedural asset, a voxel level's objects, a sound
+(`audio.play("user:sounds/x.wav")`) likewise. The engine resolves `user:` against the store's directory the app gave
+it (`threert_render::files::set_user_root`, before the scene is built; `files::asset_path` is the one place every
+reader of a scene's files goes through), and a path after `user:` must be a store path, so nothing outside the store
+is reached. Without a user root a `user:` asset is missing, as a missing file is. `GameSession::files()` lists `user:`
+assets with the rest: an app that fetches a scene's files from elsewhere (a browser page, a client that downloads a
+package) leaves them out, they are on the device. The browser builds have no store: a `user:` asset is missing there.
+
+**Large messages.** A `store.write` carries a whole file: its post may be up to 96 MiB of JSON text (any other message
+stops at 1 MiB), and the queue holds at most 192 MiB. In the engine's runtime the package's base64 is native
+(`__host_base64_encode` / `__host_base64_decode`, in `script.rs`): a 64 MiB `files.data` reaches a listener and is
+decoded in about 130 ms of an entry's 1 s (measured on a Mac by `script.rs` `files_cross_the_host_channel_as_base64`). In Node it
+is `Buffer`'s, in a page `atob` / `btoa`.
+
+**Long work: `sliced(job)`.** A conversion takes longer than a frame. `sliced(iterator)` runs a generator's work a
+slice at a time: `job.step(ms)` calls `next()` until `ms` milliseconds have passed (at least once) or the job has
+ended, and returns `{ done, value }`: the last value yielded (its progress) while it runs, the value it returned once
+it is done (and from then on). A job that throws ends; its step throws. Steps are timed by the runtime's monotonic
+clock (`performance.now()`), not `Date.now()`, which is the event's fixed time inside listeners and handlers. A step
+stops only between two `yield`s: yield often.
+
+- **Requests are presentation**, as sound is: post them from the frame script and from host listeners (and the code
+  after their `await`s), never from a handler, which is replayed and verified. What the player picked and what the
+  game stored are this device's; nothing of it is state a room agrees on.
+
+**The apps.** `threert-render play` answers both families for development and tests (`src/userfiles.rs`: the work on
+a thread of its own, one request after another in the order they were posted, the answers taken once a frame):
+
+```sh
+threert-render play game.js --assets games/openstrike \
+  --store /tmp/openstrike-store \
+  --pick "$HOME/Games/cstrike,$HOME/Downloads/de_x.bsp"
+```
+
+- `--store <dir>`: the game's store (default `<assets>/.threert/store`), also the user root of `user:` assets.
+- `files.read` with `offset` / `length` reads only that part (`Grant::read_range`).
+- `--pick <dir|file>[,<dir|file>...]` answers `files.pick` requests in order with those paths instead of a dialog: a
+  folder for `mode: "folder"`; a file, or a folder standing for the files in it (not below), for `mode: "files"`.
+  After the last one each pick is `"canceled"`; with no `--pick` at all each is `"unsupported"`. The launch lists
+  `caps: ["files", "store"]` either way.
+- On stdout (`{"type":"host","messages":[...]}`) a `store.write`'s `data` / `text` is its length (`dataLength`).
+- `threert-render live` is driven by a program that is the app: `--caps files,store` lists what that program answers
+  (it answers on stdin with `{"cmd":"host","messages":[...]}`), and `--store <dir>` is where the engine reads `user:`
+  assets from.
+- An app that embeds the engine's library can take `threert_render::userfiles` as it is: `Store` (paths, quota,
+  atomic writes), `Grant` (a folder's or files' entries; reads inside it), `Requests` (the messages' answers, with a
+  `Picker` that asks the player) and `UserFiles` (all of it as `HostServices`, on its thread), and
+  `files::set_user_root` with the game's store directory.
+- Checked: `renderer/src/userfiles.rs` tests (paths refused: `..`, absolute, bad characters, too long; the quota;
+  atomic writes under a concurrent reader; `--pick` answers in order; `files.read` refused outside the grant, and in
+  parts (a file past 64 MiB read by ranges); hidden
+  files, depth and count bounds), `files.rs` (`user:` models and sounds from the store, never outside it, missing
+  without a root), `script.rs` (base64 natively, the size bounds, a 64 MiB file within a budget), `host.rs` (caps in
+  `launch`, services as one), `packages/gameplay/test/files.test.ts`; and `games/host/files.game.ts` in `play`
+  (picked a folder, read a model from it, converted it across frames, stored it, shown from the store; a second run
+  shows it from the store without asking).
+
+## Stream textures
+
+A texture whose pixels the app replaces while the scene runs: a screen in the scene that shows what a program
+draws, a camera, a video. The scene describes it once, by name and size:
+
+```ts
+import { MeshStandardMaterial, StreamTexture } from "@threert/scene";
+
+const picture = new StreamTexture("screen", 640, 360);          // black until the first picture arrives
+const panel = new MeshStandardMaterial({ color: 0x000000, emissive: 0xffffff, emissiveMap: picture, emissiveIntensity: 300 });
+```
+
+and the app that embeds the engine hands over pictures by that name:
+
+```rust
+core.write_stream("screen", 640, 360, &rgba)?;                  // LiveCore, before the frame's `render`
+```
+
+- **Nothing is rebuilt.** A stream's identity in the texture pages is its name and size, not its pixels
+  (`texpack::stream_key`), so `texpack::set_key` does not change with a picture. `Gpu::write_stream` writes the
+  texture's padded rect (its content, its gutters as `pack` fills them, every mip level: `texpack::patch`) into
+  its place with `queue.write_texture`. A 640 x 360 picture is about 1.4 MB of texels a frame.
+- **The last picture is kept** (`Gpu.streams`): pages that are packed again for another texture set show it, not
+  the picture the scene was described with.
+- **A size other than the texture's** is resized to it (the packer shrinks a power-of-two texture of 512 or more
+  by its gutters).
+- **For a picture that changes every frame, emit it from a material function** (docs/MATERIAL_FUNCTIONS.md):
+  emission from a function keeps the live view's short history, so the screen shows this frame's picture and
+  not a blend of the last sixteen.
+- The script side has no call for it: pictures come from the app (`write_stream`), not through the script
+  runtime. A script's own `DataTexture` with `needsUpdate` is another texture under its number: written over the
+  old one where it is as large, else placed as a new one ("What comes in place", below).
+
+## What comes in place
+
+An edit rewrites what it touches and nothing else; the scene is built again from the world only for what is listed
+at the end. `THREERT_EDIT_LOG=1` says where a rebuild was decided, and a frame's log has its reason (`fallback`).
+
+- **Textures.** The pages keep where each texture lies and what they have free (`texpack::Atlas`). A texture a
+  material first names is decoded, placed among them (a shelf it fits, a new shelf, a new layer) and written there,
+  every level; its two rows go into the texture table (`Gpu::place_texture`, `LiveCore::place_textures`). Pages
+  without room become a texture with a layer more or a longer side, and what they held is copied there on the GPU.
+  New pixels of the same size go over the old ones, unless another texture has the same slot. A texture no
+  material names any more keeps its place until the scene is loaded again.
+- **Materials.** A new one, its maps and its function with it; a material given other maps, another function or
+  none. (Not one that is a particle's, `transparent`, or has vertex colours: those say where triangles are kept.)
+- **Material functions.** The scene keeps its functions by number, and one that comes takes the next
+  (`LiveCore::set_functions`). The kernel with them is another module.
+- **The kernel's variant.** A feature a scene first uses (fog, glass, a clear coat, a texture, a cutout or a
+  function on an instance), and other functions, are another variant of the kernel, which the driver compiles for
+  half a second to tens of seconds. The view runs the kernel it has while the scene's is made on another thread
+  (`Gpu::warm_kernel`, `LiveCore::choose_kernel`), and takes it at a frame's start once every pipeline a frame
+  asks of it is there. Until then what the new variant draws is missing: a material of a function the old kernel
+  has not is drawn as one without, fog comes a moment late. In lockstep (benchmarks, tests) and in a browser,
+  which has no thread to give, the frame makes its kernel itself and waits.
+- **Models.** A still model the scene has not got: its materials are made as the build makes them, its textures
+  placed in the pages, its mesh made in the edit's room (`LiveCore::place_models`, `make_mesh`).
+- **Lights.** A light that is an entry of the light table alone (not a rect light with a card, not the
+  atmosphere's sun) comes, goes and changes its kind or its shadow in place: the table is listed in a build's
+  order, sorted, grown where it is full, and the kernel's counts follow.
+- **Volumes.** The media table is made whole from the world, as a build makes it (`LiveCore::set_media`): a volume
+  that comes, goes, is set again or is moved where it stood still. A volume function that comes takes the next
+  number; the kernel's count of media and its media features follow (a scene's first volume is another variant).
+- **Density grids.** The grids follow the volumes that name them (`Gpu::put_grids`). A new grid, another size,
+  another program or a program's code has the atlas and the programs' pass made again, and what the programs had
+  simulated is copied on the GPU to the grids that are the same still; new parameters make nothing again. A
+  program's pass is compiled in the frame it comes in.
+- **Groups and cameras.** A new group, and a camera that is not the scene's, draw nothing.
+
+Still a rebuild: particle systems that come or go, and their functions and programs; a geometry function; a posed model the scene has not got, and any new model under software traversal (its room does
+not grow); a material that becomes a particle's or gets vertex colours; a rect light's card; as many shadow-casting
+local lights as bring the light tiles or take them away; the scene's first instance, procedural object, instance
+colours or vertex colours (the kernel's data is laid out for them); the atmosphere's sun shown or hidden.
+
+## Streaming: reading assets and adding them in place
+
+A game that streams its world as the camera moves (a city of baked cells: [threert/TokyoRT](https://github.com/threert/TokyoRT))
+reads files under the asset root as it goes and adds what they hold without rebuilding the scene.
+
+- **`readAsset(path, offset?, length?)`** (`@threert/scene`; `__engine.readAsset`): a file under the asset root as an
+  `ArrayBuffer`, whole or `length` bytes from `offset` (relative paths, no `..`). Native renderer only. The root is the
+  host's `--assets`.
+- **The script's heap** is 1 GiB; `THREERT_SCRIPT_MB` sets another size (a resident city keeps its cells' arrays).
+- **The script's objects are few and acyclic.** QuickJS frees an object when its last reference goes; only reference
+  cycles wait for its cycle collector, which walks every object there is (a streamed city's ~0.5 M: ~45 ms, a frame
+  lost). A scene object is 8 JS objects (an instanced mesh 13): what most never use (`up`, `tags`, `userData`,
+  `customData`, `matrix`, `matrixWorld`, an empty `children`) is made when first asked for, and its transform's parts
+  and instance tables reach it through one `WeakRef`, not a back-pointer each. The first collection waits for 256 MB
+  of heap (`THREERT_SCRIPT_GC_MB`), then QuickJS's own rule (the heap half as large again).
+- **The binding syncs what changed.** Objects added under a parent or taken from one since the last sync are bound or
+  dropped with their subtrees; the graph is walked whole only at the first sync. A world removes a childless object
+  without looking for its children (`World::remove` keeps a count of each object's children).
+- **In place:** a new mesh (any geometry) with materials the scene has; a model whose file the scene has (another
+  copy); moving or showing an object the build placed as an instance; new materials without textures that neither
+  emit nor are glass.
+- **Rebuilds:** a new group (place the meshes themselves under groups the scene made); a material with textures or a
+  function that the scene has not seen (make every material at setup, and put each on a mesh, out of sight if need
+  be); showing an object that was hidden when the scene was built or rebuilt (move it out of sight instead of hiding
+  it); a model of nodes the file lacks (it draws nothing and has no instance to hide).
+- **Emitters cost the commit**: each commit that adds or removes emitting triangles writes the emitter CDF and the
+  light tree's dynamic part over every emitter of the scene. Add a cell's emitting meshes together, and draw far lights
+  with unlit materials (`MeshBasicMaterial`, or glTF `KHR_materials_unlit`, whose emission is then what it shows): they
+  are seen and light nothing.
+- **Instances cost what changed.** An `InstancedMesh` adds its copies as TLAS instances, in place, all of them
+  sharing its geometry's BLAS; a TLAS build writes only the instances that changed since the last one
+  (`renderer/third_party/wgpu-core/PATCH.md`; upstream wgpu wrote every one, every commit), and a frame validates the
+  TLAS's distinct BLASes, not its instances. Place repeated things (a city's windows, grates, street models) as one
+  `InstancedMesh` a piece and material a cell: their triangles once, a few objects a cell. TokyoRT's Shinjuku
+  streams 470,000 instances at a commit of 4.9 ms.
+- `THREERT_EDIT_LOG=1` prints where an edit or a world change decided on a rebuild.
 
 ## The runtime's shape: Rust owns the world, the script engine is a guest
 
@@ -897,7 +1175,8 @@ page's 105 KiB (brotli 17 KiB), hello world's bundle 230 KiB (brotli 53 KiB).
 **Not measured:** any scene but hello world in a browser; Safari and Firefox (nothing Chrome-only was written:
 WebGPU through wgpu, default limits except buffer sizes, timestamp queries only if the adapter has them). Measured
 since, natively (below, "Software traversal with units"): the merged layout's and the guard's cost on a scene whose
-trace is the frame (Kabukichō), and the atomic tests under software traversal as a suite, in both layouts.
+trace is the frame (Kabukichō, a street demo since removed), and the atomic tests under software traversal as a
+suite, in both layouts.
 
 ## Software traversal with units (in-place edits without ray queries)
 
@@ -975,10 +1254,16 @@ procedural objects (`trace_procs`: the ray into the object's space, a tree of it
   as vertex colours are; gpu.rs `KernelVariant::flags`): the file's walk, a call at the end of the still walk, and the still
   walk's stack declaration taken out ("The stack"). A scene without units has none of it; hardware traversal's
   kernel never does.
-- Still flattened, as before: meshes that deform (a pose shared by a crowd), every instance of a scene with more
-  of them than a top tree holds (2^18), and every instance of an offline render (`prepare`; a live session's scene
-  goes through `prepare_live`), unless `THREERT_UNITS=1`. `THREERT_UNITS=0` flattens everything, as before this
-  step (the A/B).
+- **A mesh that deforms** (a posed skinned model's) is a unit too. Its tree has the shape of a tree built once over
+  its model's bind pose, one shape for every placement of the model (the skinning pass's corners and each such
+  mesh's triangles are in that tree's order), and the boxes of its pose. A new pose places the model's corners on
+  the CPU, takes the boxes again (`units::refit`: a leaf's from its triangles, an interior node's from its
+  children), and writes the nodes where they lie; the pass writes the triangles. Made again for a pose, a tree
+  costs sixty times as much (a character of 13,744 triangles, one core: 3.0 ms against 0.05) and walks 4 to 11 %
+  shorter by its nodes' areas.
+- Still flattened, as before: every instance of a scene with more of them than a top tree holds (2^18), and every
+  instance of an offline render (`prepare`; a live session's scene goes through `prepare_live`), unless
+  `THREERT_UNITS=1`. `THREERT_UNITS=0` flattens everything, as before this step (the A/B).
 
 **Edits in place.** The edits that hardware traversal makes in place go through one type (`gpu::Top`: the TLAS and
 its BLASes, or the units), so the engine's path is the same under both traversals (`live/edits.rs` `move_instances`,
@@ -991,10 +1276,12 @@ its BLASes, or the units), so the engine's path is the same under both traversal
 | a mesh of its own is added (a new chunk, a new box) | its triangles and attributes into the edit room in its tree's order, its tree into the mesh range, a record, the top tree |
 | a mesh of its own changes (a voxel edit: the chunks it touched) | those meshes' trees made again (the old tree's nodes given back and filled), their records; no other unit is read |
 | a mesh is removed | its record cleared, its tree given back and filled, the top tree |
+| a skinned model takes a new pose | its mesh's tree's boxes written where they lie (the shape kept), its triangles by the skinning pass, the top tree |
+| a skinned model is hidden, shown or removed | its record, the top tree (shown: skinned as it is posed then) |
 
 The scene is rebuilt, as before this step, by: the first instanced mesh of a scene that has none (its kernel has no
-unit walk: one rebuild, as hardware traversal's first instance is); an edit of a procedural object; a posed model or
-a rigid group's pose (their triangles are in the still tree); an instance of a mesh that deforms; **room that is
+unit walk: one rebuild, as hardware traversal's first instance is); an edit of a procedural object; a skinned
+model added (hardware traversal adds it in place); **room that is
 full** (the edit room and the tree ranges are sized at the build, a quarter of the scene and at least 65,536
 triangles and 1,024 records, and do not grow under software traversal: under hardware traversal they do; what an
 edit replaces stays behind until the next rebuild, under both; a scene with units and no geometry of its own to
@@ -1206,7 +1493,7 @@ guard's 1.2 ms there is not its form). In Chrome (`tools/web-hello.ts --frames`)
 | `instancing` (1,000, all moving) | 3.39 / 7.89; flat rebuilds the scene every frame (276 ms of CPU a frame; units 6.5) | offline at one instant, 64 spp: ΔE 0.37, SSIM 0.995 |
 | `bistro` (1 unit of 2.83 M triangles) | 23.1 / 22.2 | ΔE 0.69, SSIM 0.990 |
 | `zero-day` (1 unit of 5.87 M) | 14.5 / 12.8 | ΔE 1.20, SSIM 0.963: the scene's own spread, see below |
-| `zero-day-animated` (3,991) | every frame rebuilds the scene (2.6 s), with units as flat: a rigid group's pose, as before step 7b | – |
+| `zero-day-animated` (4,181) | posed in place since 2026-11-20: 16.3 ms at 1280 × 720, half scale, a frame's commit 1.2 ms (before: every frame rebuilt the scene, 2.9 s) | – |
 
 `zero-day`'s picture: two runs of the flat kernel are ΔE 0.11 apart, so units' 1.20 is not noise of one kernel.
 Offline at 1,024 spp the three traversals are as far from one another: units against flat ΔE 0.97, hardware
@@ -1251,8 +1538,8 @@ too is an override, from F_TINT).
   `cache_acc_add`, `refl_store`, ...), declared once in each layout's block, so a layout is its declarations and
   nothing else of the kernel knows which it is in.
 - The loop guard's count goes into every loop by a pass over the variant's syntax tree (gpu.rs `guard_loops`).
-- What more than one shader reads or writes is declared once, in `records.wgsl`: a triangle's attributes
-  (`TriAttr`), a sample of the trace (`Pixel`), the light tiles' constants. The file is part of the kernel, of the
+- What more than one shader reads or writes is declared once, in `records.wgsl`: a triangle's attributes as a hit
+  has them (`TriAttr`), a sample of the trace (`Pixel`), the light tiles' constants. The file is part of the kernel, of the
   particle passes and of the live passes (build.rs reads it with live.wgsl). The particle passes take the object
   table's stride as a pipeline constant, as the kernel does (until 2026-11-15 gpu.rs rewrote a line of their text).
 - The kernel's bind group layouts are written in one place (gpu.rs `kernel_layout_entries`), and a test holds them
@@ -1279,10 +1566,13 @@ too is an override, from F_TINT).
 The kernel's read-only scene data other than triangles is two storage buffers, each a row of sections
 (`renderer/src/heap.rs`):
 - `tables` (group 0, binding 4), vec4s (`Table`): the light tree's nodes, materials, lights, the light groups'
-  spheres, the emitter CDF with its guide table, the texture pages' rects, objects, instance records, media and the
-  GGX energy table.
+  spheres, the emitter CDF with its guide table, the texture pages' rects, objects, instance records, media, the
+  GGX and glass energy tables, and the emitters' triangles (`GpuEmitterTri`: the light list's own world-space
+  copies, so a light sample reads no placement; what moves an emitter after the load is copied again on the GPU,
+  `emitter_fill.wgsl`).
 - `words` (binding 5), 32-bit words (`Stream`): the environment's CDF, the procedural geometry's data, the vertex
-  colours (`env_cdf_at`, `pword`, `vcolor_word`). Integers are read as integers, not through a float's bits.
+  colours, the instances' rows, and the triangles' indices and rows ("The scene's triangles" below) (`env_cdf_at`,
+  `pword`, `vcolor_word`, `tri_indices`, `tri_row`). Integers are read as integers, not through a float's bits.
 
 `Params::table_first` and `word_first` name each section's first element and are written with the parameters
 (`Uploaded::place`). What a scene has more of is another section, not another binding.
@@ -1310,8 +1600,58 @@ The kernel's read-only scene data other than triangles is two storage buffers, e
   vertices; and a browser's kernel had seven tables as the sized arrays of a struct, a second copy of each made
   every frame, and was compiled again when a table doubled. The count of bindings is as it was: 22 buffers and
   acceleration structures a stage natively, 28 of Metal's 29 with the translucency pass (29 with the loop guard's).
+  (`finish`'s records are the kernel's 23rd; the translucency pass, which does not read them, binds group 1
+  without, and stays at 29.)
   (Hardware traversal no longer binds software traversal's trees, a placeholder there; the light tiles' lists took
   the binding.)
+
+## The scene's triangles
+
+Vertices and indices, one layout for hardware and software traversal (`renderer/src/indexed.rs`):
+- **Vertices.** `vertices` (binding 1): a record of 48 bytes a vertex, (position, u), (normal, v), (tangent, hand;
+  a hand of 0: none). The BLASes are built from this buffer too (stride 48).
+- **Triangles.** Three indices each, a section of `words` (`Stream::Indices`): what a hit reads, and the BLASes'
+  index buffer. A mesh's indices count from the mesh's first vertex, which its instances' records carry
+  (`info.z`); a world-space triangle's count from 0.
+- **A mesh's triangle has nothing else of its own.** Which section of its mesh it is in, its hit says (`Hit.part`):
+  the geometry of the BLAS it was hit in, or under software traversal its tree's leaf. Its instance's row for
+  the section has the material and where the section's triangles and emitters start; its instance's record has
+  its object and whether its mesh deforms (`INST_DEFORMS`). A light sample is told its emitter's section by the
+  light list's record (64 bytes). The record a pixel is left to `finish` by has 16 bits for it (`MESH_SECTIONS`).
+- **Rows** (`Stream::Triangles`, four words). A triangle no instance places (a light's card, a particle's, a
+  flattened scene's) has one: its material, its object, its flags, its emitter + 1. They are all the GPU holds: the
+  world-space triangles', then the translucent particles'.
+- **Software traversal's leaves** (`leaves`, binding 2; `indexed::Leaf`). A tree keeps its triangles itself, as an
+  acceleration structure does: 48 bytes each, in the triangles' order, (v0, id), (v1 - v0, id), (v2 - v0, -). A
+  candidate's test reads nothing else. The ids: a world-space triangle's flags; a mesh's section, and its index in
+  the section (a tree has a mesh's triangles in its own order). Written at the build and where an edit places a
+  mesh; after the skinning pass a pass takes a posed mesh's again from its vertices (`leaf_gather.wgsl`).
+- **A hit reads** its triangle's indices and its three vertices' records (`tri_data(triangle, instance, part)`).
+- **What shares.** Corners equal bit for bit in position, normal, UV and tangent are one vertex: the still
+  world-space triangles among themselves, each mesh within itself, a skinned mesh by its model's corners. Triangles
+  the CPU or a pass writes whole (those that move in world space, particles) keep three vertices each.
+- **Tangents.** A vertex's own: the tangent at a hit is its triangle's three vertices' there, the hand its first
+  vertex's, placed by its instance (`hit_tangent`; read only where a frame is asked, by a normal map or a
+  function). A model's file gives them; a primitive of a file that has UVs and no tangents has them made where it
+  is loaded, a corner each, by the algorithm normal maps are baked against (`tangents.rs`, MikkTSpace; a vertex
+  whose corners come out apart, at a mirrored texture's seam, is a vertex for each). Geometry that is no file's and
+  has no tangents (a scene's own geometries, a light's card) has its frame made where it is hit, from its
+  triangle's edges, its UVs and its first normal.
+- **Motion.** `prev_verts` (binding 6): the vertices that move as they were the previous frame, whole records (a
+  copy on the GPU has no stride; the kernel reads their positions): the moving world-space triangles' first, then
+  the deforming meshes', each where its record says (`n2.w`).
+- **Edits.** A mesh an edit places takes a run of triangles and a run of vertices (`EditState::tris`, `verts`);
+  both rooms grow by a copy on the GPU. A mesh changed in place keeps its run where the new vertices fit.
+- **Bytes.** A triangle was 144 bytes for the kernel (48 its vertices, 96 its attributes) and 36 more as the BLAS's
+  input; it is its three indices, 12, and its share of the vertices' 48 each. Vertices a triangle as measured:
+  Tokyo 1.17, Zero Day 1.03, a crowd of skinned walkers 0.98, small scenes of smooth models 0.5 to 0.7, a voxel
+  level's meshes 1.88 (a face's four corners are no other face's). With the BLASes, on the GPU: Tokyo 6.4 GB ->
+  3.9, Zero Day 1.6 -> 0.95.
+- The build still flattens a file's indexed geometry and finds the sharing again (1.2 s on Tokyo's 23 M
+  triangles): carrying a file's indices through is a later step.
+- Under hardware traversal the kernel binds one buffer fewer than it did (a triangle's attributes were a second
+  one): the translucency pass's pipeline, which was at Metal's 29 buffers a stage, is at 28. Under software
+  traversal the leaves take that place: a browser's merged layout uses all eight of its storage buffers, as it did.
 
 ## Random numbers
 
@@ -1371,6 +1711,13 @@ cache's voxels, and later segments meet homogeneous media alone; depth of field 
 particles are lit from the cache's voxels; past a camera hit's own decisions the sampler is a hash, not Sobol
 (variance only).
 
+Where a path ends in the cache, `main` takes only what a warm voxel holds. The pixels with more to trace there (a
+training path, a cold voxel's estimate, a reflection hit's lights) leave a record of 96 bytes, and a second pass
+of the kernel, `finish`, traces them after each sample and adds their light to the pixel, one invocation a record.
+They are few and scattered: traced in `main` they held their SIMD groups, and their code cost every pixel (the
+trace 9 to 15 % faster without, Kabukichō 7). The records' buffer follows the traced size. The layout as written
+only; the merged one ends its paths in `main`.
+
 The radiance cache is held to numbers by the `cache/*` tests (a bounce off a lit floor, the same off a coated one
 and with the floor on a voxel face, two bounces in a view's first frame, a lit ground seen in a mirror, a furnace
 box, a corner): within 2 % of the offline or analytic value. A lookup whose voxel has too few samples reads the
@@ -1383,6 +1730,204 @@ none of them it traces its light there. Two limits are known and held by tests s
 - The cache holds no directions: it takes a mirror for a diffuse reflector of what falls on it (the ground before a
   sunlit mirror wall 5 % bright), and a surface seen in a reflection takes the sky's light from it, unshadowed
   below a voxel's size.
+
+## Live rendering settings
+
+The native `play` and `live` commands, `serve` live jobs and the browser take four settings, one for each gap
+between what a frame affords and what is shown (renderer/src/live/rendering.rs):
+
+| setting | the gap | ThreeRT's own | vendor technology it maps |
+|---|---|---|---|
+| `quality` | rays: the render resolution every later stage works from | dynamic resolution | (a budget, not a technique) |
+| `reconstruction` | noise, then pixels | denoiser + temporal upscaler | DLSS SR / RR, MetalFX, FSR, XeSS |
+| `frameGeneration` | frames shown per frame rendered | none | DLSS FG, FSR FG, XeSS FG, MetalFX frame interpolation (none integrated yet) |
+| `latency` | input to photon | one frame queued instead of two | Reflex, Anti-Lag 2, XeLL |
+
+Each is a request: the renderer runs what the device supports, and the status says what ran and why not the rest
+(nothing falls back silently). Neural techniques are not a setting of their own: a neural denoiser or upscaler is a
+reconstruction method, a neural radiance cache would be a lighting option, neural texture compression an asset format.
+
+```sh
+node tools/bundle-game.ts scenes/neon-reflections.ts
+renderer/target/release/threert-render play out/bundles/neon-reflections.js \
+  --quality performance --reconstruction metalfx-denoised,metalfx,builtin --latency on
+```
+
+### Reconstruction: two contracts
+
+A path tracer's frame needs two jobs before post: remove the samples' noise, then bring the image to the output size
+from the history of earlier frames. Vendor technology takes over the second job or both, so there are two kinds of
+provider, which read different signals:
+
+- an **upscaler** (`UpscaleProvider`) reads ThreeRT's *denoised* HDR image, depth, motion, a reactive mask and the
+  jitter, and replaces the upscaling;
+- a **joint denoiser** (`JointProvider`) reads the *noisy* traced lighting and the surface guides it needs to tell
+  lighting from texture (diffuse and specular albedo, normal, roughness, specular hit distance, an overlay of what has
+  no noise to remove), and replaces both. ThreeRT's denoiser does not run.
+
+| `--reconstruction` | denoise | upscale |
+|---|---|---|
+| `builtin` (default) | ThreeRT | ThreeRT (temporal) |
+| `fsr` | ThreeRT | AMD FidelityFX Super Resolution **1** (spatial EASU + RCAS; also on WebGPU) |
+| `metalfx` | ThreeRT | Apple's temporal scaler (macOS 13+, iOS 16+) |
+| `dlss` | ThreeRT | NVIDIA DLSS Super Resolution; DLAA at scale 1 (x86-64 Windows/Linux, RTX on Vulkan, feature `dlss`) |
+| `metalfx-denoised` | Apple's temporal denoised scaler: both (macOS 26+ on Apple silicon, iOS 26+) | |
+| `dlss-rr` | NVIDIA DLSS Ray Reconstruction: both (as `dlss`) | |
+| `off` | none | none: each frame's samples as traced, without history (the joint denoisers' input; for comparison) |
+| `custom:<id>` | a provider an embedding host registered, of either kind | |
+| `auto` | the best this device runs: `metalfx-denoised`, `metalfx` on a Mac or an iPhone; `dlss-rr`, `dlss` with DLSS; else `builtin` | |
+
+A list (`dlss-rr,dlss,fsr`) is an order of preference; `builtin` ends every list. `quality` presets are the vendors'
+ratios exactly (`ultra-performance` is a third: 640 pixels across 1080p, the smallest input DLSS takes, where a typed
+`--scale 0.333` gives 639 and DLSS reports itself unsupported). Diagnostic views use `builtin`. A provider that
+fails while encoding a frame falls back to `builtin` from that frame on.
+
+A provider says which render scales it takes (`scale_range`: MetalFX scales its output up to 3x the input, so a third
+and up; DLSS from its modes' input ranges). Under dynamic resolution (`quality: auto`) the governor does not go below
+the range of the method that runs, nor below that of the first method asked for that did not run for the scale alone:
+it goes up to it, and from there the method runs. (A 2560 x 1440 view that dynamic resolution held at a quarter never
+ran MetalFX before.)
+
+### TypeScript
+
+```ts
+import { rendering, type RenderingStatus } from "@threert/scene";
+
+rendering.set({ quality: "performance", reconstruction: ["metalfx-denoised", "dlss-rr", "builtin"], latency: "auto" });
+const status: RenderingStatus | undefined = rendering.status();
+// status.reconstruction: { requested, active, denoise, upscale, fallback, skipped: [{ method, reason, detail }] }
+```
+
+`set` changes the settings it is given, from the next frame; it returns `true` when a renderer binding took the
+request (not a support check) and throws a `TypeError` for an unknown setting or value. `status()` is the last frame's:
+for each setting what was requested and what ran; for reconstruction also who denoised and who upscaled, and each
+method tried before the one that ran with its reason (`unavailable`: not in this build or platform; `unsupported`: the
+device, OS or size; `provider-error`; `diagnostic-view`) and a sentence of detail. `fallback` is the first method's
+reason (`null` when it ran, or for `auto`). These are device-local view settings, not scene state, and are not
+replicated. A runtime without the live renderer binding returns `false` from `set` and `undefined` from `status`.
+
+### NVIDIA DLSS setup
+
+Install [NVIDIA DLSS SDK 310.9.1](https://github.com/NVIDIA/DLSS/tree/v310.9.1), the Vulkan SDK, and Clang
+(including libclang for bindgen). Set `DLSS_SDK` and `VULKAN_SDK` to their SDK directories, then build:
+
+```sh
+cargo build --release --locked --manifest-path renderer/Cargo.toml --features dlss
+WGPU_BACKEND=vulkan THREERT_DLSS=1 renderer/target/release/threert-render \
+  play out/bundles/neon-reflections.js --quality performance --reconstruction dlss-rr,dlss
+```
+
+NVIDIA's matching runtime libraries (`nvngx_dlss`, and `nvngx_dlssd` for Ray Reconstruction) must be discoverable.
+For distribution, follow the
+[DLSS wrapper's deployment instructions](https://github.com/bevyengine/dlss_wgpu/tree/b35069de8640bfae383e65a46b7d16058b2994d2#distributing-your-app).
+The engine does not bundle NVIDIA's SDK or runtime.
+
+### Apple MetalFX
+
+The temporal scaler requires a supporting Metal device and macOS 13 or iOS 16 or later. Build with the macOS / iOS 26
+SDK or newer to include the denoised scaler, which also requires macOS 26 or iOS 26 at runtime (an iPhone 17 Pro Max
+runs both). The framework is loaded at run time, so one binary runs on systems without it. A plain temporal scaler
+can keep its history across dynamic resolution changes inside its supported range (its inputs are textures of the
+output's size); the denoised scaler starts a new history when input dimensions change.
+
+In the scene viewer, press `M` to switch between `builtin` and `auto` (on a Mac, MetalFX's joint denoiser) and `N`
+to step through every method this platform has. The title bar shows the method that ran and the render scale. Games
+that handle keyboard input keep their key bindings. `tools/denoise-demo/live.sh` opens Kaleido (a mirror hall lit
+only by hundreds of glowing orbs) for this comparison; `tools/denoise-demo/record.ts` and `video.ts` record it.
+
+For smooth mirrors and glass, secondary ray queries put the reflected and transmitted surfaces in the joint
+denoiser's guides (pathtrace.wgsl `surface_guides`). Directly visible sky and emission-dominated pixels are the
+overlay, with the bypass mask 1 on them. Exposure, bloom, depth of field and motion blur process the reconstructed
+HDR image on the GPU.
+
+### Native controls and custom providers
+
+Set `THREERT_RECONSTRUCTION` for a native process that embeds `LiveCore`, call `LiveCore::set_rendering` (or
+`set_reconstruction`), or send `{"cmd":"rendering","reconstruction":["metalfx-denoised","builtin"],"quality":"balanced"}`
+to a running `live` or `play` session (`{"cmd":"reconstruction","mode":"fsr"}` is the same with one setting). Launch
+flags (`--quality`, `--reconstruction`, `--frame-generation`, `--latency`) set the initial values. Viewer `stats` have
+the whole status under `rendering`, and `reconstruction`, `requested_reconstruction` and `reconstruction_fallback`;
+the `live --frame-log` records the method each frame ran and its fallback. Live `serve` jobs accept `reconstruction`
+(a method, a list or `auto`) and a numeric `scale`.
+
+An embedding host implements `UpscaleProvider` or `JointProvider` (renderer/src/live/reconstruction.rs documents
+every texture: format, units, conventions) and calls `LiveCore::register_upscaler("custom:my-scaler", provider)` or
+`register_joint_denoiser`, then selects it from Rust or TypeScript. IDs after `custom:` are 1–48 lowercase ASCII
+letters, digits, or hyphens. `prepare` answers `Prepared::Ready` (with the input textures' size, which may exceed the
+input for a provider that takes a varying input) or `Prepared::Unsupported(reason)`, which goes to the status. The
+provider writes full-output HDR on the live GPU, on the encoder or in a native command buffer it returns; the engine
+still owns packing the signals, post-processing and presentation.
+
+Run `node tools/bench-metalfx.ts` after building the release binary to compare the three MetalFX/built-in paths
+against 256-spp offline references for a still camera and a lateral move. It saves the frames, frame timings and
+image metrics under `out/metalfx/` and checks which implementation actually ran.
+Use `--scene glass` for the refraction workbench or `--scene cornell` for the Cornell box.
+On an Apple M1 running macOS 27.2.1, the glass camera move scored 0.909 SSIM with the built-in path,
+0.944 with MetalFX temporal and 0.940 with joint denoising. At the same 320 × 180 input and 640 × 360
+output, median GPU frame times with the camera held still were 9.69, 9.78 and 10.22 ms respectively.
+On the Cornell box the built-in path scored highest for both camera poses.
+
+## Moving objects in the live view
+
+The live view's histories (the irradiance and specular ones on the traced grid, the upscaler's colour on the output
+grid) follow a moving object by its motion vectors (`motion_in`), and four rules keep it from leaving copies of
+itself where it was (`live.wgsl`; measured by `node tools/bench-object-ghosting.ts`: a dragged device, a light thrown
+over a polished floor, a character running over a sunlit floor, the camera still):
+
+- **What it uncovers starts again.** The g-buffer says whether a surface is a moving object's that crossed a traced
+  sample this frame (`GB.moves`; one that moved less, a leaf in the wind or a far walker, is left to a still edge's
+  rules: counted as moving, wind-blown foliage flickered 4.5 times as much and a crowd twice). A sample
+  whose own surface stands still and lies behind the moving surface that was nearest there a frame ago is uncovered,
+  and its history goes (`judge`; in every output pixel its verdict reaches, `upscale`, where what went was moving: a
+  still scene's jitter finds a gone edge now and then, and dropping it whole there flickered). Before, the band behind a
+  moving edge kept a line of the object's colour a frame (the nearest of the nine samples there is still the object,
+  so the band reprojected with it, and the clamp in motion kept its colour).
+- **Locks go with it.** A thin feature's lock on a moving surface is not carried by the two cameras (`lock_carry`),
+  and a carried lock that lands on a moving surface is dropped (`track`): a moving screen's text left copies of
+  itself for a jitter sequence.
+- **Reflections follow what moves past them.** While the lighting is live (a moving object sets it), a still
+  surface's specular history is clipped to this frame's neighbourhood (`SPEC_CLIP` deviations plus `SPEC_CLIP_REL`
+  of its luminance): a light carried past a polished floor left its reflection along its path.
+- **Where the light changed, the history waits for it.** While the lighting is live, a traced sample whose light
+  jumped since the previous frame (by `LIGHT_CHANGE` of itself and `LIGHT_FLICKER` times its own flicker: a shadow's
+  edge passed, a lamp's pool moved) starts its flicker count again (`track`), and the output pixels around it hold
+  their history to this frame's samples until it has settled (`LIGHT_SETTLE` frames, `upscale`). The floor under a
+  running character stands still, so nothing else clamped it: its sun shadow left a line of its edge a frame, rippling
+  behind it.
+
+![A character running over a sunlit floor, before (left) and after (right): the ripples its shadow's edge left behind](images/shadow-ghosting.jpg)
+
+![Before and after: a dragged device's edge lines and text copies, a thrown light's trail and its streak in the floor's reflection](images/object-ghosting.jpg)
+
+Not covered: the specular clip also cuts a right history where the lighting is live all the time (a crowd's
+reflections are darker than offline's). A short-term specular history to clip against is no answer: at one sample
+a pixel it is noise (tried and dropped: `dtemporal`'s anti-lag note). The clip is transitional: it goes when a
+change in the lighting can be told from noise (last frame's path traced again with its random numbers). A fast
+light's effect on diffuse lighting (a shadow it casts) still lags by a few frames (the diffuse
+history and its anti-lag), and the band just uncovered starts from this frame's samples (more aliased for a frame or
+two, as any disocclusion).
+
+## Glass
+
+A transmissive material (`transmission`, `ior`, `roughness`) is a rough dielectric interface, Walter et al. 2007
+with GGX (pathtrace.wgsl "The dielectric"): light reflects off a microfacet or refracts through it by the exact
+Fresnel reflectance there. Reflection and transmission both have a value and a density, so lights are sampled
+through frosted glass, on both sides of it, and weighed against the BSDF's rays. Total internal reflection is
+reflection and is not tinted.
+
+- Below roughness 0.05 the transmission is a delta lobe: what lies behind a clear pane is seen straight (the path
+  loop's `through`: no clamp, the live specular signal). The reflection keeps its microfacet lobe.
+- Single scattering loses energy as the roughness grows (leaving glass of roughness 0.6 at 45 degrees: R + T =
+  0.74). With energy compensation the interface is scaled by 1 / (R + T) from a table (Turquin 2019, as Cycles:
+  16 x 16 x 8 x 2 values over the cosine, the roughness, the index and the side; lib.rs `glass_energy_lut`, a
+  section of the scene's tables).
+- Shadow rays cross glass straight, weighed by a share of their own (`glass_at`), as before.
+- Not yet: thin walls (a single sheet refracts as a solid's face), absorption by distance, the radiance scaling
+  by the indices' ratio squared (it cancels over a closed solid; Cycles and glTF's formula leave it out too).
+
+Held by `glass/*`: one interface in a white sky from either side against a quadrature over microfacet normals
+done apart, with compensation 1, a lamp seen through frosted glass against the BTDF's integral, a frosted sphere
+in a furnace.
 
 ## What the kernel trusts
 
@@ -1434,15 +1979,34 @@ layout and its kernels' source are what they were (`gpu.rs` `the_options_default
 on scenes that are not all at hand. What was measured again on this source, on the same handheld, is under "Checked
 on the device", and differs where it says so.
 
-- **Uniform tables** (`GpuOptions::uniform_tables`, `THREERT_UNIFORM_TABLES=1|0`; default on Android; never with the
-  merged layout). The driver gave the kernel other buffers' contents for four of its read-only storage buffers, each
+- **The tables read whole** (`GpuOptions::table_views`, `THREERT_TABLE_VIEWS=1|0`; default 0 on Android, 1
+  elsewhere; kernel flag `whole_tables`). Since 2026-11-15 (#89) the kernel's seven typed tables are views of their
+  sections of the tables' buffer, each a binding of its own (12 to 18, merged.rs `TABLE_VIEWS`). The Adreno 740
+  driver read the storage views wrong (checked on the device, 2026-11-16, ThreeRT for Android 0.5.0 at `3d2297e`):
+  - `materials` (binding 12): every scene in a blown-out colour cast (OpenStrikeRT's Foundry pink, Range green, the
+    weapon and the soldiers one colour). Reading the materials alone from the buffer whole drew right.
+  - `emitters` (14): with the materials read whole, the first frame after an emissive object's power changed in a
+    scene with no other emitters on (a muzzle flash in Range, or in an imported map: what a map switch in practice
+    with bots leads to) did not end: `kgsl … gpu timeout`, the host thread blocked for good. Copied into a buffer of
+    its own at offset 0 each frame, the emitters' table hung the same: the binding, not its sharing a buffer with
+    `tables` or its offset. Read whole: no hang.
+  - Without the views the kernel reads all seven from `tables` (binding 4) by the offsets in the parameters
+    (`Params::table_first`), as the merged layout does (pathtrace.wgsl `@if(merged || whole_tables)`), and there are
+    no uniform tables (below), so none of their bounds either. On the device the frame costs what it does with the
+    uniform copies (Foundry at 249 × 140, one bounce: 52 ms read whole, 51 ms with the uniform copies and the other
+    three read whole). `THREERT_TABLE_VIEWS=1` on the device brings back the views (and the uniform copies), for A/B.
+  - Elsewhere the views stay; `THREERT_TABLE_VIEWS=0` reads the tables whole on any device, to the same image bit
+    for bit (`live::instanced_tests::the_tables_read_whole_render_what_the_views_do`, offline and live after a power
+    edit).
+- **Uniform tables** (`GpuOptions::uniform_tables`, `THREERT_UNIFORM_TABLES=1|0`; default on Android with the views,
+  `THREERT_TABLE_VIEWS=1`; never with the merged layout or the tables read whole). The driver gave the kernel other buffers' contents for four of its read-only storage buffers, each
   a binding of its own then: `tex_info` (binding 14), `objects` (15), `instances` (17), `media` (18), all numbered
   after the acceleration structure (13). As uniform buffers they read right.
   - Since 2026-11-15 the four are views of their sections of the tables' buffer ("The scene's tables"), still at
-    bindings of their own (15 to 18), and the acceleration structure is the group's last binding (19). **Whether
-    the driver reads them right there is not known: no device has run it.** Until one has, Android keeps the
-    uniform copies; `THREERT_UNIFORM_TABLES=0` on the device is the run that decides (if it draws right, the copies
-    and their bounds can go).
+    bindings of their own (15 to 18), and the acceleration structure is the group's last binding (19). The device
+    did not read those views right either (2026-11-16, `THREERT_TABLE_VIEWS=1 THREERT_UNIFORM_TABLES=0`: Range all
+    white), and with the uniform copies the other three views were still wrong (above): Android now reads the
+    tables whole and has no uniform copies; they stay for `THREERT_TABLE_VIEWS=1`.
   - The kernel's source has them under `@if(uniform_tables)` (pathtrace.wgsl): four sized uniform arrays at
     bindings 15 to 18 (merged.rs `UNIFORM_TABLES`; their lengths WESL constants), and their accessors hold every
     index to the array (`min(i, last)`), so nothing is read outside a uniform buffer.
@@ -1458,10 +2022,10 @@ on the device", and differs where it says so.
 
   | buffer | size | decision |
   |---|---|---|
-  | `tables` (4) and its views `materials` (12), `lights` (13), `emitters` (14) | megabytes in a lit scene | storage: the device drew right with materials, lights and emitters as storage buffers (bindings 4 to 6 then) |
+  | `tables` (4) and, with the views, `materials` (12), `lights` (13), `emitters` (14) | megabytes in a lit scene | storage: the device drew right with materials, lights and emitters as storage buffers of their own (bindings 4 to 6, before #89) and reads them right from `tables` whole; not as the views (above) |
   | `words` (5): the environment's CDF, the procedural geometry's data, vertex colours | megabytes | storage; the environment's light sampling is off on Android, below |
-  | `tri_verts` (1), `attrs` (2), `nodes` (3), `prev_verts` (6) | per triangle | storage (megabytes) |
-  | `accum` (11), group 1 (radiance cache, the trace's outputs, the loop guard's count) | per pixel, per cache entry | written by the kernel: cannot be uniform |
+  | `vertices` (1), `leaves` (2), `nodes` (3), `prev_verts` (6) | per vertex, per triangle, per node | storage (megabytes) |
+  | `accum` (11), group 1 (radiance cache, the trace's outputs, `finish`'s records, the loop guard's count) | per pixel, per cache entry | written by the kernel: cannot be uniform |
   | group 2, the translucency pass (`timg`, `vpts`, `vcount`, `tlow`) | per pixel | written by the pass |
   | the particle passes' `systems`, `spawns`, `grid`; the grid programs' `srcs` | small, read-only | storage: other shaders, of eleven bindings at most and no acceleration structure; not known to misread (the fix on the device left them alone) |
   | the live passes (`live.wgsl`: 25 storage buffers, `ae_bins` and `ae_state` among them; at most eight a pass) | per pixel; two tiny | storage: written by the passes; the device showed their output right |
@@ -1478,9 +2042,11 @@ on the device", and differs where it says so.
   | `THREERT_CUTOUT_LITE` | Android: 1 | hardware traversal: 1 = shadow and any-hit rays take alpha cutouts as opaque; 2 = camera rays also step through at most 4 cutouts | a map with cutout foliage: the trace 235 ms, 41 ms without cutouts |
   | `THREERT_LAST_DIRECT` | Android: 1 | the path's last vertex (at the bounce limit, past the camera hit) takes its direct light | with one bounce and no radiance cache (which cost 30-60 % more trace) sunlit ground lit nothing and interiors were black |
   | `THREERT_LIGHT_PICK` | 0 | past the camera hit, the directional lights and one of the other kinds (local lights, emitters, the sky), weighted by their number: two shadow rays a vertex instead of four; unbiased, noisier | a handheld's host sets it with `THREERT_LAST_DIRECT` |
+  | `THREERT_LIGHT_TILES` | Android: 0 | a scene with more than `RIS_EXACT` shadow-casting local lights has no light tiles (`F_LISTS`, #87): its lights are resampled unguided, as before the tiles (not a flag of the source: the scene's feature is left off, gpu.rs `light_tiles_on`) | OpenStrikeRT's Foundry, 249 × 140, one bounce, the tables read whole: 48 ms with the tiles, 31 ms without (30 fps, the 0.4 clients' rate); `THREERT_LIGHT_PICK=1` instead: 38 ms |
 
-  `THREERT_CHECKED=1` (or a mask: 2 bounds, 4 loop bounding, 8 ray-query initialization) compiles the kernel with
-  naga's runtime checks, to tell a driver's fault from the kernel's.
+  The kernel is compiled with wgpu's loop bounding and no other runtime check (ROADMAP § 1a, "The kernel's loops
+  are bounded"). `THREERT_CHECKED` = 0 (none), 1 (every check) or a mask (2 bounds, 4 loop bounding, 8 ray-query
+  initialization) tells a driver's fault from the kernel's.
 - **The pipeline cache** (`GpuOptions::pipeline_cache`, `THREERT_PIPELINE_CACHE=<directory>`; `pipeline_cache.rs`).
   The driver compiles a kernel variant for about ten seconds. With a directory given, the device has a wgpu
   `PipelineCache` (Vulkan only), every compute pipeline of the engine and the raster pass's are made with it, and it
@@ -1580,45 +2146,33 @@ source under ThreeRT for Android 0.4.0, which sets `THREERT_PIPELINE_CACHE` and 
 
 ## Correctness
 
+Checked when the runtime landed, on the reference scenes and on Kabukichō, the UE-port street demo of the time (since
+removed from the repository).
+
 * `threert-render edit-check` builds the GPU tables both ways for a list of events: edited in place, and built fresh
   from the edited world. For Kabukichō (three moods, closing time, the gate, rain) materials, lights, object power, the
-  emitter distribution and wetness / rain are bit-identical, and none of the edits is structural.
-* Every reference scene and Kabukichō render from their bundles like they did from the old IR packages (same
+  emitter distribution and wetness / rain were bit-identical, and none of the edits was structural.
+* Every reference scene and Kabukichō rendered from their bundles like they did from the old IR packages (same
   triangle, light, emitter and texture counts; at 64 spp mean ΔE 0.0 (material-grid, bit-identical) to 0.99, and
-  1.43 for Kabukichō, where the error map is sampling noise only). The six UE cameras (`tools/kabukicho/views.py`,
-  now `render --camera`) frame identically.
-* `tools/kabukicho/verify-port.py` (against `node tools/kabukicho/dump-street.ts`) still matches every UE actor
-  (2,158 shapes, 0.0000 m).
+  1.43 for Kabukichō, where the error map is sampling noise only). The six UE cameras (`render --camera`) framed
+  identically.
+* The port still matched every UE actor (2,158 shapes, 0.0000 m).
 * Playground UI test (`threert-playground --uitest`): 14/14, including Play / Stop in Light Room.
 * Cloud: `node cloud/test/e2e-local.ts` and `play-smoke.ts` pass (rooms hold state only; nodes run the game code
   against the room's state; a cold job fetched code, runtime and the missing asset, then rendered; a warm event →
   PNG takes 124 ms with 0.5 ms of script).
-* Live temporal bench (`tools/bench-temporal.ts --scale 1`, same converged references as PR #9): camera motion
-  unchanged (ΔE 5.29–6.25 vs 5.21–6.38); 4 s after closing time ΔE 4.00 vs 3.90. The earlier closing shots differ
-  by design: each sign group now stays lit until its staggered delay and then flickers off, like the UE Director,
-  where before the handler switched every group off at once.
+* Live temporal bench (`tools/bench-temporal.ts --scale 1` on Kabukichō, same converged references as PR #9):
+  camera motion unchanged (ΔE 5.29–6.25 vs 5.21–6.38); 4 s after closing time ΔE 4.00 vs 3.90. The earlier closing
+  shots differed by design: each sign group then stayed lit until its staggered delay and flickered off, like the UE
+  Director, where before the handler switched every group off at once.
 
-## Kabukichō: the UE Director as a frame script
-
-The UE session's `AKabukichoDirector` (C++) ticks every frame. Rain eases at 0.6 / s. Streets get wet at 0.35 / s
-and dry at 0.06 / s. Fog eases toward the mood. Power groups that change state flicker like failing neon for
-0.35–1.1 s (on) or 0.08–0.3 s (off), and switch with staggered delays when many change at once: moods, the 3 AM
-closing, the power cut. `games/kabukicho/kabukicho.game.ts` ports it line for line:
-
-- **Handlers** commit the Director's targets as game state: `rain` (R), `mood` (M), `blackout` (B), `lights` (L),
-  `click` (a sign's power group, the gate), `viewpoint` (V).
-- **`frame(f)`** makes the street follow them: group powers, gate emission, wetness / rain / fog, the camera marker;
-  settled at once when `f.snap`.
-
-![Kabukichō in the node runtime: start · power cut 0.15 s · 1.3 s · restoring 4.8 s](images/runtime-blackout.jpg)
-
-## Measurements (Apple M5, 1280×720, Kabukichō: 4.0 M triangles, 2,665 objects, 147 lights)
+## Measurements (Apple M5, 1280×720, on Kabukichō: 4.0 M triangles, 2,665 objects, 147 lights)
 
 | | IR patches (PR #8) | no IR |
 |---|---:|---:|
 | Scene setup in QuickJS | 345–381 ms (IR + generated GLBs / PNGs) | 255–266 ms (engine calls, no encoding) |
 | Gameplay event → scene updated | patch 0.01–4.8 ms | handler + frame(0) + sync 6–13 ms; commit in place 0.00–0.45 ms |
-| Frame script (Director port) + sync + commit, per frame | 0.12–1.1 ms (presentation writes) | 0.4–0.8 ms average, 2.1 ms max (7–8 ms before change tracking) |
+| Frame script (a port of the UE level's C++ Director) + sync + commit, per frame | 0.12–1.1 ms (presentation writes) | 0.4–0.8 ms average, 2.1 ms max (7–8 ms before change tracking) |
 | Generated-texture scene setup (glb-asset) | — | 43 ms (732 ms when DataTexture still encoded PNG in JS) |
 | One-shot render of another room state (`serve`, warm, 640×360, 16 spp) | 0.88 s | 1.23 s (3.6 ms script) |
 | Live open (playground) | 5.2 s | 5.8 s (setup 0.26 s, build 3.1 s, texture pages 1.3 s, upload 1.7 s) |
@@ -1633,7 +2187,7 @@ geometry in JS), where the runtime could move to V8 (deno_core) behind the same 
    are structural today: fine for small scenes or occasional changes, not every frame on a big street.
 2. **Warm room sessions on nodes.** `serve` keeps runtimes per room already; a node could also keep the GPU scene of a
    room between jobs and apply state changes in place, as the live view does.
-3. **Kernel variant warm-up.** An edit that enables a kernel feature (e.g. a dry street getting wet) compiles that
-   variant on first use; pre-compile likely variants in the background.
+3. **Images decoded beside the frames.** A texture or a model that comes in place is decoded on the frame's
+   thread (five 2048 x 2048 images: 0.2 s); the object could wait for a worker instead, as it waits for its kernel.
 4. **UE references for the simple scenes** came from the removed IR adapter (cached in out/ue). New ones need either
    the scenes rebuilt in UE by hand or an engine-API binding on the UE side (the scene code driving UE actors).

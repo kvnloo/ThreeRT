@@ -91,15 +91,14 @@ pub(super) struct Raster {
 }
 
 pub(super) const RASTER_WGSL: &str = r#"
-struct R { pos: vec4<f32>, fwd: vec4<f32>, right: vec4<f32>, up: vec4<f32>, jit: vec4<f32> }; // pos.w = tan(fov/2), fwd.w = aspect, jit = ndc offset xy, near
+struct R { pos: vec4<f32>, fwd: vec4<f32>, right: vec4<f32>, up: vec4<f32>, jit: vec4<f32> }; // pos.w = tan(fov/2), fwd.w = aspect, right.w = the indices' first word, jit = ndc offset xy, near
 @group(0) @binding(0) var<uniform> r: R;
-@group(0) @binding(1) var<storage, read> tri_verts: array<vec4<f32>>; // per triangle: a, b - a, c - a (kernel layout)
+@group(0) @binding(1) var<storage, read> vertices: array<vec4<f32>>; // a vertex: three rows, the first (position, u) (kernel layout)
+@group(0) @binding(2) var<storage, read> words: array<u32>; // the triangles' indices, three a triangle
 struct V { @builtin(position) p: vec4<f32>, @location(0) @interpolate(flat) id: u32 };
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> V {
     let ti = vi / 3u;
-    let k = vi % 3u;
-    var p = tri_verts[ti * 3u].xyz;
-    if (k != 0u) { p += tri_verts[ti * 3u + k].xyz; }
+    let p = vertices[words[bitcast<u32>(r.right.w) + vi] * 3u].xyz;
     let d = p - r.pos.xyz;
     let z = dot(d, r.fwd.xyz);
     // Reversed infinite depth: near / z.
@@ -117,6 +116,7 @@ impl Raster {
             entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
         let pl = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
@@ -142,13 +142,14 @@ impl Raster {
         Raster { pipeline, layout, uniform, vis, depth }
     }
 
-    /// Records the visibility pass for `tris` triangles at internal size (iw, ih), sampling at jitter (jx, jy).
+    /// Records the visibility pass for the scene's first `tris` triangles (their vertices; their indices in
+    /// the words' heap) at internal size (iw, ih), sampling at jitter (jx, jy).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record(&self, g: &gpu::Gpu, e: &mut wgpu::CommandEncoder, verts: &wgpu::Buffer, tris: u32, cam: &Camera, aspect: f32, (iw, ih): (u32, u32), (jx, jy): (f32, f32), timestamps: Option<wgpu::RenderPassTimestampWrites>) {
+    pub(super) fn record(&self, g: &gpu::Gpu, e: &mut wgpu::CommandEncoder, vertices: &wgpu::Buffer, words: &crate::heap::Heap<crate::heap::Stream>, tris: u32, cam: &Camera, aspect: f32, (iw, ih): (u32, u32), (jx, jy): (f32, f32), timestamps: Option<wgpu::RenderPassTimestampWrites>) {
         let u: [[f32; 4]; 5] = [
             [cam.pos.x, cam.pos.y, cam.pos.z, cam.tan_half_fov],
             [cam.fwd.x, cam.fwd.y, cam.fwd.z, aspect],
-            [cam.right.x, cam.right.y, cam.right.z, 0.0],
+            [cam.right.x, cam.right.y, cam.right.z, f32::from_bits((words.at(crate::heap::Stream::Indices) / 4) as u32)],
             [cam.up.x, cam.up.y, cam.up.z, 0.0],
             // Pixel centres sample at +0.5; shift the image so they sample at the jittered position instead.
             [2.0 * (0.5 - jx) / iw as f32, -2.0 * (0.5 - jy) / ih as f32, 0.01, 0.0],
@@ -157,7 +158,7 @@ impl Raster {
         let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: verts.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: vertices.as_entire_binding() }, wgpu::BindGroupEntry { binding: 2, resource: words.buffer.as_entire_binding() }],
         });
         let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("raster vis"),
@@ -201,6 +202,35 @@ pub(super) struct Profile {
 }
 
 impl LiveCore {
+    /// The kernel this frame runs. The scene's (`up.kernel`: an edit that brings a feature or a function changes it)
+    /// where what a frame asks of it is made; else the one the view has, while the scene's is made on another thread
+    /// (`Gpu::warm_kernel`): the frame does not wait for a compile, and what the new kernel draws (fog, a clear
+    /// coat, a function) comes when it is ready. A view's first kernel is its load's. In lockstep a frame is its
+    /// world's alone, and a browser has no other thread: there the frame makes its kernel itself.
+    fn choose_kernel(&mut self, guides: bool) {
+        let wanted = &self.sc.up.kernel;
+        let key = |k: &gpu::Kernel| (k.features, k.hash, k.approx);
+        if self.kernel.as_ref().is_some_and(|k| key(k) == key(wanted)) {
+            return;
+        }
+        // (What a frame asks: as the load makes them, and the guides and the translucency pass where it has them.)
+        let mut passes: Vec<&'static str> = vec![];
+        if !self.g.merged {
+            passes.push("finish");
+        }
+        if guides {
+            passes.push("surface_guides");
+        }
+        if wanted.features & gpu::F_MEDIA != 0 {
+            passes.extend(["media_train", "media_composite"]);
+        }
+        let translucent = self.sc.up.translucent.is_some();
+        if self.kernel.is_none() || self.fixed_dt.is_some() || cfg!(target_arch = "wasm32") || self.g.kernel_ready(wanted, &passes, translucent) {
+            self.kernel = Some(wanted.clone());
+        } else {
+            self.g.warm_kernel(wanted, &passes, translucent);
+        }
+    }
     /// Profile slots after the cache resolve that this scene writes: particle pass + BLAS rebuild (2; stateless or GPU
     /// particles), translucency + volume training (2 more).
     pub(super) fn profile_extra(&self) -> u32 {
@@ -214,8 +244,9 @@ impl LiveCore {
     }
 
     /// Light LOD: the emitter CDF weighted by distance to the camera (`emitter_lod`) and the emitter cull with its view
-    /// cone (`EmitterCull`), rebuilt when the camera is 15 m from where it was last built or has turned LIGHT_LOD_TURN
-    /// from that direction (the kernel's emitter pdfs read the same reference from the parameters).
+    /// cone (`EmitterCull`), rebuilt when the camera is 15 m from where it was last built, has turned LIGHT_LOD_TURN
+    /// from that direction, or sees another cone (its lens, the view's shape): the kernel's emitter pdfs read the same
+    /// reference from the parameters.
     pub(super) fn update_light_lod(&mut self) {
         let d0 = LIGHT_LOD_D0;
         let (w, h) = (self.w, self.h);
@@ -227,7 +258,10 @@ impl LiveCore {
         let r = glam::Vec3::new(b.light_lod[0], b.light_lod[1], b.light_lod[2]);
         let dir = glam::Vec3::new(b.lod_view[0], b.lod_view[1], b.lod_view[2]);
         let turned = b.emit_power[2] > 0.0 && dir.dot(self.cam.fwd) < LIGHT_LOD_TURN.to_radians().cos();
-        if b.light_lod[3] > 0.0 && r.distance(self.cam.pos) < 15.0 && !turned {
+        // The frustum's half-diagonal: tan = tan(fov / 2) x sqrt(1 + aspect^2).
+        let half = (self.cam.tan_half_fov * (1.0 + (w as f32 / h as f32).powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
+        let cone = half.min(std::f32::consts::PI).cos();
+        if b.light_lod[3] > 0.0 && r.distance(self.cam.pos) < 15.0 && !turned && b.lod_view[3] == cone {
             return;
         }
         b.light_lod = [self.cam.pos.x, self.cam.pos.y, self.cam.pos.z, d0];
@@ -235,14 +269,12 @@ impl LiveCore {
         let cull = if self.sc.up.kernel.approx & gpu::A_FAR_EMITTERS != 0 { EMITTER_CULL } else { 0.0 };
         b.emit_power[1] = cull;
         b.emit_power[2] = cull * EMITTER_CULL_VIEW;
-        // The frustum's half-diagonal: tan = tan(fov / 2) x sqrt(1 + aspect^2).
-        let half = (self.cam.tan_half_fov * (1.0 + (w as f32 / h as f32).powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
-        b.lod_view = [self.cam.fwd.x, self.cam.fwd.y, self.cam.fwd.z, half.min(std::f32::consts::PI).cos()];
+        b.lod_view = [self.cam.fwd.x, self.cam.fwd.y, self.cam.fwd.z, cone];
         // Power edits held back for the emitter worker land first (its job in flight was built for the old reference:
         // dropped), so the CDF built here has the powers the objects hold and the reference the kernel reads.
         self.land_powers_now();
         let (e, b) = (&self.sc.tables, &mut self.sc.base);
-        let (em, total, power) = crate::emitter_cdf(&e.emitter_tris, &e.materials, &e.objects, e.stride, b.light_lod, crate::EmitterCull::of(b));
+        let (em, total, power) = crate::emitter_cdf(&e.emitter_tris, &crate::emitter_order(&e.emitter_tris, e.light_tree.as_ref()), &e.materials, &e.objects, e.stride, b.light_lod, crate::EmitterCull::of(b));
         self.sc.up.heap.write(&self.g.queue, Table::Emitters, 0, bytemuck::cast_slice(&em));
         b.misc[1] = total;
         b.emit_power[0] = power;
@@ -252,8 +284,17 @@ impl LiveCore {
         // A dynamic sky's bake that finished since the last frame (time of day).
         self.take_sky();
         self.take_emitters();
+        // Settings a game or page requested since the last frame.
+        if let Some(r) = self.rendering_control.as_ref().and_then(|c| c.take()) { self.set_rendering(r); }
         let (w, h) = (self.w, self.h);
         let (iw, ih) = self.internal_size();
+        let size = ReconstructionSize { input: [iw, ih], output: [w, h], dynamic: self.dynamic_res };
+        self.reset |= self.reconstructor.prepare(&self.g, &self.targets, size, self.view_mode != 0);
+        let reconstruction = self.reconstructor.active;
+        self.ensure_deferred(iw as u64 * ih as u64);
+        if self.sc.up.translucent.is_some() {
+            self.targets.translucent_low(&self.g);
+        }
         let now = Instant::now();
         // Lockstep (benchmarks) renders at a fixed frame time, whatever the wall clock says.
         self.frame_dt = self.fixed_dt.unwrap_or_else(|| now.duration_since(self.last_frame).as_secs_f32());
@@ -262,8 +303,8 @@ impl LiveCore {
         self.update_light_lod();
         // A camera cut (a jump no camera makes in one frame: 2 m or 30 degrees) is not motion: no blur (UE: bCameraCut).
         let cut = (self.cam.pos - self.prev_cam.pos).length() > 2.0 || self.cam.fwd.dot(self.prev_cam.fwd) < 0.866;
-        // (Objects moved this frame: re-posed triangles or moved instances, e.g. walkers in a shared pose.)
-        let blur = !self.motion_blur_off && self.blur.0 > 0.0 && (moved || self.reposed || self.pose_reposed || self.inst_moved) && !cut;
+        // (Objects moved this frame: re-posed triangles or moved instances, e.g. a crowd's walkers.)
+        let blur = self.blur.0 > 0.0 && (moved || self.reposed || self.pose_reposed || self.inst_moved) && !cut;
         // Camera motion is reprojected exactly (disocclusions are rejected per pixel), so history survives motion;
         // the cap only bounds smearing of view-dependent shading (glossy reflections).
         // Diffuse lighting reprojects exactly with the camera; view-dependent specular is handled per pixel (temporal pass).
@@ -278,7 +319,7 @@ impl LiveCore {
         // At most two frames in flight: beyond that the CPU waits, so latency stays bounded when GPU-bound.
         // Wait for the oldest frame only (waiting for all work would leave the GPU idle while this frame records).
         let t_wait = Instant::now();
-        while self.inflight.len() >= 2 {
+        while self.inflight.len() >= self.frames_in_flight() {
             let oldest = self.inflight.pop_front().unwrap();
             let _ = g.device.poll(wgpu::PollType::Wait { submission_index: Some(oldest), timeout: None });
         }
@@ -304,7 +345,7 @@ impl LiveCore {
             Some(t) => {
                 let (latest, slot) = t.harvest(period);
                 if let Some((ms, frame, trace)) = latest {
-                    (self.gpu_ms, self.gpu_frame, self.gpu_trace_ms) = (ms, frame, trace);
+                    (self.gpu_ms, self.gpu_frame, self.gpu_trace_ms) = (ms + self.reconstructor.untimed_gpu_ms(), frame, trace);
                 }
                 if let Some(k) = slot {
                     t.frames[k] = self.frame;
@@ -324,9 +365,9 @@ impl LiveCore {
             self.prev_span = None;
         }
         self.reposed = false;
-        if let (false, Some(span)) = (self.pose_reposed, self.pose_span) {
-            self.keep_prev(span);
-            self.pose_span = None;
+        if !self.pose_reposed && !self.pose_spans.is_empty() {
+            let spans = std::mem::take(&mut self.pose_spans);
+            self.keep_prev_spans(&spans);
         }
         self.pose_reposed = false;
         // Likewise the instances the last update moved: their previous-frame rows become the current ones.
@@ -339,29 +380,41 @@ impl LiveCore {
             }
         }
         self.inst_moved = false;
+        self.choose_kernel(reconstruction.guides());
         let g = &self.g;
+        let kernel = self.kernel.as_ref().unwrap_or(&self.sc.up.kernel);
         let t_submit = Instant::now();
-        let pipeline = g.pipeline(&self.sc.up.kernel, true);
+        let pipeline = g.pipeline(kernel, true);
+        let guides = reconstruction.guides().then(|| g.kernel_pass(kernel, "surface_guides"));
         // (No media pass while every medium is hidden: a pool of idle fireballs costs the frame nothing.)
-        let media = self.sc.up.kernel.features & gpu::F_MEDIA != 0 && self.sc.up.media_hidden.borrow().iter().any(|h| !h);
-        let media_train = (media && self.cache.is_some()).then(|| g.media_pipeline(&self.sc.up.kernel, "media_train"));
-        let media_composite = media.then(|| g.media_pipeline(&self.sc.up.kernel, "media_composite"));
+        let media = kernel.features & gpu::F_MEDIA != 0 && self.sc.up.media_hidden.borrow().iter().any(|h| !h);
+        let media_train = (media && self.cache.is_some()).then(|| g.kernel_pass(kernel, "media_train"));
+        let media_composite = media.then(|| g.kernel_pass(kernel, "media_composite"));
+        // The pixels a sample's trace leaves at the radiance cache (pathtrace.wgsl `finish`).
+        let finish = self.targets.kernel.deferred.as_ref().filter(|_| self.cache.is_some()).map(|d| (g.kernel_pass(kernel, "finish"), d));
         // This frame's sub-pixel jitter (Halton 2, 3), every camera ray's and the raster visibility pass's: 8 phases at
         // full resolution, as many more as an output pixel has fewer traced ones (8 / scale^2: the upscaler needs each
         // output pixel visited), in the 12 bits a side the samples carry it in.
-        let phases = ((8.0 * (w as f32 / iw as f32) * (h as f32 / ih as f32)).round() as u32).clamp(8, 512);
-        let quant = |v: f32| (v * 4095.0).round() / 4095.0;
-        let jitter = (quant(halton(self.frame % phases + 1, 2)), quant(halton(self.frame % phases + 1, 3)));
+        let jitter = if reconstruction.unjittered() {
+            (0.5, 0.5)
+        } else {
+            let phases = ((8.0 * (w as f32 / iw as f32) * (h as f32 / ih as f32)).round() as u32).clamp(8, 512);
+            let quant = |v: f32| (v * 4095.0).round() / 4095.0;
+            (quant(halton(self.frame % phases + 1, 2)), quant(halton(self.frame % phases + 1, 3)))
+        };
         // The light tiles (pathtrace.wgsl "Light tiles"), in a scene whose local lights are resampled (gpu::F_LISTS):
         // the lists the last frame built, for this frame's paths (none after a reset: its reports were another
         // view's), and this frame's grid offset, a pixel of 8 x 8.
-        let tiles_on = self.sc.up.kernel.features & gpu::F_LISTS != 0;
+        let tiles_on = kernel.features & gpu::F_LISTS != 0;
         if self.reset || !tiles_on {
             self.light_tiles = None;
         }
         let tile_at = (((halton(self.frame % 64 + 1, 2) * 8.0) as u32).min(7), ((halton(self.frame % 64 + 1, 3) * 8.0) as u32).min(7));
+        // Something moves (triangles re-transformed, instances' transforms): the kernel writes motion vectors.
+        let moving = !self.sc.dynamic.1.is_empty() || self.sc.moving_instances;
         for k in 0..spp.max(1) {
             let mut p = self.sc.base;
+            p.motion[1] = reconstruction.raw_signal() as u32 as f32;
             if let Some((row, at, size, cam)) = self.light_tiles {
                 (p.ltile[0], p.ltile[1], p.ltile[2]) = (1, row, at);
                 p.ltile2 = [size.0, size.1, 0, 0];
@@ -373,7 +426,7 @@ impl LiveCore {
             }
             p.raster = [(self.raster.is_some() && !self.sc.instanced) as u32 as f32, jitter.0, jitter.1, 0.0];
             p.raster[3] = if self.rays { 0.0 } else { 1.0 };
-            if !self.sc.dynamic.1.is_empty() || !self.sc.tables.retained.instance_of.is_empty() || !self.sc.tables.retained.rigid.is_empty() {
+            if moving {
                 // The kernel finds the first dynamic triangle in Params::group_first (group 4), a u32.
                 p.motion[0] = 1.0;
             }
@@ -432,6 +485,10 @@ impl LiveCore {
                 let blas_ts = self.profile.as_ref().map(|p| (&p.queries, n * 2 + 2));
                 g.run_particles(&self.sc.up, cam.pos.to_array(), cam.fwd.to_array(), shader_time(self.time), self.frame_dt, b.time[2], b.time[1], &mut e, pass_ts, blas_ts);
             }
+            // The particles' emitters in the light list, where the passes above placed them.
+            if let (Some(f), 0) = (&self.sc.up.fills.particles, k) {
+                g.fill_emitters(f, &mut e);
+            }
             // (The uniform tables: their sections as this frame's edits and the particle passes above left them, where
             // the kernel reads them; merged.rs.)
             if k == 0 {
@@ -439,7 +496,7 @@ impl LiveCore {
             }
             if let (Some(r), 0, false) = (&self.raster, k, self.sc.instanced) {
                 let tw = self.timer.as_ref().zip(timed).map(|(t, slot)| wgpu::RenderPassTimestampWrites { query_set: &t.queries, beginning_of_pass_write_index: Some(slot as u32 * 8 + 4), end_of_pass_write_index: Some(slot as u32 * 8 + 5) });
-                r.record(g, &mut e, &self.sc.up.verts, self.sc.tris.len() as u32, &cam, self.aspect, (iw, ih), jitter, tw);
+                r.record(g, &mut e, &self.sc.up.vertices, &self.sc.up.words, self.sc.tris.len() as u32, &cam, self.aspect, (iw, ih), jitter, tw);
             }
             {
                 let tw = match (&self.profile, &self.timer, timed) {
@@ -447,11 +504,19 @@ impl LiveCore {
                     (None, Some(t), Some(slot)) if k == 0 => Some(wgpu::ComputePassTimestampWrites { query_set: &t.queries, beginning_of_pass_write_index: Some(slot as u32 * 8), end_of_pass_write_index: Some(slot as u32 * 8 + 1) }),
                     _ => None,
                 };
+                if let Some((_, d)) = &finish {
+                    e.clear_buffer(&d.buffer, d.offset, Some(4));
+                }
                 let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("live trace"), timestamp_writes: tw });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &self.sc.up.bg, &[]);
                 pass.set_bind_group(1, &self.kernel_bg, &[]);
                 pass.dispatch_workgroups(iw.div_ceil(8), ih.div_ceil(8), 1);
+                // (Rows over every traced pixel: the invocations past the records' count leave at once.)
+                if let Some((f, _)) = &finish {
+                    pass.set_pipeline(f);
+                    pass.dispatch_workgroups(gpu::DEFERRED_ROW / 64, (iw * ih).div_ceil(gpu::DEFERRED_ROW), 1);
+                }
                 // Participating media: their volume voxels trained after the trace (pathtrace.wgsl media_train), and
                 // camera rays through media once the frame's samples are traced (media_composite). In the trace's pass
                 // and timing; profiled, the frame's last sample's media passes are a pass of their own (`media`).
@@ -461,6 +526,10 @@ impl LiveCore {
                     pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("media"), timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &p.grid.0, beginning_of_pass_write_index: Some(4), end_of_pass_write_index: Some(5) }) });
                     pass.set_bind_group(0, &self.sc.up.bg, &[]);
                     pass.set_bind_group(1, &self.kernel_bg, &[]);
+                }
+                if let (Some(guides), true) = (&guides, last) {
+                    pass.set_pipeline(guides);
+                    pass.dispatch_workgroups(iw.div_ceil(8), ih.div_ceil(8), 1);
                 }
                 if let (Some(mt), 0) = (&media_train, k) {
                     pass.set_pipeline(mt);
@@ -498,24 +567,24 @@ impl LiveCore {
         let lp = LiveParams {
             cur: cam.uniform(self.aspect),
             prev: self.prev_cam.uniform(self.aspect),
-            size: [w, h, self.frame, self.reset as u32],
-            misc: [self.sc.exposure, cap, self.vignette, (self.bloom.1.iter().sum::<f32>() > 0.0) as u32 as f32],
+            size: [w, h, self.frame, (self.reset || reconstruction.history_free()) as u32],
+            misc: [self.view.exposure, cap, self.vignette, (self.bloom.1.iter().sum::<f32>() > 0.0) as u32 as f32],
             // misc2.z: motion blur, this frame's motion (pixels) -> blur length. UE (PostProcessMotionBlur.cpp,
             // UpdateMotionBlurTimeScale) blurs over +- amount / 2 x the motion x (1 / target FPS) / frame time, the
             // actual frame time without a target. 0 while nothing moves (the pass then costs nothing).
             misc2: [1.0, SAMPLE_CEILING, if !blur { 0.0 } else if self.blur.1 > 0.0 { self.blur.0 / (self.blur.1 * self.frame_dt.clamp(1.0 / 240.0, 0.25)) } else { self.blur.0 }, spp.max(1) as f32],
-            mode: [self.view_mode, 0, self.live_lighting() as u32, 0],
+            mode: [self.view_mode, self.reconstructor.white_units() as u32, self.live_lighting() as u32, reconstruction.raw_signal() as u32],
             post: self.post,
-            ae: self.sc.exposure_settings.ae,
-            ae2: self.sc.exposure_settings.ae2,
-            ae3: [self.sc.exposure_settings.speed[0], self.sc.exposure_settings.speed[1], self.frame_dt.clamp(1.0 / 240.0, 0.25), (self.reset || self.frame == 0 || exposure_snap()) as u32 as f32],
-            lx: self.sc.exposure_settings.lx,
+            ae: self.view.exposure_settings.ae,
+            ae2: self.view.exposure_settings.ae2,
+            ae3: [self.view.exposure_settings.speed[0], self.view.exposure_settings.speed[1], self.frame_dt.clamp(1.0 / 240.0, 0.25), (self.reset || self.frame == 0 || exposure_snap()) as u32 as f32],
+            lx: self.view.exposure_settings.lx,
             isz: [iw, ih, self.prev_isz.0, self.prev_isz.1],
             br: [r[0], r[1], r[2], r[3]],
             br2: [r[4], r[5], 0.0, 0.0],
             bt: [t[0], t[1], t[2], t[3]],
             bt2: [t[4], t[5], 0.0, 0.0],
-            dof: dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, h),
+            dof: dof_params(self.view.dof.as_ref(), cam.tan_half_fov, w, h),
             jit: [jitter.0, jitter.1, 0.0, 0.0],
             state: [1 - self.frame % 2, 0, 0, 0],
             lt: [tile_at.0, tile_at.1, 0, layout::light_tiles(iw)],
@@ -526,19 +595,19 @@ impl LiveCore {
         // translucency after the upscaler the same way), then their volume voxels trained.
         // (Nothing to draw while every translucent particle system is hidden in place.)
         let tl = self.sc.up.translucent.as_ref().filter(|_| g.translucent_particles_live(&self.sc.up)).map(|t| {
-            let pipes = g.translucent_pipelines(&self.sc.up.kernel, true);
+            let pipes = g.translucent_pipelines(kernel, true);
             let target = if lp.misc2[2] > 0.0 || lp.dof[0] > 0.0 { &self.targets.buf("sb").buffer } else { &self.targets.buf("fa").buffer };
             // Below full resolution the particles are drawn per traced pixel, then laid over the output (`translucent_up`).
             let low = (iw, ih) != (w, h);
             let tp = gpu::TranslucentParams { size: [w, h, t.first, 1], view: [iw, ih, gpu::VOLUME_TRAIN_CAP, low as u32], misc: [VOLUME_TRAIN_SHARE, translucent_hidden(self.frame) as u32 as f32, 0.0, 0.0] };
             g.queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&tp));
-            (pipes, g.translucent_bind_group(t, target), &t.count)
+            (pipes, g.translucent_bind_group(t, target, self.targets.translucent_low.as_ref().expect("made at the frame's start")), &t.count)
         });
         // The pass (train = false) or the volume training (train = true).
         let tl_dispatch = |pass: &mut wgpu::ComputePass, train: bool| {
             if let Some((pipes, tbg, _)) = &tl {
                 pass.set_bind_group(0, &self.sc.up.bg, &[]);
-                pass.set_bind_group(1, &self.kernel_bg, &[]);
+                pass.set_bind_group(1, self.tl_kernel_bg.as_ref().unwrap(), &[]);
                 pass.set_bind_group(2, tbg, &[]);
                 if train {
                     pass.set_pipeline(&pipes.train);
@@ -567,18 +636,46 @@ impl LiveCore {
             pass.set_bind_group(1, &self.kernel_bg, &[]);
             pass.dispatch_workgroups((gpu::CACHE_SIZE / 256) as u32, 1, 1);
         }
+        let mut before_post: Option<[wgpu::CommandBuffer; 2]> = None;
+        let use_provider = reconstruction.external();
+        let mut provider_failed = false;
+        let mut reconstruct = |e: &mut wgpu::CommandEncoder| {
+            match self.reconstructor.encode(g, e, size, cam, self.aspect, jitter, self.view.exposure, self.reset || cut) {
+                Ok(buffers) => buffers,
+                Err(_) => {
+                    provider_failed = true;
+                    // Start fresh rather than read a built-in history from before the switch. With reset, lock_carry
+                    // does no work. (A joint denoiser's frame has no denoising: this one frame shows its raw signal.)
+                    let at = (std::mem::offset_of!(LiveParams, size) + 3 * std::mem::size_of::<u32>()) as u64;
+                    g.queue.write_buffer(&self.targets.params, at, bytemuck::bytes_of(&1u32));
+                    let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("builtin reconstruction fallback"), ..Default::default() });
+                    for (k, (name, grid, pipe)) in self.passes.pipes.iter().enumerate() {
+                        if !matches!(*name, "track" | "judge" | "reject" | "upscale") { continue; }
+                        pass.set_pipeline(pipe);
+                        pass.set_bind_group(0, &self.targets.bgs[k], &[]);
+                        let (gw, gh) = grid.size((w, h), (iw, ih), self.prev_isz);
+                        pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
+                    }
+                    None
+                }
+            }
+        };
         if let Some(p) = &self.profile {
             // One compute pass per stage, each timed.
             for (k, (name, grid, pipe)) in self.passes.pipes.iter().enumerate() {
                 let q = (k as u32 + 1) * 2;
-                let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &p.queries, beginning_of_pass_write_index: Some(q), end_of_pass_write_index: Some(q + 1) }) });
-                if (self.view_mode != 0 || !layout::VIEW_MODE_PASSES.contains(name)) && (tiles_on || *name != layout::LIGHT_TILES_PASS) {
+                let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &p.queries, beginning_of_pass_write_index: Some(q), end_of_pass_write_index: (!(use_provider && *name == "upscale")).then_some(q + 1) }) });
+                if !reconstruction.skips(name) && (self.view_mode != 0 || !layout::VIEW_MODE_PASSES.contains(name)) && (tiles_on || *name != layout::LIGHT_TILES_PASS) {
                     pass.set_pipeline(pipe);
-                    pass.set_bind_group(0, &self.sc.bgs[k], &[]);
+                    pass.set_bind_group(0, &self.targets.bgs[k], &[]);
                     let (gw, gh) = grid.size((w, h), (iw, ih), self.prev_isz);
                     pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
                 }
                 drop(pass);
+                if use_provider && *name == "upscale" {
+                    before_post = reconstruct(&mut e);
+                    drop(e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("reconstruction end"), timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &p.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(q + 1) }) }));
+                }
                 if *name == "upscale" && tl.is_some() {
                     for (j, train) in [(0u32, false), (1, true)] {
                         let q = (self.passes.pipes.len() as u32 + 4 + j) * 2;
@@ -592,13 +689,21 @@ impl LiveCore {
             e.copy_buffer_to_buffer(&p.resolve, 0, &p.read, 0, p.read.size());
         } else {
             let tw = self.timer.as_ref().zip(timed).map(|(t, slot)| wgpu::ComputePassTimestampWrites { query_set: &t.queries, beginning_of_pass_write_index: Some(slot as u32 * 8 + 2), end_of_pass_write_index: Some(slot as u32 * 8 + 3) });
-            let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("live post"), timestamp_writes: tw });
+            let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("live post"), timestamp_writes: tw.clone().map(|mut t| { if use_provider { t.end_of_pass_write_index = None; } t }) });
             for (k, (name, grid, pipe)) in self.passes.pipes.iter().enumerate() {
-                if (self.view_mode == 0 && layout::VIEW_MODE_PASSES.contains(name)) || (!tiles_on && *name == layout::LIGHT_TILES_PASS) {
+                if use_provider && *name == "upscale" {
+                    drop(pass);
+                    before_post = reconstruct(&mut e);
+                    pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("post after reconstruction"), timestamp_writes: tw.clone().map(|mut t| { t.beginning_of_pass_write_index = None; t }) });
+                    tl_dispatch(&mut pass, false);
+                    tl_dispatch(&mut pass, true);
+                    continue;
+                }
+                if reconstruction.skips(name) || (self.view_mode == 0 && layout::VIEW_MODE_PASSES.contains(name)) || (!tiles_on && *name == layout::LIGHT_TILES_PASS) {
                     continue;
                 }
                 pass.set_pipeline(pipe);
-                pass.set_bind_group(0, &self.sc.bgs[k], &[]);
+                pass.set_bind_group(0, &self.targets.bgs[k], &[]);
                 let (gw, gh) = grid.size((w, h), (iw, ih), self.prev_isz);
                 pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
                 if *name == "upscale" {
@@ -618,7 +723,9 @@ impl LiveCore {
             e.copy_buffer_to_buffer(&count.buffer, count.offset, read, 0, 4);
         }
         extra(&mut e, &self.targets.out);
-        let done = g.queue.submit([e.finish()]);
+        let done = g.queue.submit(before_post.into_iter().flatten().chain([e.finish()]));
+        if provider_failed { self.history_len = 1.0; }
+        if let Some(c) = &self.rendering_control { c.publish(self.rendering_status()); }
         self.inflight.push_back(done);
         self.cpu_wait_ms = waited;
         if let (Some((read, state)), true) = (&self.guard_read, guard_free) {

@@ -18,7 +18,7 @@ const port = Number(args.find((a) => /^\d+$/.test(a)) ?? process.env.PORT ?? 417
 
 // What the site is made of: the pages, their shared files, and the two generated directories. Nothing else under
 // site/ (tools, the worker, this file) is served.
-const PAGES = new Set(["index.html", "showcase/index.html", "download/index.html", "docs/index.html", "privacy/index.html"]);
+const PAGES = new Set(["index.html", "showcase/index.html", "download/index.html", "docs/index.html", "docs/rendering/index.html", "privacy/index.html"]);
 const DIRS = ["css/", "js/", "brand/", "media/", "releases/", "play/"];
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
@@ -58,7 +58,7 @@ Bun.serve({
     }
     if (!isFile(file)) return new Response("not found", { status: 404 });
     const headers: Record<string, string> = { "cache-control": "no-cache", "content-type": TYPES[extname(file).toLowerCase()] ?? "application/octet-stream" };
-    // Packages are fetched by native clients and by pages on other origins (a playground, a game's own site).
+    // Packages are fetched by native clients and by pages on other origins (a game's own site).
     if (rel.startsWith("play/")) headers["access-control-allow-origin"] = "*";
     // The clients' files are downloads, as the Worker serves them.
     const client = clientFile(`/${rel}`);

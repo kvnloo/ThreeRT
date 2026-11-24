@@ -10,13 +10,14 @@
 import {
   AmbientLight, compatNote, DirectionalLight, Fog, FogExp2, GLTFModel, HDRIEnvironment, HemisphereLight, InstancedMesh, Light, MeshBasicMaterial, MaterialFunction, Mesh, MeshPhysicalMaterial, type MeshStandardMaterial, Object3D,
   type ParticleBinding, type ParticleFunction, Particles, GpuParticles, type ParticleProgram, type ParticleProgramBinding, type VolumeBinding, type VolumeFunction, VolumeMesh, type DensityGrid, type GridProgram, type GridProgramBinding, ProceduralMesh, ProceduralGeometry,
-  DataTexture, PerspectiveCamera, PointLight, RectAreaLight, Scene, SkyAtmosphere, SkyColor, SkyGradient, SpotLight, Texture, trackChanges, vec3, takePhysicsCommands,
+  DataTexture, StreamTexture, PerspectiveCamera, PointLight, RectAreaLight, Scene, SkyAtmosphere, SkyColor, SkyGradient, SpotLight, Texture, trackChanges, vec3, takePhysicsCommands,
   bindBody, unbindBody, usePhysicsEngine, physicsStepped, physicsBodies, Joint, getEngineBodies,
   type SceneChanges, type ShaderBinding, type SwayDesc, type PhysicsDesc, type BoundBody,
 } from "./core.ts";
 import { BoxGeometry, BufferGeometry, CapsuleGeometry, SphereGeometry } from "./geometry.ts";
 import { Matrix4, Quaternion, Vector3 } from "./math.ts";
 import { ENGINE_IDS, engineColliders } from "./raycaster.ts";
+import type { RenderingBinding } from "./rendering.ts";
 
 /** A joint's state in the binding once the engine let go of it (`Joint.broken`). */
 const BROKEN = "broken";
@@ -145,6 +146,8 @@ export interface TextureDesc {
   uri?: string;
   /** The bytes are RGBA8 pixels of this size (DataTexture), not an encoded image. */
   size?: Vec2;
+  /** The app replaces the pixels while the scene runs, under this name (StreamTexture). */
+  stream?: string;
   srgb: boolean;
   wrap: boolean;
   repeat: Vec2;
@@ -172,11 +175,12 @@ type ObjectKindDesc =
   /** `InstancedMesh`: `count` instances (its capacity) of triangle geometry (`materials[0]`) or procedural geometry. */
   | { name: string; parent: number | null; castShadow: boolean; movable?: boolean; kind: "instanced"; geometry: number; procedural?: boolean; materials: number[]; count: number };
 
-/** Pose of an animated model: clip name, time (s), looping. */
+/** Pose of an animated model: clip name ("" for none), time (s), looping, nodes posed by name (4 or 7 numbers). */
 export interface AnimationDesc {
   clip: string;
   time: number;
   loop: boolean;
+  nodes?: Record<string, number[]>;
 }
 
 export interface SettingsDesc {
@@ -192,9 +196,11 @@ export interface SettingsDesc {
 }
 
 /** The engine API. Ids are chosen by the caller (`SceneBinding`); every call takes effect at the engine's next commit. */
-export interface Engine {
+export interface Engine extends RenderingBinding {
   /** `groups`: (first index, index count, material index) per group, for meshes with several materials. */
   /** `colors`: the vertex colours (three.js's `color` attribute), linear RGB per vertex. */
+  /** A file under the asset root, whole or a range (native only; a page's throws): `readAsset` below. */
+  readAsset?(path: string, offset?: number, length?: number): ArrayBuffer;
   geometry(id: number, positions: Float32Array, normals: Float32Array, uvs: Float32Array, indices: Uint32Array, groups?: Uint32Array | null, colors?: Float32Array | null): void;
   texture(id: number, desc: TextureDesc, data: Uint8Array | null): void;
   shader(name: string, code: string, helpers: string): void;
@@ -267,7 +273,8 @@ interface Bound {
   name: string;
   parent: number | null;
   kind: string;
-  trs: Float64Array;
+  /** The transform last sent (a plain array: a typed one is two objects, its buffer the second). */
+  trs: number[];
   visible: boolean;
   power: number;
   /** Per-instance data last sent. */
@@ -280,7 +287,9 @@ interface Bound {
   /** Model pose last sent (clip, time, loop). */
   anim: AnimationDesc | null;
   /** An instanced mesh's instances last sent: count, and each attribute with its version. */
-  inst: { count: number; m: [unknown, number]; c: [unknown, number]; d: [unknown, number] } | null;
+  /** An instanced mesh's count and the tables (and their versions) last sent: one record, flat (each instanced mesh's
+   *  was four objects, and the script engine's cycle collector walks every object). */
+  inst: { count: number; m: unknown; mv: number; c: unknown; cv: number; d: unknown; dv: number } | null;
   /** Sync that last reached it in a walk of the graph. */
   epoch: number;
   /** Its rigid body in the engine, and what it was made from (a change makes it anew). */
@@ -351,7 +360,7 @@ export class SceneBinding {
   private settingsKey = "";
   private readonly trs = new Float32Array(10);
   private readonly scratch = new Float64Array(Math.max(HOT, LIGHT_VALUES));
-  private readonly changes: SceneChanges = { objects: new Set(), structure: true };
+  private readonly changes: SceneChanges = { objects: new Set(), structure: true, added: new Set(), removed: new Set() };
   /** In-place Matrix4 edits have no setter to report a change. Revisit only opted-in objects each sync. */
   private readonly manualWorld = new Set<Object3D>();
   private readonly untrack: () => void;
@@ -414,8 +423,10 @@ export class SceneBinding {
     const ch = this.changes;
     for (const o of this.manualWorld) ch.objects.add(o);
     if (ch.structure || !this.objects.has(this.camera)) {
-      // Objects were added or removed: walk the graph (creates new objects, re-parents, removes what is gone).
+      // The whole graph: walk it (creates new objects, re-parents, removes what is gone).
       ch.structure = false;
+      ch.added?.clear();
+      ch.removed?.clear();
       ch.objects.clear();
       const epoch = ++this.epoch;
       const visit = (o: Object3D, parent: number | null) => {
@@ -427,17 +438,46 @@ export class SceneBinding {
       if (this.objects.get(this.camera)?.epoch !== epoch) visit(this.camera, null);
       for (const [o, b] of this.objects) {
         if (b.epoch === epoch) continue;
-        this.dropBody(o, b);
-        if (o instanceof Joint) this.dropJoint(o);
-        this.engine.remove(b.id);
-        this.objects.delete(o);
-        this.manualWorld.delete(o);
-        this.byName.delete(b.name);
-        const cut = b.name.lastIndexOf("_"), n = Number(b.name.slice(cut + 1));
-        if (cut > 0 && Number.isInteger(n) && n >= 1 && n < (this.nameFloor.get(b.name.slice(0, cut)) ?? 1)) this.nameFloor.set(b.name.slice(0, cut), n);
-        if (o instanceof Light) this.lights.delete(o);
-        if (o instanceof PerspectiveCamera) this.cameras.delete(o);
-        stats.removed++;
+        this.dropObject(o, b, stats);
+      }
+    } else if (ch.added?.size || ch.removed?.size) {
+      // Objects added or removed since the last sync: their subtrees alone. Removed first (what is no longer under the
+      // scene goes, with everything below it), then added (bound from the highest ancestor the engine has not got).
+      const inScene = (o: Object3D) => {
+        for (let p: Object3D | null = o; p; p = p.parent) if (p === this.scene) return true;
+        return o === this.camera;
+      };
+      const removed = [...(ch.removed ?? [])], added = [...(ch.added ?? [])];
+      ch.removed?.clear();
+      ch.added?.clear();
+      for (const r of removed) {
+        const stack = [r];
+        while (stack.length) {
+          const o = stack.pop()!;
+          const b = this.objects.get(o);
+          if (b && !inScene(o)) this.dropObject(o, b, stats);
+          for (const c of o.children) stack.push(c);
+        }
+      }
+      // what changed of objects the engine has (as the full walk meets them before what is new), then what is new
+      const touched = [...ch.objects].filter((o) => this.objects.has(o));
+      ch.objects.clear();
+      for (const o of touched) {
+        const b = this.objects.get(o);
+        if (b) this.bindObject(o, b.parent, stats);
+      }
+      const visit = (o: Object3D, parent: number | null) => {
+        const b = this.bindObject(o, parent, stats);
+        for (const c of o.children) visit(c, b.id);
+      };
+      const done = new Set<Object3D>();
+      for (const a of added) {
+        if (!inScene(a)) continue;
+        let top = a;
+        while (top.parent && top.parent !== this.scene && !this.objects.has(top.parent)) top = top.parent;
+        if (done.has(top)) continue;
+        done.add(top);
+        visit(top, top.parent && top.parent !== this.scene ? this.objects.get(top.parent)!.id : null);
       }
     } else if (ch.objects.size) {
       const touched = [...ch.objects];
@@ -532,6 +572,21 @@ export class SceneBinding {
   }
 
   /** Creates / re-creates the object in the engine if it is new or changed kind or parent, then sends its state. */
+  /** An object the scene no longer has: out of the engine, its names free again. */
+  private dropObject(o: Object3D, b: Bound, stats: SyncStats): void {
+    this.dropBody(o, b);
+    if (o instanceof Joint) this.dropJoint(o);
+    this.engine.remove(b.id);
+    this.objects.delete(o);
+    this.manualWorld.delete(o);
+    this.byName.delete(b.name);
+    const cut = b.name.lastIndexOf("_"), n = Number(b.name.slice(cut + 1));
+    if (cut > 0 && Number.isInteger(n) && n >= 1 && n < (this.nameFloor.get(b.name.slice(0, cut)) ?? 1)) this.nameFloor.set(b.name.slice(0, cut), n);
+    if (o instanceof Light) this.lights.delete(o);
+    if (o instanceof PerspectiveCamera) this.cameras.delete(o);
+    stats.removed++;
+  }
+
   private bindObject(o: Object3D, parent: number | null, stats: SyncStats): Bound {
     let b = this.objects.get(o);
     const kind = this.kindKey(o);
@@ -539,7 +594,7 @@ export class SceneBinding {
       const created = !b;
       if (!b) {
         const name = this.uniqueName(o);
-        b = { id: this.nextId++, name, parent, kind, trs: new Float64Array(10).fill(NaN), visible: true, power: 1, custom: "0,0,0,0", sway: "", light: null, camera: "", anim: null, inst: null, epoch: 0, body: null, bodyFailed: null };
+        b = { id: this.nextId++, name, parent, kind, trs: new Array<number>(10).fill(NaN), visible: true, power: 1, custom: "0,0,0,0", sway: "", light: null, camera: "", anim: null, inst: null, epoch: 0, body: null, bodyFailed: null };
         this.objects.set(o, b);
         this.byName.set(name, o);
         if (o instanceof Light) this.lights.set(o, b);
@@ -596,7 +651,7 @@ export class SceneBinding {
     }
     if (o instanceof GLTFModel) {
       const a = animationDesc(o);
-      if (a?.clip !== b.anim?.clip || a?.time !== b.anim?.time || a?.loop !== b.anim?.loop) {
+      if (!samePose(a, b.anim)) {
         b.anim = a;
         this.engine.animation(b.id, a);
         stats.updated++;
@@ -648,18 +703,18 @@ export class SceneBinding {
   private sendInstances(o: InstancedMesh, b: Bound, stats: SyncStats): void {
     const cap = o.instanceMatrix.count;
     if (!Number.isInteger(o.count) || o.count < 0 || o.count > cap) throw new TypeError(`${b.name}: count must be an integer from 0 to ${cap}`);
-    const s = (b.inst ??= { count: -1, m: [null, -1], c: [null, -1], d: [null, -1] });
-    const fresh = (a: { version: number; array: Float32Array } | null, last: [unknown, number], size: number, what: string): Float32Array | null => {
-      if (!a || (last[0] === a && last[1] === a.version)) return null;
+    const s = (b.inst ??= { count: -1, m: null, mv: -1, c: null, cv: -1, d: null, dv: -1 });
+    const fresh = (a: { version: number; array: Float32Array } | null, k: "m" | "c" | "d", v: "mv" | "cv" | "dv", size: number, what: string): Float32Array | null => {
+      if (!a || (s[k] === a && s[v] === a.version)) return null;
       const arr = a.array;
       if (arr.length !== cap * size) throw new TypeError(`${b.name}: ${what} must have ${size} numbers for each of the ${cap} instances`);
-      last[0] = a;
-      last[1] = a.version;
+      s[k] = a;
+      s[v] = a.version;
       return arr;
     };
-    const m = fresh(o.instanceMatrix, s.m, 16, "instanceMatrix");
-    const c = fresh(o.instanceColor, s.c, 3, "instanceColor");
-    const d = fresh(o.instanceCustomData, s.d, 4, "instanceCustomData");
+    const m = fresh(o.instanceMatrix, "m", "mv", 16, "instanceMatrix");
+    const c = fresh(o.instanceColor, "c", "cv", 3, "instanceColor");
+    const d = fresh(o.instanceCustomData, "d", "dv", 4, "instanceCustomData");
     if (m || c || d || o.count !== s.count) {
       s.count = o.count;
       this.engine.instances(b.id, o.count, m, c, d);
@@ -1164,7 +1219,7 @@ export class SceneBinding {
       this.textures.set(t, id);
       t.needsUpdate = false;
       const raw = t instanceof DataTexture;
-      const desc: TextureDesc = { ...(raw || t.data ? {} : { uri: t.uri }), ...(raw ? { size: [t.width, t.height] as Vec2 } : {}), srgb: t.colorSpace === "srgb", wrap: t.wrap !== "clamp", repeat: [...t.repeat], offset: [...t.offset] };
+      const desc: TextureDesc = { ...(raw || t.data ? {} : { uri: t.uri }), ...(raw ? { size: [t.width, t.height] as Vec2 } : {}), ...(t instanceof StreamTexture ? { stream: t.stream } : {}), srgb: t.colorSpace === "srgb", wrap: t.wrap !== "clamp", repeat: [...t.repeat], offset: [...t.offset] };
       this.engine.texture(id, desc, raw ? t.pixels : (t.data ?? null));
     }
     return id;
@@ -1588,8 +1643,47 @@ function lightValues(l: Light, out: Float64Array): Float64Array {
 function animationDesc(m: GLTFModel): AnimationDesc | null {
   const a = m.animation;
   if (!a) return null;
-  if (typeof a.clip !== "string" || !Number.isFinite(a.time)) throw new TypeError(`${m.name || m.uri}: animation needs a clip name and a finite time`);
-  return { clip: a.clip, time: a.time, loop: a.loop ?? true };
+  const who = m.name || m.uri;
+  if (a.clip !== undefined && typeof a.clip !== "string") throw new TypeError(`${who}: animation's clip is a name`);
+  if (a.time !== undefined && !Number.isFinite(a.time)) throw new TypeError(`${who}: animation's time must be finite`);
+  if (!a.clip && !a.nodes) throw new TypeError(`${who}: animation needs a clip or nodes`);
+  const d: AnimationDesc = { clip: a.clip ?? "", time: a.time ?? 0, loop: a.loop ?? true };
+  if (a.nodes) {
+    // (A copy: the game may change its arrays in place for the next frame.)
+    const nodes: Record<string, number[]> = {};
+    for (const [name, v] of Object.entries(a.nodes)) {
+      const n = Array.from(v);
+      if ((n.length !== 4 && n.length !== 7) || !n.every(Number.isFinite)) throw new TypeError(`${who}: animation node "${name}" needs 4 finite numbers (a rotation) or 7 (a translation, a rotation)`);
+      nodes[name] = n;
+    }
+    d.nodes = nodes;
+  }
+  return d;
+}
+
+function samePose(a: AnimationDesc | null, b: AnimationDesc | null): boolean {
+  if (!a || !b) return a === b;
+  if (a.clip !== b.clip || a.time !== b.time || a.loop !== b.loop) return false;
+  const an = a.nodes, bn = b.nodes;
+  if (!an || !bn) return an === bn;
+  const keys = Object.keys(an);
+  if (keys.length !== Object.keys(bn).length) return false;
+  for (const k of keys) {
+    const x = an[k]!, y = bn[k];
+    if (!y || x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * A file under the asset root, whole or `length` bytes of it from `offset` (`__engine.readAsset`, native renderer only;
+ * docs/RUNTIME.md "Streaming"): what a game reads as it goes, such as a city's baked cells as the camera moves.
+ */
+export function readAsset(path: string, offset?: number, length?: number): ArrayBuffer {
+  const e = (globalThis as { __engine?: Partial<Pick<Engine, "readAsset">> }).__engine;
+  if (!e?.readAsset) throw new Error("readAsset: this host reads no assets (the native renderer does)");
+  return offset === undefined ? e.readAsset(path) : e.readAsset(path, offset, length ?? 0);
 }
 
 export function cameraDesc(c: PerspectiveCamera): CameraDesc {
@@ -1650,6 +1744,9 @@ function resolveOrientation(o: Object3D): Quaternion {
 /** An engine that records the calls (tests, headless inspection). */
 export class RecordingEngine implements Engine {
   calls: [string, ...unknown[]][] = [];
+  readAsset(path: string): ArrayBuffer {
+    throw new Error(`readAsset ${path}: the recording engine reads no assets`);
+  }
   geometry(...a: Parameters<Engine["geometry"]>) { this.calls.push(["geometry", ...a.filter((x, k) => k < 5 || x || (k === 5 && a[6]))]); }
   texture(...a: Parameters<Engine["texture"]>) { this.calls.push(["texture", ...a]); }
   shader(...a: Parameters<Engine["shader"]>) { this.calls.push(["shader", ...a]); }

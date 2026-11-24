@@ -42,25 +42,117 @@ pub fn object_row(pivot: Vec3, power: f32, size: impl Into<Vec3>, custom: [f32; 
     [[pivot.x, pivot.y, pivot.z, power.max(0.0)], [size.x, size.y, size.z, -1.0e9], custom, [color[0], color[1], color[2], 0.0]]
 }
 
-/// A glTF mesh placed by several static instances (hardware RT): its triangles once, in model space, in the `pool_*`
-/// arrays; one BLAS, one TLAS instance per placement.
+/// An instanced object's copy's entry: without power when the copy emits and is hidden (its emitters stay in the light
+/// list, at no weight until it is shown).
+pub fn copy_row(mut row: ObjectRow, dark: bool) -> ObjectRow {
+    if dark {
+        row[0][3] = 0.0;
+    }
+    row
+}
+
+/// A mesh its instances place: its triangles once, in model space, in the `pool_*` arrays; one BLAS, one TLAS
+/// instance per placement. A geometry's (`section_mesh`) or a model's (`model_sections`); its materials are its
+/// instances' (`Instance::rows`).
 #[derive(Clone, Copy, Debug)]
 pub struct InstMesh {
     pub first: u32,
     pub count: u32,
-    /// The first `opaque` pool triangles are opaque (BLAS geometry 0), the rest cutout (geometry 1, any-hit test).
-    pub opaque: u32,
-    /// Triangles each placement flattens instead (glass, emissive, material functions), in the build's rest arrays.
+    /// Triangles each placement flattens instead (`flatten_coincident`'s pairs), in the build's rest arrays.
     pub rest_first: u32,
     pub rest_count: u32,
     /// Model-space bounds (object bounds of its instances, picking).
     pub lo: Vec3A,
     pub hi: Vec3A,
-    /// Its triangles change (a shared pose, `PoseGroup`): its BLAS is rebuilt with them.
+    /// Its triangles change (a posed skinned model's, `Skinned`): its BLAS is rebuilt with them.
     pub deforms: bool,
-    /// An emitting `own_blas` mesh (`emitter_mesh_tris`): its triangles in world space, its one placement at identity,
-    /// so they are light-sampled as flattened ones are (`prepare` gives them emitter entries).
-    pub emits: bool,
+    /// Its sections (`Section`), in `Scene::sections`: a geometry of its BLAS each, a row of its instances each.
+    pub sect_first: u32,
+    pub sect_count: u32,
+    /// Its triangles carry its geometry's vertex colours (a material says whether it reads them).
+    pub colored: bool,
+    /// Its vertices (indexed.rs): the first and how many the run holds. Its triangles' indices count from the first;
+    /// `prepare` sets them, or the edit that places the mesh.
+    pub vfirst: u32,
+    pub vcount: u32,
+}
+
+/// A run of a mesh's triangles that an object draws with one of its materials: a geometry group, or the whole of a
+/// geometry drawn with one material. A geometry of the mesh's BLAS; an instance has a row for each (`Instance::rows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Section {
+    /// Its first triangle in the mesh, and how many.
+    pub first: u32,
+    pub count: u32,
+    /// Which of the object's materials (a group's material index; past the last, the last).
+    pub slot: u32,
+}
+
+/// The most sections a mesh may have: a hit's section is 16 bits of the record a pixel is left to the kernel's second
+/// pass by (pathtrace.wgsl `finish`).
+pub const MESH_SECTIONS: usize = 1 << 16;
+
+/// An instance's row for a section of its mesh, as the kernel reads it (the words' heap, heap.rs `Stream::Rows`):
+/// the material with the class bits `ROW_*`, the section's first triangle in the triangles' table, its first emitter in
+/// the light list (`NO_EMITTER`: it does not emit), and a word to spare.
+pub type Row = [u32; 4];
+pub const ROW_MATERIAL: u32 = 0xff_ffff;
+/// The material is alpha-tested; it is glass (shadow rays pass).
+pub const ROW_CUTOUT: u32 = 1 << 24;
+pub const ROW_GLASS: u32 = 1 << 25;
+pub const NO_EMITTER: u32 = u32::MAX;
+
+/// The row of a section drawn with material `mat`; where its triangles and its emitters are is set where the tables
+/// are laid out (lib.rs `prepare`, the live edits).
+pub fn row_of(mat: u32, materials: &[GpuMaterial]) -> Row {
+    let class = materials.get(mat as usize).map_or(0, |m| [0, ROW_CUTOUT, ROW_GLASS][mesh_class(m) as usize]);
+    [mat | class, 0, NO_EMITTER, 0]
+}
+
+/// The material a row names.
+pub fn row_material(r: &Row) -> u32 {
+    r[0] & ROW_MATERIAL
+}
+
+/// Whether an instance with these rows casts shadows: as its object says, and never when every section is glass
+/// (such an instance is out of a shadow ray's way by its mask; glass among other sections is passed at the hit).
+pub fn rows_cast(rows: &[Row], cast_shadow: bool) -> bool {
+    cast_shadow && !rows.iter().all(|r| r[0] & ROW_GLASS != 0)
+}
+
+/// The bits of an instance's record for its rows: which classes are among them.
+pub fn rows_bits(rows: &[Row]) -> u32 {
+    let any = |bit: u32| rows.iter().any(|r| r[0] & bit != 0);
+    (if any(ROW_CUTOUT) { INST_CUTOUT } else { 0 }) | if any(ROW_GLASS) { INST_GLASS } else { 0 }
+}
+
+/// How many emitters an instance with these rows has in the light list: every triangle of its sections whose
+/// material emits, a section after another, a section's in its triangles' order (`section_emitters`).
+pub fn rows_emitters(sections: &[Section], rows: &[Row], materials: &[GpuMaterial]) -> u32 {
+    sections.iter().zip(rows).filter(|(_, r)| materials.get(row_material(r) as usize).is_some_and(emissive)).map(|(s, _)| s.count).sum()
+}
+
+/// A triangle's place among its instance's emitters, its material and its section, from its attributes (its
+/// section and its index in it), the instance's rows and where each section's emitters start (`section_emitters`).
+/// None: its section's material does not emit.
+pub fn section_slot(a: &GpuTriAttr, rows: &[Row], starts: &[Option<u32>]) -> Option<(usize, u32, u32)> {
+    let s = a.uv[3].to_bits() as usize;
+    Some(((starts.get(s).copied()?? + a.x[3].to_bits()) as usize, row_material(rows.get(s)?), s as u32))
+}
+
+/// Where each section's emitters start among its instance's (None: its material does not emit).
+pub fn section_emitters(sections: &[Section], rows: &[Row], materials: &[GpuMaterial]) -> Vec<Option<u32>> {
+    let mut at = 0;
+    sections
+        .iter()
+        .zip(rows)
+        .map(|(s, r)| {
+            materials.get(row_material(r) as usize).is_some_and(emissive).then(|| {
+                at += s.count;
+                at - s.count
+            })
+        })
+        .collect()
 }
 
 /// Pool triangles of the deforming meshes, which the build puts first in the pool.
@@ -69,6 +161,18 @@ pub fn deforming_pool(meshes: &[InstMesh]) -> usize {
 }
 
 impl InstMesh {
+    /// Its BLAS geometries (`sections`: the scene's): one a section, its first triangle in the mesh and how many.
+    /// Every one is flagged opaque, whatever an instance's materials are (a query forces opacity; a cutout's and
+    /// glass's hits are told by the instance's rows).
+    pub fn parts(&self, sections: &[Section]) -> Vec<(u32, u32)> {
+        self.sections(sections).iter().map(|s| (s.first, s.count)).collect()
+    }
+
+    /// Its sections among the scene's.
+    pub fn sections<'a>(&self, sections: &'a [Section]) -> &'a [Section] {
+        &sections[self.sect_first as usize..(self.sect_first + self.sect_count) as usize]
+    }
+
     /// World bounds of a placement: the box of the transformed model-space box.
     pub fn placed_bounds(&self, m: Mat4) -> (Vec3A, Vec3A) {
         let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
@@ -96,10 +200,26 @@ pub struct Instance {
     /// hidden (`instance_world`: TLAS mask 0, never flattened or picked).
     pub sub: Option<u32>,
     pub hidden: bool,
+    /// Hidden by its object's visibility (`World::shown`) or for a placement without size (`placed_world`), which
+    /// keep its mesh and its place above the triangles: it comes back in place. (One that an edit took out is hidden
+    /// and not this: a rebuild draws it again.)
+    pub masked: bool,
+    /// Its first emitter in the light list, if it has emitters (`rows_emitters`): set where the list is made (lib.rs
+    /// `prepare`, the live edits). A section's row has where the section's start, for the rays that hit one.
+    pub first_emitter: u32,
+    /// Its rows in `Scene::rows`, one a section of its mesh (`InstMesh::sect_count`), and the record's bits for them
+    /// (`rows_bits`).
+    pub rows: u32,
+    pub bits: u32,
+    /// An instance of a mesh that deforms: where its vertices' positions of the previous frame begin (the kernel's
+    /// `prev_verts`: its motion is its pose's and its transform's). 0 otherwise.
+    pub prev: u32,
+    /// Its mesh's first vertex (`indexed::Indexed::meshes`): its triangles' indices count from it.
+    pub verts: u32,
 }
 
 /// Kernel record of an instance (`instances` binding): world matrix rows, normal matrix rows (inverse transpose),
-/// (first triangle in the GPU order, object index, texture-LOD offset bits, first cutout triangle - first), and the
+/// (first triangle in the GPU order, object index, its mesh's first vertex, its rows' first), and the
 /// world matrix rows of the previous frame (a movable instance's motion vectors; the same rows when it did not move).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -111,19 +231,69 @@ pub struct GpuInstance {
 }
 
 impl Instance {
-    /// Kernel record with its mesh's first triangle at `first` in the GPU order; `opaque` = where its cutout
-    /// geometry starts.
-    pub fn gpu(&self, first: u32, opaque: u32) -> GpuInstance {
+    /// Kernel record with its mesh's first triangle at `first` in the GPU order. (n0.w is left free: a unit's record
+    /// takes it for its tree's root, units.rs `unit_record`. n1.w: its bits. n2.w: `prev`, as bits.)
+    pub fn gpu(&self, first: u32) -> GpuInstance {
         let w = self.world;
         let nm = glam::Mat3::from_mat4(w).inverse().transpose();
         let row = |r: usize| [w.x_axis[r], w.y_axis[r], w.z_axis[r], w.w_axis[r]];
-        let nrow = |r: usize| [nm.x_axis[r], nm.y_axis[r], nm.z_axis[r], 0.0];
-        GpuInstance { m: [row(0), row(1), row(2)], n: [nrow(0), nrow(1), nrow(2)], info: [first, self.object, lod_offset(w).to_bits(), opaque], p: [row(0), row(1), row(2)] }
+        let nrow = |r: usize, w: f32| [nm.x_axis[r], nm.y_axis[r], nm.z_axis[r], w];
+        let bits = f32::from_bits(self.bits | if mirrors(w) { INST_MIRRORED } else { 0 });
+        GpuInstance { m: [row(0), row(1), row(2)], n: [nrow(0, 0.0), nrow(1, bits), nrow(2, f32::from_bits(self.prev))], info: [first, self.object, self.verts, self.rows], p: [row(0), row(1), row(2)] }
+    }
+    /// A triangle's attributes as a flattened triangle has them: the material its row names in place of the
+    /// section, and no index in it (`rows`: the instance's).
+    pub fn resolved(&self, a: &GpuTriAttr, rows: &[Row]) -> GpuTriAttr {
+        let mat = rows.get(a.uv[3].to_bits() as usize).map_or(0, row_material);
+        GpuTriAttr { uv: [a.uv[0], a.uv[1], a.uv[2], f32::from_bits(mat)], x: [a.x[0], a.x[1], a.x[2], 0.0], ..*a }
     }
     /// Model-space triangle `t` of its mesh in world space (the same transform the flattening path applies).
     pub fn tri(&self, t: &[Vec3A; 3]) -> [Vec3A; 3] {
         t.map(|v| self.world.transform_point3a(v))
     }
+    /// A triangle of its mesh (vertices `t`, attributes `a`, vertex colours `c`) as flattening has it: in world space
+    /// (`tri`, `instance_attr`), and under a mirroring instance with its second and third vertex changed places, so
+    /// that it faces as the mesh's does (as `append_arrays` flattens a mirrored placement).
+    pub fn flat(&self, t: &[Vec3A; 3], a: &GpuTriAttr, c: Option<[u32; 3]>) -> ([Vec3A; 3], GpuTriAttr, Option<[u32; 3]>) {
+        let (w, b) = (self.tri(t), instance_attr(a, self.world, self.object));
+        if !mirrors(self.world) {
+            return (w, b, c);
+        }
+        // (The UVs are packed along the normals: uv0 in n0.w n1.w, uv1 in n2.w uv.x, uv2 in uv.y uv.z.)
+        let swapped = GpuTriAttr { n1: [b.n2[0], b.n2[1], b.n2[2], b.n1[3]], n2: [b.n1[0], b.n1[1], b.n1[2], b.uv[1]], uv: [b.uv[2], b.n2[3], b.uv[0], b.uv[3]], t1: b.t2, t2: b.t1, ..b };
+        ([w[0], w[2], w[1]], swapped, c.map(|c| [c[0], c[2], c[1]]))
+    }
+}
+
+/// A triangle's tangents, one a corner: the direction of u on the surface and the frame's hand (1 or -1). A file's,
+/// or generated (tangents.rs); a triangle without has none (`GpuTriAttr::t`'s hand is 0).
+pub type CornerTangents = [(Vec3, f32); 3];
+
+/// A triangle in a node's own space (vertices, normals, UVs, tangents) placed by `w` as the build flattens it: under
+/// a mirroring `w` the second and third vertex change places, so that it faces as its mesh does, and its tangents'
+/// frame changes hand (`Instance::flat` does the same with a mesh's triangle).
+#[allow(clippy::type_complexity)]
+pub fn placed_tri(w: Mat4, p: &[Vec3; 3], n: &[Vec3; 3], uv: &[Vec2; 3], tangent: Option<CornerTangents>) -> ([Vec3; 3], [Vec3; 3], [Vec2; 3], Option<CornerTangents>) {
+    let nm = Mat3::from_mat4(w).inverse().transpose();
+    let (k, hand) = if mirrors(w) { ([0, 2, 1], -1.0) } else { ([0, 1, 2], 1.0) };
+    (k.map(|i| w.transform_point3(p[i])), k.map(|i| (nm * n[i]).normalize_or_zero()), k.map(|i| uv[i]), tangent.map(|t| k.map(|i| (w.transform_vector3(t[i].0).normalize_or_zero(), t[i].1 * hand))))
+}
+
+/// Bit of an instance record's n1.w, beside the units' flags there (units.rs `UNIT_*`): the instance mirrors its mesh
+/// (the kernel's `inst_sign`).
+pub const INST_MIRRORED: u32 = 4;
+/// More bits there: a row of the instance is a cutout's, a glass's (what a walk of a unit asks before it reads a
+/// triangle's row).
+pub const INST_CUTOUT: u32 = 16;
+pub const INST_GLASS: u32 = 32;
+/// Its mesh deforms (a posed skinned model's): its motion is its vertices' too (`Instance::prev`).
+pub const INST_DEFORMS: u32 = 64;
+/// Every bit of n1.w that is the instance's own, not a unit's.
+pub const INST_BITS: u32 = INST_MIRRORED | INST_CUTOUT | INST_GLASS | INST_DEFORMS;
+
+/// Whether a placement mirrors what it places (a negative determinant).
+pub fn mirrors(w: Mat4) -> bool {
+    glam::Mat3::from_mat4(w).determinant() < 0.0
 }
 
 /// Procedural geometry placed in the scene (`Kind::Procedural`): an instance of its own AABB BLAS (hardware RT), its
@@ -209,12 +379,24 @@ pub fn blas_tri(t: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// keeps the TLAS free of non-finite numbers, and can come back in place.
 pub fn instance_world(m: Mat4, t: &world::InstanceTable, i: usize) -> (Mat4, bool) {
     let w = m * t.matrix(i);
-    let det = glam::Mat3::from_mat4(w).determinant();
-    if i < t.count as usize && w.is_finite() && det.abs() > 1e-30 {
+    if i < t.count as usize {
+        return placed_world(w, m.w_axis.truncate());
+    }
+    (at_point(if w.w_axis.is_finite() { w.w_axis.truncate() } else { m.w_axis.truncate() }), true)
+}
+
+/// An instance's world matrix as the structure above the triangles takes it, and whether the placement has no size:
+/// not finite, or not invertible (scene code hides by scaling to 0). Such an instance stands at a point (its
+/// translation, or `fallback`), hidden.
+pub fn placed_world(w: Mat4, fallback: Vec3) -> (Mat4, bool) {
+    if w.is_finite() && glam::Mat3::from_mat4(w).determinant().abs() > 1e-30 {
         return (w, false);
     }
-    let at = if w.w_axis.is_finite() { w.w_axis.truncate() } else { m.w_axis.truncate() };
-    (Mat4::from_scale_rotation_translation(Vec3::splat(1e-6), glam::Quat::IDENTITY, at), true)
+    (at_point(if w.w_axis.is_finite() { w.w_axis.truncate() } else { fallback }), true)
+}
+
+fn at_point(at: Vec3) -> Mat4 {
+    Mat4::from_scale_rotation_translation(Vec3::splat(1e-6), glam::Quat::IDENTITY, at)
 }
 
 impl ProcObject {
@@ -316,28 +498,22 @@ pub fn proc_layout(procs: &[ProcObject], sw: bool) -> ProcLayout {
     ProcLayout { head, headers, blobs, blob_of, blob_words, sw }
 }
 
-/// Flags of an instance's pool triangle as a world-space triangle (software traversal): the placement's shadow flag and
-/// the material's cutout (the build's flag pass ran before the instances were flattened).
+/// Flags of an instance's pool triangle as a world-space triangle (software traversal): the placement's shadow flag,
+/// the material's cutout, and no shadow for glass (the build's flag pass ran before the instances were flattened).
 pub fn instance_tri_flags(inst: &Instance, a: &GpuTriAttr, materials: &[GpuMaterial]) -> u32 {
-    let shadow = if inst.cast_shadow { 0 } else { TRI_NO_SHADOW };
-    let cutout = materials.get(a.uv[3].to_bits() as usize).is_some_and(|m| m.uv2[3] > 0.0);
-    shadow | if cutout { TRI_MASKED } else { 0 }
+    let m = materials.get(a.uv[3].to_bits() as usize);
+    let shadow = if inst.cast_shadow && !m.is_some_and(|m| m.layer[0] > 0.0) { 0 } else { TRI_NO_SHADOW };
+    shadow | if m.is_some_and(|m| m.uv2[3] > 0.0) { TRI_MASKED } else { 0 }
 }
 
 /// Triangle ranges of node `id` in build order: one, or two for an instanced node flattened by software traversal (its
-/// glass / emissive part from the build, its mesh appended by `prepare`).
+/// glass / function part from the build, its mesh appended by `prepare`).
 pub fn node_ranges<'a>(tri_nodes: &'a [(String, u32, u32)], id: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
     tri_nodes.iter().filter(move |(n, _, _)| n == id).map(|(_, a, b)| *a as usize..*b as usize)
 }
 
-/// Texture-LOD constant change of a transform: texel density per metre scales with 1 / linear size, approximated by
-/// the cube root of the volume scale (exact for uniform scale).
-pub fn lod_offset(w: Mat4) -> f32 {
-    -glam::Mat3::from_mat4(w).determinant().abs().max(1e-30).log2() / 3.0
-}
-
-/// Model-space shading attributes of a pool triangle placed by `w` (normals by the inverse transpose, tangent by the
-/// matrix, texture-LOD constant by the scale), object `object`.
+/// Model-space shading attributes of a pool triangle placed by `w` (normals by the inverse transpose, tangents by
+/// the matrix, their frame's hand changed by a mirroring one), object `object`.
 pub fn instance_attr(a: &GpuTriAttr, w: Mat4, object: u32) -> GpuTriAttr {
     let m3 = glam::Mat3::from_mat4(w);
     let nm = m3.inverse().transpose();
@@ -345,8 +521,12 @@ pub fn instance_attr(a: &GpuTriAttr, w: Mat4, object: u32) -> GpuTriAttr {
         let r = (nm * Vec3::new(v[0], v[1], v[2])).normalize_or_zero();
         [r.x, r.y, r.z, v[3]]
     };
-    let t = (m3 * Vec3::new(a.t[0], a.t[1], a.t[2])).normalize_or_zero();
-    GpuTriAttr { n0: n(a.n0), n1: n(a.n1), n2: n(a.n2), uv: a.uv, t: [t.x, t.y, t.z, a.t[3]], x: [a.x[0] + lod_offset(w), f32::from_bits(object), a.x[2], a.x[3]] }
+    let flip = if mirrors(w) { -1.0 } else { 1.0 };
+    let t = |v: [f32; 4]| {
+        let r = (m3 * Vec3::new(v[0], v[1], v[2])).normalize_or_zero();
+        [r.x, r.y, r.z, v[3] * flip]
+    };
+    GpuTriAttr { n0: n(a.n0), n1: n(a.n1), n2: n(a.n2), uv: a.uv, t: t(a.t), x: [a.x[0], f32::from_bits(object), a.x[2], a.x[3]], t1: t(a.t1), t2: t(a.t2) }
 }
 
 #[repr(C)]
@@ -356,8 +536,10 @@ pub struct GpuTriAttr {
     pub n1: [f32; 4], // normal1, w = uv0.y
     pub n2: [f32; 4], // normal2, w = uv1.x
     pub uv: [f32; 4], // uv1.y, uv2.x, uv2.y, material (bits)
-    pub t: [f32; 4],  // tangent (dP/du), w = bitangent sign
-    pub x: [f32; 4],  // texture LOD constant 0.5*log2(uv area / world area), object index (bits), -, -
+    pub t: [f32; 4],  // its first corner's tangent (dP/du), w = the frame's hand (0: the triangle has no tangents)
+    pub x: [f32; 4],  // -, object index (bits), a particle's area, its emitter entry + 1 (bits; 0: not light-sampled)
+    pub t1: [f32; 4], // its second corner's tangent
+    pub t2: [f32; 4], // its third corner's
 }
 
 #[repr(C)]
@@ -368,7 +550,7 @@ pub struct GpuMaterial {
     pub params: [f32; 4],     // metallic, roughness, specular, normal scale
     pub tex0: [i32; 4],       // base, normal, roughness(G), metalness(B)
     pub tex1: [i32; 4],       // emissive, occlusion(R), flags, material function + 1 (0 = none)
-    pub uv: [f32; 4],         // uv repeat xy, transmission texture (R) + 1 (0 = none; glTF), -
+    pub uv: [f32; 4],         // uv repeat xy, transmission texture (R) + 1 (0 = none; glTF), 1 = it reads vertex colours
     pub uv2: [f32; 4],        // uv offset xy, -, alpha cutoff (0 = opaque)
     pub layer: [f32; 4],      // transmission (glass), index of refraction, clearcoat, clearcoat roughness
     pub mp: [[f32; 4]; 8],    // material function parameters
@@ -406,11 +588,48 @@ pub struct CameraData {
     pub dof: Option<desc::Dof>,
 }
 
+/// The environment beside its sky, as the world describes it: one derivation (`of`) for a build and for an edit, one
+/// place that says what the kernel takes from it (`write`, `features`).
+#[derive(Clone, Debug)]
+pub struct EnvSettings {
+    pub fog: Option<desc::Fog>,
+    /// three.js `scene.background` (`desc::Environment::background`): the kernel's F_BACKGROUND, `Params::background`.
+    pub background: Option<[f32; 3]>,
+    /// The sky's aerial perspective (`aerial_params`): the kernel's F_AERIAL, `Params::aerial`.
+    pub aerial: [f32; 4],
+    /// Global wetness and rain intensity (0..1).
+    pub wetness: f32,
+    pub rain: f32,
+    /// Cloud cover (0..1) of an atmosphere sky: the sky is baked with it (`bake_sky`).
+    pub cloud_cover: f32,
+}
+
+impl EnvSettings {
+    pub fn of(w: &World) -> EnvSettings {
+        let e = &w.environment;
+        EnvSettings { fog: e.fog.clone(), background: e.background, aerial: aerial_params(&e.sky), wetness: e.wetness.clamp(0.0, 1.0), rain: e.rain.clamp(0.0, 1.0), cloud_cover: e.cloud_cover.clamp(0.0, 1.0) }
+    }
+
+    /// The kernel's parameters for them.
+    pub fn write(&self, p: &mut crate::gpu::Params) {
+        p.time[1] = self.wetness;
+        p.time[2] = self.rain;
+        p.background = self.background.map_or([0.0; 4], |c| [c[0], c[1], c[2], 1.0]);
+        p.aerial = self.aerial;
+        [p.fog, p.fog_color, p.vol, p.vol2] = crate::fog_params(self.fog.as_ref());
+    }
+
+    /// The kernel features they ask for (`gpu::environment_features`).
+    pub fn features(&self) -> u32 {
+        crate::gpu::environment_features(self.fog.as_ref(), self.background.is_some(), self.aerial)
+    }
+}
+
 pub enum SkyData {
     None,
     Color(Vec3),
     /// `dynamic`: baked at `sky::DYNAMIC_SKY` (the live view re-bakes it as the sun moves); `glow`: night-sky radiance.
-    Atmosphere { sun_dir: Vec3, sun_lux: Vec3, rayleigh: f32, mie: f32, g: f32, ground: Vec3, sun_node: Option<usize>, dynamic: bool, glow: crate::sky::Glow },
+    Atmosphere { sun_dir: Vec3, sun_lux: Vec3, rayleigh: f32, mie: f32, g: f32, ground: Vec3, dynamic: bool, glow: crate::sky::Glow },
     Gradient(crate::sky::Gradient),
 }
 
@@ -453,12 +672,8 @@ pub struct Scene {
     pub lights: Vec<GpuLight>,
     pub camera: CameraData,
     pub sky: SkyData,
-    pub fog: Option<desc::Fog>,
-    /// Global wetness and rain intensity (0..1).
-    pub wetness: f32,
-    pub rain: f32,
-    /// Cloud cover (0..1) of an atmosphere sky.
-    pub cloud_cover: f32,
+    /// The environment beside its sky (`EnvSettings::of`).
+    pub environment: EnvSettings,
     pub preset: desc::Preset,
     pub stats: HashMap<&'static str, f64>,
     /// Triangle ranges per object (name, first, end), in `tris` order: picking and selection outlines.
@@ -468,16 +683,26 @@ pub struct Scene {
     /// Some object has instance colours (`InstanceTable::colors`): the kernel's F_TINT, 4 vec4s an object
     /// (`object_stride`).
     pub tinted: bool,
-    /// three.js `scene.background` (`desc::Environment::background`): the kernel's F_BACKGROUND, `Params::background`.
-    pub background: Option<Vec3>,
-    /// The sky's aerial perspective (`aerial_params`): the kernel's F_AERIAL, `Params::aerial`.
-    pub aerial: [f32; 4],
     /// Instanced static glTF meshes (model-space triangles, flags, attributes) and their placements. `prepare` appends
     /// the pool after the flattened triangles (hardware RT) or flattens the instances (software traversal).
     pub pool_tris: Vec<[Vec3A; 3]>,
     pub pool_attrs: Vec<GpuTriAttr>,
     pub meshes: Vec<InstMesh>,
     pub instances: Vec<Instance>,
+    /// What the skinning pass reads of the models whose meshes deform (`Skinned::source`): a model's triangles as
+    /// its file has them, in its mesh's order. One a model, whatever its placements and poses.
+    pub skin_sources: Vec<Vec<[skin::SkinCorner; 3]>>,
+    /// Beside each: the model's palette as its file has it (its bind pose), and, under software traversal with units
+    /// (lib.rs `unit_trees`), the tree over that pose's triangles: the shape of the tree of each mesh skinned from the
+    /// source, whose boxes are taken again at each pose (`units::refit`). The source's triangles are in its order.
+    pub skin_rest: Vec<Vec<skin::PaletteRows>>,
+    pub skin_trees: Vec<Vec<crate::bvh::GpuNode>>,
+    /// The triangles as shared vertices and indices (indexed.rs), in the GPU's order: `prepare` makes them.
+    pub indexed: crate::indexed::Indexed,
+    /// The meshes' sections (`InstMesh::sect_first`) and the instances' rows (`Instance::rows`): as the kernel reads
+    /// the rows once `prepare` has set where each section's triangles and emitters are.
+    pub sections: Vec<Section>,
+    pub rows: Vec<Row>,
     /// Kernel records of `instances` (`prepare`, hardware RT).
     pub gpu_instances: Vec<GpuInstance>,
     /// Where engine handles landed in the GPU tables, for edits without a rebuild (`LiveCore::commit`).
@@ -537,84 +762,266 @@ pub struct Retained {
     pub textures: HashMap<(u32, bool), i32>,
     /// Material function name -> index (GpuMaterial.tex1[3] - 1).
     pub shaders: HashMap<String, i32>,
-    /// Object -> object-table index (objects that draw triangles: meshes, models, rect-light cards).
-    pub objects: HashMap<u32, u32>,
+    /// A model file's material -> `materials` index: by (the file, with its functions if it has any; the material's
+    /// index in the file, usize::MAX for the file's default one).
+    pub asset_materials: HashMap<(String, usize), u32>,
+    /// Object -> where what it draws landed (`Proxy`): meshes, models, rect-light cards, instanced objects.
+    pub proxies: HashMap<u32, Proxy>,
     /// Object of each `lights` entry, same order (`prepare` sorts both).
     pub light_nodes: Vec<u32>,
-    /// Rect-light object with a visible card -> its card material.
-    pub cards: HashMap<u32, u32>,
     /// Atmosphere sun: its colour comes from the sky bake.
     pub sun: Option<u32>,
-    /// Posed models and movable objects (dynamic triangles) -> what re-transforming them in place needs.
-    pub dynamic: HashMap<u32, DynamicModel>,
-    /// Movable models placed as instances (hardware RT) -> their instance: a move updates its transform, not triangles.
-    pub instance_of: HashMap<u32, u32>,
-    /// Posed rigid models split by node (`RigidModel`): a new pose moves their nodes' instances.
-    pub rigid: HashMap<u32, RigidModel>,
-    /// Posed models sharing a pose (`PoseGroup`), and each member's group (members are in `instance_of` too).
-    pub pose_groups: Vec<PoseGroup>,
-    pub pose_member: HashMap<u32, u32>,
-    /// `own_blas` meshes placed as instances (hardware RT): object -> its instance; (geometry, GPU material) -> the
-    /// shared mesh (objects with the same geometry and material share its BLAS). live/edits.rs `edit_geometry` keeps both.
-    pub own_instance: HashMap<u32, u32>,
-    pub own_mesh: HashMap<(u32, u32), u32>,
-    /// Emitting `own_blas` meshes (`InstMesh::emits`): object -> its mesh (its own, in world space).
-    pub emitter_mesh: HashMap<u32, u32>,
-    /// Instanced objects (`Kind::Instanced`) placed as instances -> where (live/edits.rs `update_instanced`).
-    pub instanced: HashMap<u32, InstancedPlace>,
+    /// Posed skinned models' meshes (`Skinned`: a model's proxy names its own, `MeshKind::Skinned`). One an edit took
+    /// out again has no mesh (`u32::MAX`) until the next one placed takes its slot.
+    pub skinned: Vec<Skinned>,
+    /// Posed skinned models an edit can place another of: (uri, nodes) -> one of `skinned` that the build placed, with
+    /// the file's own materials (what the pass skins it from, its mesh's sections and rows are the model's).
+    pub skinned_model: HashMap<(String, Option<Vec<String>>), u32>,
+    /// Meshes and instanced objects: (geometry, whether by its groups: `by_groups`) -> the shared mesh (objects of the
+    /// same geometry share its BLAS, whatever their materials: those are their instances' rows). live/edits.rs
+    /// `edit_geometry` keeps it.
+    pub own_mesh: HashMap<(u32, bool), u32>,
+    /// Whether the scene said a mesh's geometry will be edited or driven (`own_blas`, `driven`): it gets room for
+    /// edits in place (gpu.rs `EditRoom`).
+    pub edits_meshes: bool,
     /// Static models' instanced meshes by (uri, nodes), those with nothing flattened per placement: a model added in
     /// place is another instance of one (live/edits.rs `edit_geometry`).
     pub model_mesh: HashMap<(String, Option<Vec<String>>), u32>,
+    /// Posed rigid models' parts by (uri, `rigid_pose_key`), each its node (`STILL_NODES`) and its mesh, where every
+    /// part is a mesh with nothing flattened beside: one added in place is an instance of each.
+    pub rigid_meshes: HashMap<(String, String), Vec<(usize, u32)>>,
+    /// A model's mesh's rows as every instance of it has them (the file's materials, `model_sections`; where a
+    /// section's triangles and emitters are is each instance's to fill).
+    pub mesh_rows: HashMap<u32, Vec<Row>>,
 }
 
-/// Where an instanced object's instances are: `capacity` of them from `first` in `instances` (triangles) or `procs`
-/// (procedural), with object-table entries from `object`, one each; the first `drawn` were last written with their
-/// matrices (the rest are hidden, and an update leaves them be).
+/// Where what one object of the world draws landed in the GPU's tables: its entry in the objects table and how its
+/// geometry is held. Edits in place go through it (live/edits.rs `LiveCore::commit`).
+#[derive(Clone, Default)]
+pub struct Proxy {
+    /// Object-table index (pivot, bounds, power, customData). None: an instanced object (an entry a copy: from
+    /// `InstancedPlace::object` for instances; a flattened one's are the build's alone).
+    pub object: Option<u32>,
+    /// A rect light's visible card: its material.
+    pub card: Option<u32>,
+    pub draw: Draw,
+}
+
+/// How a drawn object's geometry is held.
+#[derive(Clone, Default)]
+pub enum Draw {
+    /// As the build placed it, with nothing kept to change it by: triangles flattened into the static groups, a
+    /// static model's instance. An edit that would change it rebuilds.
+    #[default]
+    Fixed,
+    /// World-space triangles in the dynamic groups, re-transformed (a movable object) or re-skinned (a posed model)
+    /// on the CPU.
+    Dynamic(DynamicModel),
+    /// An instance of a model-space mesh (hardware RT, or software traversal's units).
+    Instance(InstanceRef),
+    /// Procedural geometry: its index in `procs` (its record less the first procedural record).
+    Procedural(u32),
+    /// A posed rigid model split by node: a new pose moves its nodes' instances.
+    Rigid(RigidModel),
+    /// An instanced object's copies (live/edits.rs `update_instanced`).
+    Instanced(InstancedPlace),
+}
+
+/// One instance of a mesh: its index in `instances`, which is its record (the build's, or one of the edit room's).
+#[derive(Clone, Copy, Debug)]
+pub struct InstanceRef {
+    pub instance: u32,
+    pub mesh: MeshKind,
+    /// A move is its transform's, not its triangles' (a mesh a body drives, a movable model the build placed).
+    pub moves: bool,
+}
+
+/// What mesh an instance is of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MeshKind {
+    /// A model's.
+    Model,
+    /// A posed skinned model's own (`Retained::skinned`): skinned again at a new pose; the model moves as its instance.
+    Skinned(u32),
+    /// A geometry's mesh, shared by the objects of the geometry (`Retained::own_mesh`).
+    Own,
+}
+
+impl MeshKind {
+    /// An `own_blas` mesh: what a geometry edit makes and places again (a model's is the build's).
+    pub fn own(self) -> bool {
+        matches!(self, MeshKind::Own)
+    }
+}
+
+impl Retained {
+    /// The object's proxy, made if it has none yet (the build, an edit that places it).
+    pub fn proxy(&mut self, id: u32) -> &mut Proxy {
+        self.proxies.entry(id).or_default()
+    }
+
+    /// Its object-table index.
+    pub fn object(&self, id: u32) -> Option<u32> {
+        self.proxies.get(&id)?.object
+    }
+
+    /// Its instance, if it is one of a mesh.
+    pub fn instance(&self, id: u32) -> Option<&InstanceRef> {
+        match &self.proxies.get(&id)?.draw {
+            Draw::Instance(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn instanced(&self, id: u32) -> Option<&InstancedPlace> {
+        match &self.proxies.get(&id)?.draw {
+            Draw::Instanced(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn rigid(&self, id: u32) -> Option<&RigidModel> {
+        match &self.proxies.get(&id)?.draw {
+            Draw::Rigid(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Whether any object's move is an instance's transform (a movable or driven instance, a rigid model's nodes).
+    pub fn moves_instances(&self) -> bool {
+        self.proxies.values().any(|p| matches!(&p.draw, Draw::Rigid(_)) || matches!(&p.draw, Draw::Instance(i) if i.moves))
+    }
+
+    /// The records of the instances an edit moves in place: a mesh's or a model's that moves (a body's, a movable
+    /// one's), a posed rigid model's parts that move (`RigidModel::moving`), an instanced object's copies.
+    pub fn moving_records(&self) -> std::collections::HashSet<u32> {
+        self.proxies
+            .values()
+            .flat_map(|p| match &p.draw {
+                Draw::Instance(i) if i.moves => vec![i.instance],
+                Draw::Rigid(r) => r.moving(),
+                Draw::Instanced(c) if c.mesh.is_some() => (c.first..c.first + c.capacity).collect(),
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    /// Whether any object is a mesh the scene edits or drives (what geometry edits place again).
+    pub fn has_own_instances(&self) -> bool {
+        self.edits_meshes
+    }
+
+    /// The triangles re-transformed on the CPU: the dynamic objects' and the rigid models' flattened ones.
+    pub fn dynamics_mut(&mut self) -> impl Iterator<Item = &mut DynamicModel> {
+        self.proxies.values_mut().filter_map(|p| match &mut p.draw {
+            Draw::Dynamic(d) => Some(d),
+            Draw::Rigid(r) => Some(&mut r.rest),
+            _ => None,
+        })
+    }
+}
+
+/// Where an instanced object's instances are: `capacity` of them from `first` in `instances` (instances of `mesh`) or
+/// in `procs` (procedural copies: no mesh), with object-table entries from `object`, one each; the first `drawn`
+/// were last written with their matrices (the rest are hidden, and an update leaves them be).
 #[derive(Clone, Copy, Debug)]
 pub struct InstancedPlace {
     pub first: u32,
     pub capacity: u32,
     pub object: u32,
-    pub procedural: bool,
+    pub mesh: Option<u32>,
     pub drawn: u32,
 }
 
-/// A posed glTF model without skins whose clip moves some of its nodes (Zero Day's 551 moving objects): the nodes the
-/// clip leaves alone are ordinary static triangles; each moving mesh node is an instance of its own mesh (its triangles
-/// in the node's space, one BLAS built once), placed at object x node transform, so a new pose moves instances and
-/// rebuilds the TLAS only. Their glass / emissive / function triangles are flattened (shadow rays, emitter sampling):
-/// `rest`, re-transformed in place from `rest_local`.
+/// A posed glTF model without skins whose clips move some of its nodes (Zero Day's 551 moving objects), in parts
+/// (`RigidPart`), each an instance of a mesh every placement of the model shares: the nodes no clip of the file
+/// moves and the pose does not name merged into one mesh in the model's space, placed by the object's transform;
+/// each other node a mesh in the node's space, placed at object x node transform, so a new pose, of whichever clip,
+/// moves instances only (a part's emitters are its
+/// instance's in the light list, filled again when it moves). What `flatten_coincident` takes out of a part's mesh
+/// is flattened: `rest`, re-transformed in place from `rest_local`.
 #[derive(Clone, Default)]
 pub struct RigidModel {
-    /// (glTF node, instance index).
+    /// (glTF node, instance index): the nodes a pose may move.
     pub instances: Vec<(usize, u32)>,
+    /// The instance of the nodes it leaves alone, if any is drawn. It moves with the object alone; its emitters are
+    /// still ones until the object first moves (`still_moves`: live/edits.rs `repose_rigid`).
+    pub still: Option<u32>,
+    pub still_moves: bool,
+    /// The object's transform its parts were last placed by, as `World::world_matrix` gives it (an update compares
+    /// with it to tell a move from a new pose).
+    pub world: Mat4,
     pub rest: DynamicModel,
-    /// Per `rest` triangle: its node and its node-space triangle (positions, normals, uvs, tangent).
-    pub rest_local: Vec<(usize, [Vec3; 3], [Vec3; 3], [Vec2; 3], Option<(Vec3, f32)>)>,
+    /// Per `rest` triangle: its node (`STILL_NODES`: the model's own space) and its triangle there (positions,
+    /// normals, uvs, tangent).
+    pub rest_local: Vec<(usize, [Vec3; 3], [Vec3; 3], [Vec2; 3], Option<CornerTangents>)>,
+    /// `rigid_pose_key` of the pose its parts were made for: a pose with another is other parts (a build's to make).
+    pub pose: String,
 }
 
-/// Posed skinned models in the same pose (the same model, nodes, clip and time: a crowd whose game shares a few walk
-/// phases). One model-space mesh holds the pose, skinned once per new pose and its BLAS rebuilt; each model is an
-/// instance of it, moved by its transform (hardware RT). Only meshes without triangles flattened per placement.
+/// In place of a node: the nodes no pose of a rigid model moves, merged (their space is the model's).
+pub const STILL_NODES: usize = usize::MAX;
+
+/// What a rigid model's parts go by, beside the model: the nodes its pose names (`skin::Model::moving_nodes`: they
+/// are parts with the nodes the file's clips move, whichever clip plays).
+pub fn rigid_pose_key(a: &desc::Animation) -> String {
+    a.nodes.keys().cloned().collect::<Vec<_>>().join("\u{0}")
+}
+
+impl RigidModel {
+    /// The records of all its instances.
+    pub fn records(&self) -> Vec<u32> {
+        self.instances.iter().map(|&(_, i)| i).chain(self.still).collect()
+    }
+
+    /// Those whose emitters are moving ones: its nodes', and the still part's once the object has moved.
+    pub fn moving(&self) -> Vec<u32> {
+        self.instances.iter().map(|&(_, i)| i).chain(self.still.filter(|_| self.still_moves)).collect()
+    }
+
+    /// A part's transform for the object's `m` and the pose's node transforms.
+    pub fn part_world(m: Mat4, node: usize, globals: &[Mat4]) -> Mat4 {
+        if node == STILL_NODES { m } else { m * globals[node] }
+    }
+}
+
+/// A part of a rigid model as the build makes it once for the placements of the model with a clip: its node
+/// (`STILL_NODES`), its mesh (None: nothing of it stays in a mesh), and what `flatten_coincident` took out, in the
+/// part's space with its material.
+struct RigidPart {
+    node: usize,
+    mesh: Option<u32>,
+    rest: Vec<([Vec3; 3], [Vec3; 3], [Vec2; 3], Option<CornerTangents>, u32)>,
+}
+
+/// A posed skinned model's mesh: the model's triangles in its own space, a mesh a model. The skinning pass skins it at
+/// each new pose (gpu.rs `skin`: the CPU sends the pose's matrices) and its BLAS is built again; the model moves as
+/// its instance (hardware RT). Never shared: two models in one pose are two meshes (a mesh shared came apart when
+/// one of them took another pose, and that was a rebuild). Only meshes without triangles flattened per placement.
 #[derive(Clone, Debug)]
-pub struct PoseGroup {
+pub struct Skinned {
     pub mesh: u32,
     pub uri: String,
     pub nodes: Option<Vec<String>>,
     /// The pose the mesh holds.
     pub animation: desc::Animation,
-    /// Per pool triangle of the mesh, in order: its index in the model's triangles and its material.
-    pub order: Vec<(u32, u32)>,
-    /// (object, instance) of each member.
-    pub members: Vec<(u32, u32)>,
+    /// Per pool triangle of the mesh, in order: its index in the model's triangles, its section and its index in it
+    /// (the model's: one list for all its placements).
+    pub order: Arc<Vec<(u32, u32, u32)>>,
+    /// Its object, and its instance.
+    pub object: u32,
+    pub instance: u32,
+    /// What the skinning pass skins it from (`Scene::skin_sources`), how many matrices its pose is
+    /// (`skin::Model::palette`), and the primitives the pose its mesh was made for mirrors (`skin::Model::mirrored`:
+    /// a pose that mirrors others has its triangles in another order, a build's to make).
+    pub source: u32,
+    pub palette_len: u32,
+    pub mirrors: Vec<bool>,
 }
 
-/// What groups posed models into a `PoseGroup`: model, nodes, clip, time (bits), loop.
-type PoseKey = (String, Option<Vec<String>>, String, u32, bool);
-
 /// pathtrace.wgsl `Medium`: world -> local affine rows (the unit box / sphere's space), (function, shape or
-/// `MEDIUM_HIDDEN`, homogeneous, animated),
-/// (majorant 1/m, HG anisotropy, -, -), the node's customData, 32 parameter floats.
+/// `MEDIUM_HIDDEN`, homogeneous, animated), (majorant 1/m, HG anisotropy, its density grid's first layer in the atlas
+/// and its cells, as bits: 0 without one), the node's customData, 32 parameter floats.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MediumGpu {
@@ -640,6 +1047,51 @@ pub struct GridBuild {
     pub medium: u32,
     /// `world::DensityGrid::made`.
     pub made: u32,
+}
+
+/// Where density grid `gid` lies in the atlas, as a medium's record has it (b.zw: its first layer and its cells, as
+/// bits). The first volume that names a grid has it built (`grids`: stacked along z in the order they come; `node`
+/// and `medium`: that volume's), its program by its rank among `programs`. The build and the live view's media
+/// table both come here.
+pub fn grid_of(w: &World, grids: &mut Vec<GridBuild>, programs: &[(String, String, String)], gid: u32, node: u32, medium: u32) -> Result<[f32; 2]> {
+    let k = match grids.iter().position(|b| b.id == gid) {
+        Some(k) => k,
+        None => {
+            let dg = w.grids.get(&gid).ok_or_else(|| anyhow!("unknown density grid {gid}"))?;
+            let program = match &dg.program {
+                Some((name, _)) => Some(programs.iter().position(|(k, _, _)| k == name).ok_or_else(|| anyhow!("unknown grid program {name}"))? as u32),
+                None => None,
+            };
+            let mut gp = [0.0f32; 32];
+            for (k, v) in dg.program.iter().flat_map(|(_, p)| p.iter()).take(32).enumerate() {
+                gp[k] = *v;
+            }
+            let z0 = grids.iter().map(|b| b.dims[2]).sum::<u32>();
+            let cells = grids.iter().map(|b| b.dims).chain([dg.dims]).map(|d| d.iter().map(|&d| d as u64).product::<u64>()).sum::<u64>();
+            // (The atlas is as wide and high as the widest and highest grid: its texels count too.)
+            let atlas = grids.iter().map(|b| b.dims[0]).chain([dg.dims[0]]).max().unwrap() as u64 * grids.iter().map(|b| b.dims[1]).chain([dg.dims[1]]).max().unwrap() as u64 * (z0 + dg.dims[2]) as u64;
+            if cells > world::GRID_MAX_SCENE_CELLS || atlas > 2 * world::GRID_MAX_SCENE_CELLS || z0 + dg.dims[2] > world::GRID_MAX_LAYERS {
+                return Err(anyhow!("the scene's density grids exceed {} cells or {} layers along z together (or differ too much in width and height)", world::GRID_MAX_SCENE_CELLS, world::GRID_MAX_LAYERS));
+            }
+            grids.push(GridBuild { id: gid, dims: dg.dims, z0, data: dg.data.clone(), program, params: gp, node, medium, made: dg.made });
+            grids.len() - 1
+        }
+    };
+    let b = &grids[k];
+    Ok([f32::from_bits(b.z0), f32::from_bits(b.dims[0] | b.dims[1] << 10 | b.dims[2] << 20)])
+}
+
+impl MediumGpu {
+    /// A volume's record: the object `o` (a `Kind::Volume`) placed by `m`, its function's number, whether it is shown
+    /// (a hidden one is built with no shape, to be shown in place), and its density grid's place (`grid`: b.zw).
+    pub fn of(o: &world::Object, m: Mat4, function: u32, shown: bool, grid: [f32; 2]) -> Option<MediumGpu> {
+        let Kind::Volume { params, shape, majorant, g, homogeneous, animated, .. } = &o.kind else { return None };
+        let mut p = [0.0f32; 32];
+        for (k, v) in params.iter().take(32).enumerate() {
+            p[k] = *v;
+        }
+        Some(MediumGpu { w: medium_rows(m), a: [function, if shown { *shape } else { MEDIUM_HIDDEN }, *homogeneous as u32, *animated as u32], b: [majorant.max(0.0), g.clamp(-0.99, 0.99), grid[0], grid[1]], c: o.custom, p })
+    }
 }
 
 /// The world -> local rows of a medium whose node has world matrix `m` (pathtrace.wgsl `Medium.w0..w2`).
@@ -707,16 +1159,46 @@ struct TexCache {
 }
 
 impl TexCache {
-    fn add(&mut self, key: (String, bool), wrap: bool, img: impl FnOnce() -> Result<std::sync::Arc<image::RgbaImage>>) -> Result<i32> {
+    fn add(&mut self, key: (String, bool), wrap: bool, mut img: impl FnMut() -> Result<std::sync::Arc<image::RgbaImage>>) -> Result<i32> {
         if let Some(i) = self.by_key.get(&key) {
             return Ok(*i);
         }
         let img = img()?;
         let id = self.textures.len() as i32;
-        self.textures.push(Texture { width: img.width(), height: img.height(), rgba: img, srgb: key.1, key: format!("{}|{}|{}", key.0, key.1, wrap), wrap });
+        self.textures.push(Texture::of(&key.0, key.1, wrap, img));
         self.by_key.insert(key, id);
         Ok(id)
     }
+}
+
+impl Texture {
+    /// A texture of the pages: an image (its source's identity `key`: `texture_image`), read as sRGB or not, wrapped
+    /// or clamped.
+    pub fn of(key: &str, srgb: bool, wrap: bool, img: Arc<image::RgbaImage>) -> Texture {
+        Texture { width: img.width(), height: img.height(), rgba: img, srgb, key: Texture::key_of(key, srgb, wrap), wrap }
+    }
+
+    /// The pages' key of the texture `of` makes.
+    pub fn key_of(key: &str, srgb: bool, wrap: bool) -> String {
+        format!("{key}|{srgb}|{wrap}")
+    }
+
+    /// A world's texture as a material's slot has it (`srgb_default`: whether the slot is a colour's), decoded. As
+    /// the build makes it, so the pages know one they have by its key.
+    pub fn of_world(t: &world::Texture, srgb_default: bool, assets: &Path) -> Result<Texture> {
+        let (key, img) = texture_image(t, assets)?;
+        Ok(Texture::of(&key, t.srgb && srgb_default, t.wrap, img))
+    }
+}
+
+/// The textures a material's GPU form names, as `build_material` asks for them: (texture, sRGB requested).
+pub fn material_textures(id: u32, m: &desc::Material, textures: &HashMap<u32, world::Texture>, shaders: &HashMap<String, i32>) -> Result<Vec<(u32, bool)>> {
+    let mut out = vec![];
+    build_material(id, m, textures, shaders, &mut |tid, srgb| {
+        out.push((tid, srgb));
+        Ok(0)
+    })?;
+    Ok(out)
 }
 
 /// Identity of a file version: (path, length, mtime). Assets and textures rarely change, so they are parsed /
@@ -776,7 +1258,7 @@ fn bytes_key(kind: &str, bytes: &[u8]) -> String {
 fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image::RgbaImage>)> {
     match &t.source {
         world::TextureSource::File(uri) => {
-            let path = assets.join(uri);
+            let path = crate::files::asset_path(assets, uri);
             let key = file_key(&path);
             Ok((key.clone(), cached_image(&key, || crate::files::image(&path).with_context(|| format!("texture {uri}")))?))
         }
@@ -788,12 +1270,18 @@ fn texture_image(t: &world::Texture, assets: &Path) -> Result<(String, Arc<image
             let key = bytes_key(&format!("pixels{width}x{height}"), rgba);
             Ok((key.clone(), cached_image(&key, || image::RgbaImage::from_raw(*width, *height, rgba.to_vec()).context("generated texture: size does not match the pixels"))?))
         }
+        // A stream's identity is its name and size, whatever its pixels: the pages keep its place (texpack.rs
+        // `stream_name`), and the app's pictures go straight into it (gpu.rs `write_stream`).
+        world::TextureSource::Stream { name, width, height, rgba } => {
+            let image = image::RgbaImage::from_raw(*width, *height, rgba.to_vec()).context("stream texture: size does not match the pixels")?;
+            Ok((crate::texpack::stream_key(name, *width, *height), Arc::new(image)))
+        }
     }
 }
 
 /// A model file (cached per file version).
 pub fn model_gltf(uri: &str, assets: &Path) -> Result<Arc<skin::Model>> {
-    let path = assets.join(uri);
+    let path = crate::files::asset_path(assets, uri);
     cached_gltf(&file_key(&path), || skin::Model::new(import_gltf(&path).with_context(|| format!("asset {uri}"))?))
 }
 
@@ -826,7 +1314,7 @@ pub fn build_material(id: u32, m: &desc::Material, textures: &HashMap<u32, world
         params: [m.metalness, m.roughness, 0.5 * m.specular_intensity.unwrap_or(1.0), m.normal_scale.map(|s| s[0]).unwrap_or(1.0)],
         tex0: [slot(&m.map, true)?, slot(&m.normal_map, false)?, slot(&m.roughness_map, false)?, slot(&m.metalness_map, false)?],
         tex1: [slot(&m.emissive_map, true)?, slot(&m.ao_map, false)?, if m.unlit { MAT_UNLIT } else if m.double_sided { MAT_DOUBLE_SIDED } else { 0 }, 0],
-        uv: [repeat[0], repeat[1], slot(&m.transmission_map, false)? as f32 + 1.0, 0.0],
+        uv: [repeat[0], repeat[1], slot(&m.transmission_map, false)? as f32 + 1.0, if m.vertex_colors { 1.0 } else { 0.0 }],
         uv2: [offset[0], offset[1], 0.0, m.alpha_test.unwrap_or(0.0)],
         layer: [m.transmission.unwrap_or(0.0).clamp(0.0, 1.0), m.ior.unwrap_or(1.5).max(1.0), m.clearcoat.unwrap_or(0.0).clamp(0.0, 1.0), m.clearcoat_roughness.unwrap_or(0.0).clamp(0.0, 1.0)],
         mp: [[0.0; 4]; 8],
@@ -944,8 +1432,67 @@ pub const MAX_MEDIA: usize = 32;
 /// (pathtrace.wgsl `medium_span`).
 pub const MEDIUM_HIDDEN: u32 = 2;
 
-pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<Scene> {
-    let t0 = web_time::Instant::now();
+/// The scene's sky as the renderer bakes it, and the atmosphere's sun (its light object: `Retained::sun`). `matrix`:
+/// an object's world matrix (the build has its own, a product in another order than `World::world_matrix`'s: the
+/// same to the bit only for an object without a parent).
+pub fn sky_data(w: &World, assets: &Path, matrix: &dyn Fn(u32) -> Mat4) -> Result<(SkyData, Option<u32>)> {
+    let mut sun_id = None;
+    let sky = match &w.environment.sky {
+        Sky::Atmosphere { sun, ground_albedo, rayleigh_scale, mie_scale, mie_anisotropy, dynamic, glow, horizon_glow, .. } => {
+            let sun_light = sun.and_then(|s| w.objects.get(&s).map(|o| (s, o)));
+            let (sun_dir, sun_lux) = match sun_light.map(|(s, o)| (matrix(s), &o.kind)) {
+                Some((m, Kind::Light(Light::Directional { color, intensity, .. }))) => (-m.transform_vector3(Vec3::NEG_Z).normalize(), Vec3::from(*color) * *intensity),
+                _ => (Vec3::Y, Vec3::ZERO),
+            };
+            sun_id = sun_light.map(|(s, _)| s);
+            SkyData::Atmosphere {
+                sun_dir,
+                sun_lux,
+                rayleigh: *rayleigh_scale,
+                mie: *mie_scale,
+                g: *mie_anisotropy,
+                ground: Vec3::from(*ground_albedo),
+                dynamic: *dynamic,
+                glow: crate::sky::glow_of(glow, horizon_glow),
+            }
+        }
+        Sky::Color { color, intensity, .. } if *intensity > 0.0 => SkyData::Color(Vec3::from(*color) * *intensity),
+        Sky::Color { .. } => SkyData::None,
+        Sky::Hdri { .. } => return Err(anyhow!("hdri environments are not supported by the native renderer yet")),
+        Sky::Gradient { zenith, horizon, ground, intensity, horizon_exponent, glow, clouds, .. } => {
+            let cloud_map = match clouds.as_ref().and_then(|c| c.map.map(|m| (c, m))) {
+                Some((c, tid)) => {
+                    let t = w.textures.get(&tid).ok_or_else(|| anyhow!("unknown texture {tid}"))?;
+                    let (key, image) = texture_image(t, assets)?;
+                    Some(crate::sky::CloudMap {
+                        key,
+                        image,
+                        threshold: c.threshold.unwrap_or([0.35, 0.85]),
+                        gain: c.gain.unwrap_or(1.8),
+                        offset: Vec3::from(c.color) * *intensity,
+                        projection: c.projection.unwrap_or(0.35),
+                        bias: c.bias.unwrap_or(0.25),
+                        fade: c.fade.unwrap_or(4.0),
+                    })
+                }
+                None => None,
+            };
+            SkyData::Gradient(crate::sky::Gradient {
+                zenith: Vec3::from(*zenith) * *intensity,
+                horizon: Vec3::from(*horizon) * *intensity,
+                ground: Vec3::from(*ground) * *intensity,
+                horizon_exponent: *horizon_exponent,
+                glow: glow.as_ref().map(|g| (Vec3::from(g.color) * g.intensity * *intensity, g.height.max(1e-3), g.width.map(|w| (w, g.power.unwrap_or(6.0))))),
+                clouds: if cloud_map.is_some() { None } else { clouds.as_ref().map(|c| (c.coverage, Vec3::from(c.color) * *intensity, c.scale.max(0.05), c.seed)) },
+                cloud_map,
+            })
+        }
+    };
+    Ok((sky, sun_id))
+}
+
+/// A world's render preset: the preset its settings name, the settings' overrides over it, then `overrides`.
+pub fn preset_of(w: &World, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<desc::Preset> {
     let st = &w.settings;
     let mut preset_json: serde_json::Value = serde_json::from_slice(&crate::files::preset(presets_dir, &st.preset).with_context(|| format!("preset {}", st.preset))?)?;
     if let Some(o) = &st.overrides {
@@ -954,7 +1501,13 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     if let Some(o) = overrides {
         desc::merge_json(&mut preset_json, o);
     }
-    let preset: desc::Preset = serde_json::from_value(preset_json)?;
+    Ok(serde_json::from_value(preset_json)?)
+}
+
+pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&serde_json::Value>) -> Result<Scene> {
+    let t0 = web_time::Instant::now();
+    let st = &w.settings;
+    let preset = preset_of(w, presets_dir, overrides)?;
     let order = w.ordered();
     let mut worlds: HashMap<u32, Mat4> = HashMap::new();
     for id in &order {
@@ -1027,7 +1580,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 Some(d) => d.clone(),
                 None => texture_image(t, assets)?,
             };
-            let slot = texcache.add((key, srgb), t.wrap, || Ok(img))?;
+            let slot = texcache.add((key, srgb), t.wrap, || Ok(img.clone()))?;
             retained.textures.insert((tid, srgb_default), slot);
             Ok(slot)
         };
@@ -1059,45 +1612,40 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     let grid_programs: Vec<(String, String, String)> = w.grid_programs.iter().map(|(k, (c, h))| (k.clone(), c.clone(), h.clone())).collect();
     let mut objects: Vec<[f32; 4]> = vec![];
     // Static glTF models drawn more than once share their triangles (model space, one BLAS): opaque, shadow-casting
-    // per node, non-emissive materials without functions, not mirrored. THREERT_INSTANCING=0 flattens everything.
+    // per node. THREERT_INSTANCING=0 flattens everything.
     let instancing = std::env::var("THREERT_INSTANCING").map_or(true, |v| v != "0");
     let mut pool_tris: Vec<[Vec3A; 3]> = vec![];
     let (mut vcolors, mut pool_vcolors): (Vec<[u32; 3]>, Vec<[u32; 3]>) = (vec![], vec![]);
     // Whether a mesh's triangles carry its geometry's vertex colours: any of its materials asks for them.
     let colored = |g: &world::Geometry, mats: &mut dyn Iterator<Item = &u32>| !g.colors.is_empty() && mats.filter(|k| w.materials.get(k).is_some_and(|m| m.vertex_colors)).count() > 0;
     let mut pool_attrs: Vec<GpuTriAttr> = vec![];
-    // Model-space triangles of instanced meshes that each placement flattens (glass, emissive, functions).
+    // Model-space triangles of instanced meshes that each placement flattens (`flatten_coincident`'s pairs).
     let mut rest_tris: Vec<[Vec3A; 3]> = vec![];
     let mut rest_attrs: Vec<GpuTriAttr> = vec![];
     let mut meshes: Vec<InstMesh> = vec![];
     let mut instances: Vec<Instance> = vec![];
+    let (mut sections, mut rows): (Vec<Section>, Vec<Row>) = (vec![], vec![]);
+    // The geometries whose meshes carry vertex colours: one with colours that some object draws with a material that
+    // reads them (the mesh is every object's of that geometry, so it is settled before the first is placed).
+    let colored_meshes: std::collections::HashSet<(u32, bool)> = w
+        .objects
+        .values()
+        .filter_map(|o| match &o.kind {
+            Kind::Mesh { geometry, material, materials, .. } => Some((geometry, materials.iter().chain(std::iter::once(material)).collect::<Vec<_>>(), by_groups(w.geometries.get(geometry)?, materials.len()))),
+            Kind::Instanced { geometry, materials, procedural: false, .. } => Some((geometry, materials.iter().take(1).collect(), false)),
+            _ => None,
+        })
+        .filter(|(g, mats, _)| w.geometries.get(g).is_some_and(|g| !g.colors.is_empty()) && mats.iter().any(|k| w.materials.get(k).is_some_and(|m| m.vertex_colors)))
+        .map(|(g, _, grouped)| (*g, grouped))
+        .collect();
     let mut mesh_of: HashMap<(String, Option<Vec<String>>), Option<u32>> = HashMap::new();
-    // Posed skinned models that share a pose with another share its mesh (`PoseGroup`). THREERT_POSE_SHARE=0 skins
-    // each model alone (A/B).
-    let mut pose_key_of: HashMap<u32, PoseKey> = HashMap::new();
-    if instancing && std::env::var("THREERT_POSE_SHARE").map_or(true, |v| v != "0") {
-        let mut count: HashMap<PoseKey, usize> = HashMap::new();
-        for id in &order {
-            let Kind::Model { uri, nodes, animation: Some(a), functions } = &w.objects[id].kind else { continue };
-            if !w.shown(*id) || worlds[id].determinant() <= 0.0 {
-                continue;
-            }
-            // (Rigid models whose nodes move are `RigidModel`s.)
-            let glb = model_gltf(uri, assets)?;
-            if !glb.animated() || (nodes.is_none() && glb.rigid()) {
-                continue;
-            }
-            // (Copies with material functions share a pose only with the same functions: their own materials.)
-            let file = if functions.is_empty() { uri.clone() } else { format!("{uri}\u{0}{functions:?}") };
-            let key: PoseKey = (file, nodes.clone(), a.clip.clone(), a.time.to_bits(), a.r#loop);
-            *count.entry(key.clone()).or_default() += 1;
-            pose_key_of.insert(*id, key);
-        }
-        pose_key_of.retain(|_, k| count[k] >= 2);
-    }
-    let mut pose_group_of: HashMap<PoseKey, Option<u32>> = HashMap::new();
-    // Instanced objects' shared meshes by (geometry, GPU material); their flattened instances' triangle ranges.
-    let mut inst_mesh_of: HashMap<(u32, u32), u32> = HashMap::new();
+    // A posed rigid model's parts, by (model, clip): its placements share their meshes.
+    let mut rigid_parts: HashMap<(String, String), std::rc::Rc<Vec<RigidPart>>> = HashMap::new();
+    // What the skinning pass reads, by (model, nodes, the primitives mirrored): shared by the model's placements.
+    let mut skin_sources: Vec<Vec<[skin::SkinCorner; 3]>> = vec![];
+    let mut skin_rest: Vec<Vec<skin::PaletteRows>> = vec![];
+    let mut skin_source_of: HashMap<(String, Option<Vec<String>>, Vec<bool>), (u32, Arc<Vec<(u32, u32, u32)>>)> = HashMap::new();
+    // Flattened instances' triangle ranges.
     let mut tri_instances: Vec<(u32, u32, u32)> = vec![];
     // Instance colours anywhere: object entries of 4 vec4s, and the kernel's F_TINT.
     let tinted = w.instanced.iter().any(|(id, t)| t.colors.is_some() && w.shown(*id) && matches!(w.objects.get(id).map(|o| &o.kind), Some(Kind::Instanced { .. })));
@@ -1109,83 +1657,57 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         let shown = w.shown(*id);
         let flags = if n.cast_shadow { 0 } else { TRI_NO_SHADOW };
         match &n.kind {
-            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } if shown && instancing && mesh_mats.len() <= 1 && m.determinant() > 0.0 && (n.driven || (*own_blas && !w.movable(*id))) => {
-                // Its own BLAS (scene code's `dynamicGeometry`, or a mesh a rigid body drives: its moves are the
-                // instance's transform, `retained.instance_of`): placed like a model instance, its geometry's triangles
-                // in model space in the pool, shared by the objects of the same geometry and material. Glass, emissive
-                // and function materials are flattened (as a model's would be), so they are never instanced.
+            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } if instancing => {
+                // A mesh is an instance of its geometry's mesh: the triangles in model space in the pool, one BLAS,
+                // shared by the objects of the geometry whatever their materials, which are the instance's rows
+                // (`section_mesh`, `Row`: a cutout, glass, one that emits). A move is the instance's transform
+                // (`InstanceRef::moves`). One that is hidden (`World::shown`), or placed without size
+                // (`placed_world`), is an instance too, which no ray sees and whose object entry has no power: it
+                // comes back in place (`Instance::masked`).
                 let g = w.geometries.get(geometry).ok_or_else(|| anyhow!("object {}: unknown geometry {geometry}", n.name))?;
                 let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
-                let class = material_class(&materials[mat as usize]);
-                let vc = colored(g, &mut std::iter::once(material));
-                if class < 2 {
-                    let mesh = match retained.own_mesh.get(&(*geometry, mat)) {
-                        Some(&k) => Some(k),
-                        None => {
-                            let (t, a) = own_mesh_tris(g, mat);
-                            (!t.is_empty()).then(|| {
-                                meshes.push(own_inst_mesh(&t, pool_tris.len() as u32, class));
-                                put_colors(&mut pool_vcolors, pool_tris.len(), vc.then(|| tri_colors(g, false, None)));
-                                pool_tris.extend(t);
-                                pool_attrs.extend(a);
-                                let k = meshes.len() as u32 - 1;
-                                retained.own_mesh.insert((*geometry, mat), k);
-                                k
-                            })
-                        }
-                    };
-                    if let Some(mesh) = mesh {
-                        let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
-                        let pivot = m.transform_point3(Vec3::ZERO);
-                        let size = hi - lo;
-                        let oi = (objects.len() / stride) as u32;
-                        objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
-                        retained.objects.insert(*id, oi);
-                        retained.own_instance.insert(*id, instances.len() as u32);
-                        if n.driven {
-                            retained.instance_of.insert(*id, instances.len() as u32);
-                        }
-                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: None, hidden: false });
+                // Several materials: each geometry group's triangles with its own (three.js's material array).
+                let gpu_mats = mesh_mats.iter().map(|k| retained.materials.get(k).copied().ok_or_else(|| anyhow!("object {}: unknown material {k}", n.name))).collect::<Result<Vec<u32>>>()?;
+                let grouped = by_groups(g, gpu_mats.len());
+                let key = (*geometry, grouped);
+                let mesh = match retained.own_mesh.get(&key) {
+                    Some(&k) => Some(k),
+                    None => {
+                        let d = section_mesh(g, grouped, pool_tris.len() as u32, sections.len() as u32, colored_meshes.contains(&key));
+                        (!d.tris.is_empty()).then(|| {
+                            meshes.push(d.mesh);
+                            sections.extend(d.sections);
+                            put_colors(&mut pool_vcolors, pool_tris.len(), d.colors);
+                            pool_tris.extend(d.tris);
+                            pool_attrs.extend(d.attrs);
+                            let k = meshes.len() as u32 - 1;
+                            retained.own_mesh.insert(key, k);
+                            k
+                        })
                     }
-                    continue;
-                }
-                // (A driven emitter's triangles cannot stay in world space: it is flattened, dynamic, below.)
-                if emits_only(&materials[mat as usize]) && !n.driven {
-                    // An emitting material: its own BLAS too, but its triangles in world space (placed at identity,
-                    // never shared), so they are light-sampled as flattened triangles are and can be edited in place
-                    // (live/edits.rs `edit_geometry`; ROADMAP § 6 step 3).
+                };
+                if let Some(mesh) = mesh {
+                    let (m, gone) = placed_world(m, Vec3::ZERO);
+                    let unseen = !shown || gone;
+                    let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
+                    let pivot = m.transform_point3(Vec3::ZERO);
+                    let size = hi - lo;
                     let oi = (objects.len() / stride) as u32;
-                    let (t, a) = emitter_mesh_tris(g, m, mat, oi);
-                    if !t.is_empty() {
-                        let cutout = materials[mat as usize].uv2[3] > 0.0;
-                        let mut im = own_inst_mesh(&t, pool_tris.len() as u32, u32::from(cutout));
-                        im.emits = true;
-                        meshes.push(im);
-                        put_colors(&mut pool_vcolors, pool_tris.len(), vc.then(|| tri_colors(g, false, None)));
-                        pool_tris.extend(t);
-                        pool_attrs.extend(a);
-                        let mesh = meshes.len() as u32 - 1;
-                        objects.extend_from_slice(&object_row(m.transform_point3(Vec3::ZERO), n.power, im.hi - im.lo, n.custom, [1.0; 3])[..stride]);
-                        retained.objects.insert(*id, oi);
-                        retained.own_instance.insert(*id, instances.len() as u32);
-                        retained.emitter_mesh.insert(*id, mesh);
-                        instances.push(Instance { mesh, world: Mat4::IDENTITY, object: oi, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: None, hidden: false });
-                    }
-                    continue;
-                }
-                put_colors(&mut vcolors, tris.len(), vc.then(|| tri_colors(g, false, None)));
-                // (A driven mesh that cannot be an instance (glass, emissive, a material function): dynamic triangles,
-                // re-transformed in place as any movable mesh's.)
-                append_arrays(g, m, mat, if n.driven { flags | TRI_DYNAMIC } else { flags }, None, &mut tris, &mut tri_flags, &mut attrs);
-                if n.driven {
-                    retained.dynamic.insert(*id, DynamicModel { first, mats: attrs[first as usize..].iter().map(|a| a.uv[3].to_bits()).collect(), ..Default::default() });
+                    objects.extend_from_slice(&object_row(pivot, if unseen { 0.0 } else { n.power }, size, n.custom, [1.0; 3])[..stride]);
+                    retained.edits_meshes |= *own_blas || n.driven;
+                    *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: instances.len() as u32, mesh: MeshKind::Own, moves: n.driven || w.movable(*id) }) };
+                    let mine = section_rows(meshes[mesh as usize].sections(&sections), if grouped { &gpu_mats } else { std::slice::from_ref(&mat) }, &materials);
+                    instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: unseen, masked: unseen, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                    rows.extend(mine);
                 }
             }
             Kind::Instanced { geometry, procedural, materials: mats, capacity } if shown => {
                 // Copies of one geometry: one shared mesh (one BLAS), an instance and an object entry per copy, the
                 // copies' records and entries contiguous (live/edits.rs `update_instanced` rewrites them in place).
-                // Glass, emissive and function materials and mirrored copies are flattened instead, each copy its
-                // own triangles, as `own_blas` meshes are; changing their instances rebuilds.
+                // With a material that emits each copy has its emitters in the light list (`rows_emitters`), a
+                // hidden copy's at no weight (its object has no power). A copy may mirror
+                // the mesh (`INST_MIRRORED`). Without instancing each copy is its own triangles, and changing the
+                // instances rebuilds.
                 let empty = world::InstanceTable::default();
                 let t = w.instanced.get(id).unwrap_or(&empty);
                 let placed: Vec<(Mat4, bool)> = (0..*capacity as usize).map(|i| instance_world(m, t, i)).collect();
@@ -1193,7 +1715,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 if *procedural {
                     let object = (objects.len() / stride) as u32;
                     if let Some(p) = proc_object(w, *id, m, object, &retained.materials, assets)? {
-                        retained.instanced.insert(*id, InstancedPlace { first: procs.len() as u32, capacity: *capacity, object, procedural: true, drawn: t.count });
+                        retained.proxy(*id).draw = Draw::Instanced(InstancedPlace { first: procs.len() as u32, capacity: *capacity, object, mesh: None, drawn: t.count });
                         for (i, &(wm, hidden)) in placed.iter().enumerate() {
                             let q = ProcObject { world: wm, object: object + i as u32, sub: Some(i as u32), hidden, ..p.clone() };
                             objects.extend_from_slice(&q.entry(n.power, t.custom(i, n.custom), t.color(i))[..stride]);
@@ -1205,36 +1727,42 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let g = w.geometries.get(geometry).ok_or_else(|| anyhow!("object {}: unknown geometry {geometry}", n.name))?;
                 let material = mats.first().ok_or_else(|| anyhow!("object {}: an instanced mesh needs a material", n.name))?;
                 let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
-                let class = material_class(&materials[mat as usize]);
+                let emits = emissive(&materials[mat as usize]);
                 let vc = colored(g, &mut std::iter::once(material));
-                let mirrored = placed.iter().any(|(wm, hidden)| !hidden && wm.determinant() < 0.0);
-                if instancing && class < 2 && !mirrored {
-                    let mesh = match inst_mesh_of.get(&(*geometry, mat)) {
+                if instancing {
+                    // (The geometry whole, with the object's first material: the mesh an object of one material has.)
+                    let key = (*geometry, false);
+                    let mesh = match retained.own_mesh.get(&key) {
                         Some(&k) => Some(k),
                         None => {
-                            let (tr, a) = own_mesh_tris(g, mat);
-                            (!tr.is_empty()).then(|| {
-                                meshes.push(own_inst_mesh(&tr, pool_tris.len() as u32, class));
-                                put_colors(&mut pool_vcolors, pool_tris.len(), vc.then(|| tri_colors(g, false, None)));
-                                pool_tris.extend(tr);
-                                pool_attrs.extend(a);
+                            let d = section_mesh(g, false, pool_tris.len() as u32, sections.len() as u32, colored_meshes.contains(&key));
+                            (!d.tris.is_empty()).then(|| {
+                                meshes.push(d.mesh);
+                                sections.extend(d.sections);
+                                put_colors(&mut pool_vcolors, pool_tris.len(), d.colors);
+                                pool_tris.extend(d.tris);
+                                pool_attrs.extend(d.attrs);
                                 let k = meshes.len() as u32 - 1;
-                                inst_mesh_of.insert((*geometry, mat), k);
+                                retained.own_mesh.insert(key, k);
                                 k
                             })
                         }
                     };
                     if let Some(mesh) = mesh {
                         let object = (objects.len() / stride) as u32;
-                        retained.instanced.insert(*id, InstancedPlace { first: instances.len() as u32, capacity: *capacity, object, procedural: false, drawn: t.count });
+                        retained.proxy(*id).draw = Draw::Instanced(InstancedPlace { first: instances.len() as u32, capacity: *capacity, object, mesh: Some(mesh), drawn: t.count });
+                        let mine = section_rows(meshes[mesh as usize].sections(&sections), std::slice::from_ref(&mat), &materials);
                         for (i, &(wm, hidden)) in placed.iter().enumerate() {
                             let (lo, hi) = meshes[mesh as usize].placed_bounds(wm);
-                            objects.extend_from_slice(&entry(i, wm, Vec3::from(hi - lo))[..stride]);
-                            instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: Some(i as u32), hidden });
+                            objects.extend_from_slice(&copy_row(entry(i, wm, Vec3::from(hi - lo)), emits && hidden)[..stride]);
+                            instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                            rows.extend(mine.iter().copied());
                         }
                     }
                     continue;
                 }
+                // Flattened: nothing kept to change it by (`Draw::Fixed`; an entry a copy, as the instances have).
+                retained.proxy(*id);
                 for (i, &(wm, hidden)) in placed.iter().enumerate() {
                     if hidden {
                         continue;
@@ -1270,7 +1798,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 put_colors(&mut vcolors, tris.len(), vc.then(|| tri_colors(g, m.determinant() < 0.0, vc_tri.as_deref())));
                 append_arrays(g, m, mat, if movable { flags | TRI_DYNAMIC } else { flags }, per_tri.as_deref(), &mut tris, &mut tri_flags, &mut attrs);
                 if movable {
-                    retained.dynamic.insert(*id, DynamicModel { first, mats: attrs[first as usize..].iter().map(|a| a.uv[3].to_bits()).collect(), ..Default::default() });
+                    retained.proxy(*id).draw = Draw::Dynamic(DynamicModel { first, mats: attrs[first as usize..].iter().map(|a| a.uv[3].to_bits()).collect(), ..Default::default() });
                 }
             }
             Kind::Model { uri, nodes, animation, functions } if shown => {
@@ -1280,15 +1808,14 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let key = if functions.is_empty() { uri.clone() } else { format!("{uri}\u{0}{functions:?}") };
                 // (Its meshes too: placements share a mesh only with the same functions.)
                 let mesh_key = (key.clone(), nodes.clone());
-                // (material index, instancing class: 0 opaque, 1 cutout, 2 flattened per placement: glass (shadow rays
-                // pass), emissive (emitter sampling), material function)
-                let mut resolve = |gm: Option<gltf::Material>| -> Result<(u32, u32)> {
+                // A material of the file: its index, its class in a mesh (`mesh_class`), whether it only emits.
+                let mut resolve = |gm: Option<gltf::Material>| -> Result<(u32, u32, bool)> {
                     let idx = gm.as_ref().and_then(|g| g.index()).unwrap_or(usize::MAX);
                     let i = match asset_materials.get(&(key.clone(), idx)) {
                         Some(i) => *i,
                         None => {
                             let name = gm.as_ref().and_then(|g| g.name()).unwrap_or_default().to_string();
-                            let mut gpu = gltf_material(gm, images, uri, &mut texcache, &model_images)?;
+                            let mut gpu = gltf_material(gm, images, uri, &mut |key, wrap, img| texcache.add(key, wrap, img), &model_images)?;
                             // The first function whose prefix the material's name starts with, on the glTF shading.
                             if let Some(f) = functions.iter().find(|f| name.starts_with(f.prefix.as_str())) {
                                 let mut tex = |tid: u32, srgb_default: bool| -> Result<i32> {
@@ -1297,7 +1824,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                                         Some(d) => d.clone(),
                                         None => texture_image(t, assets)?,
                                     };
-                                    texcache.add((tkey, t.srgb && srgb_default), t.wrap, || Ok(img))
+                                    texcache.add((tkey, t.srgb && srgb_default), t.wrap, || Ok(img.clone()))
                                 };
                                 apply_shader(&mut gpu, &f.shader, &retained.shaders, &mut tex).with_context(|| format!("{uri}: material {name}"))?;
                             }
@@ -1307,7 +1834,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                             i
                         }
                     };
-                    Ok((i, material_class(&materials[i as usize])))
+                    Ok((i, mesh_class(&materials[i as usize]), emissive(&materials[i as usize])))
                 };
                 // A posed model's triangles are dynamic (re-skinned in place). A movable one is an instance whose
                 // transform moves (hardware RT), unless it has triangles flattened per placement: then they are dynamic
@@ -1316,193 +1843,202 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let movable = w.movable(*id);
                 let dynamic = posed || movable;
                 let flags = if dynamic { flags | TRI_DYNAMIC } else { flags };
-                // Posed rigid model: static nodes as triangles, moving nodes as instances (`RigidModel`); a movable one
-                // too (each update re-places its instances from the object's transform).
+                // Posed rigid model: its parts as instances (`RigidModel`: the nodes its clip leaves alone merged into
+                // one mesh, each node it moves a mesh); a movable one too (each update re-places its instances from
+                // the object's transform).
                 if instancing && posed && nodes.is_none() && glb.rigid() {
                     let a = animation.as_ref().unwrap();
-                    let moving = glb.moving_nodes(&a.clip)?;
                     let globals = glb.node_globals(Some(a))?;
-                    let static_tris = glb.node_triangles(m, Some(a), &|ni| !moving[ni], false, &|_| false)?;
-                    let base_flags = if n.cast_shadow { 0 } else { TRI_NO_SHADOW };
-                    for (_, t) in &static_tris {
-                        let mat = resolve(t.material.and_then(|i| doc.materials().nth(i)))?.0;
-                        push_tri(&mut tris, &mut tri_flags, &mut attrs, t.p, t.n, t.uv, t.tangent, mat, base_flags);
-                    }
-                    let mirrored = |ni: usize| (m * globals[ni]).determinant() < 0.0;
-                    let local = glb.node_triangles(Mat4::IDENTITY, None, &|ni| moving[ni], true, &mirrored)?;
-                    // Group by node (the order within a node is the file's).
-                    let mut by_node: Vec<(usize, Vec<usize>)> = vec![];
-                    for (k, (ni, _)) in local.iter().enumerate() {
-                        match by_node.last_mut() {
-                            Some((last, list)) if *last == *ni => list.push(k),
-                            _ => by_node.push((*ni, vec![k])),
+                    let pkey = (key.clone(), rigid_pose_key(a));
+                    if !rigid_parts.contains_key(&pkey) {
+                        let moving = glb.moving_nodes(a)?;
+                        // (THREERT_RIGID_NODES=all: no node merged, every one an instance of a mesh of its own: the A/B
+                        // against the merged still part.)
+                        let all = std::env::var("THREERT_RIGID_NODES").is_ok_and(|v| v == "all");
+                        let apart = |ni: usize| all || moving[ni];
+                        // The nodes left alone, in the model's space as the pose has them (the pose does not move
+                        // them); then each node apart, in its own (the order within a node is the file's).
+                        let mut lists: Vec<(usize, Vec<crate::skin::ModelTri>)> = vec![];
+                        let still: Vec<_> = glb.node_triangles(Mat4::IDENTITY, Some(a), &|ni| !apart(ni), false)?.into_iter().map(|(_, t)| t).collect();
+                        if !still.is_empty() {
+                            lists.push((STILL_NODES, still));
                         }
+                        for (ni, t) in glb.node_triangles(Mat4::IDENTITY, None, &apart, true)? {
+                            match lists.last_mut() {
+                                Some((last, list)) if *last == ni => list.push(t),
+                                _ => lists.push((ni, vec![t])),
+                            }
+                        }
+                        let mut parts = vec![];
+                        for (node, local) in &lists {
+                            let mut classed: [Vec<(usize, u32)>; 4] = Default::default();
+                            let mut emitting: std::collections::HashSet<u32> = Default::default();
+                            for (k, t) in local.iter().enumerate() {
+                                let (mat, class, emits) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
+                                classed[class as usize].push((k, mat));
+                                if emits {
+                                    emitting.insert(mat);
+                                }
+                            }
+                            flatten_coincident(&mut classed, &emitting, &|k| local[k].p);
+                            let mesh = classed[..FLAT].iter().any(|l| !l.is_empty()).then(|| {
+                                let first_pool = pool_tris.len() as u32;
+                                let (order, sects, mine) = model_sections(&kept(&classed));
+                                for &(k, section, rank) in &order {
+                                    let t = &local[k];
+                                    pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
+                                    pool_attrs.push(section_attr(t.n, t.uv, t.tangent, section, rank));
+                                }
+                                meshes.push(InstMesh { sect_first: sections.len() as u32, sect_count: sects.len() as u32, ..own_inst_mesh(&pool_tris[first_pool as usize..], first_pool) });
+                                sections.extend(sects);
+                                retained.mesh_rows.insert(meshes.len() as u32 - 1, mine);
+                                meshes.len() as u32 - 1
+                            });
+                            let rest = classed[FLAT].iter().map(|&(k, mat)| (local[k].p, local[k].n, local[k].uv, local[k].tangent, mat)).collect();
+                            parts.push(RigidPart { node: *node, mesh, rest });
+                        }
+                        if std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "log") {
+                            let (merged, rest) = (lists.iter().filter(|l| l.0 == STILL_NODES).map(|l| l.1.len()).sum::<usize>(), parts.iter().map(|p| p.rest.len()).sum::<usize>());
+                            eprintln!("rigid: {uri} ({}): {merged} triangles of the nodes left alone in one mesh, {} nodes apart, {rest} triangles flattened a placement", a.clip, lists.iter().filter(|l| l.0 != STILL_NODES).count());
+                        }
+                        // (What an edit can place again: every part a mesh whole in the pool, the file's own materials.)
+                        if functions.is_empty() && parts.iter().all(|p| p.mesh.is_some() && p.rest.is_empty()) {
+                            retained.rigid_meshes.insert((uri.clone(), rigid_pose_key(a)), parts.iter().filter_map(|p| Some((p.node, p.mesh?))).collect());
+                        }
+                        rigid_parts.insert(pkey.clone(), std::rc::Rc::new(parts));
                     }
+                    let parts = rigid_parts[&pkey].clone();
+                    let base_flags = if n.cast_shadow { 0 } else { TRI_NO_SHADOW };
                     let oi = (objects.len() / stride) as u32;
                     let (mut olo, mut ohi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
+                    // (Where the object stands as an update finds it, `World::world_matrix`: the same product as `m`,
+                    // multiplied in another order, so not always the same bits.)
+                    let mut rigid = RigidModel { world: w.world_matrix(*id), pose: rigid_pose_key(a), ..Default::default() };
+                    rigid.rest.first = tris.len() as u32;
+                    rigid.rest.object = oi;
+                    for part in parts.iter() {
+                        // (A part placed without size, a node its clip scales to nothing: at a point; `repose_rigid`
+                        // keeps it from the rays.)
+                        let (w_n, _) = placed_world(RigidModel::part_world(m, part.node, &globals), m.w_axis.truncate());
+                        if let Some(mesh) = part.mesh {
+                            let (lo, hi) = meshes[mesh as usize].placed_bounds(w_n);
+                            (olo, ohi) = (olo.min(lo.into()), ohi.max(hi.into()));
+                            let mine = retained.mesh_rows[&mesh].clone();
+                            let i = instances.len() as u32;
+                            if part.node == STILL_NODES {
+                                rigid.still = Some(i);
+                            } else {
+                                rigid.instances.push((part.node, i));
+                            }
+                            instances.push(Instance { mesh, world: w_n, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                            rows.extend(mine);
+                        }
+                        for (p, nn, uv, tg, mat) in &part.rest {
+                            let (p, nn, uv, tg) = placed_tri(w_n, p, nn, uv, *tg);
+                            push_tri(&mut tris, &mut tri_flags, &mut attrs, p, nn, uv, tg, *mat, base_flags | TRI_DYNAMIC);
+                            rigid.rest.mats.push(*mat);
+                        }
+                        rigid.rest_local.extend(part.rest.iter().map(|&(p, nn, uv, tg, _)| (part.node, p, nn, uv, tg)));
+                    }
                     for t in &tris[first as usize..] {
                         for v in t {
                             olo = olo.min(*v);
                             ohi = ohi.max(*v);
                         }
                     }
-                    let mut rigid = RigidModel::default();
-                    let rest_first = tris.len() as u32;
-                    for (ni, list) in &by_node {
-                        let w_n = m * globals[*ni];
-                        let mut classed: [Vec<(usize, u32)>; 3] = Default::default();
-                        for &k in list {
-                            let (mat, class) = resolve(local[k].1.material.and_then(|i| doc.materials().nth(i)))?;
-                            classed[class as usize].push((k, mat));
-                        }
-                        if classed[0].len() + classed[1].len() > 0 {
-                            let first_pool = pool_tris.len() as u32;
-                            let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
-                            for list in &classed[..2] {
-                                for &(k, mat) in list {
-                                    let t = &local[k].1;
-                                    for v in t.p {
-                                        lo = lo.min(v.into());
-                                        hi = hi.max(v.into());
-                                    }
-                                    pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
-                                    pool_attrs.push(tri_attr(t.p, t.n, t.uv, t.tangent, mat));
-                                }
-                            }
-                            for c in 0..8 {
-                                let p = Vec3A::new(if c & 1 == 0 { lo.x } else { hi.x }, if c & 2 == 0 { lo.y } else { hi.y }, if c & 4 == 0 { lo.z } else { hi.z });
-                                let q = w_n.transform_point3a(p);
-                                olo = olo.min(q);
-                                ohi = ohi.max(q);
-                            }
-                            let count = (classed[0].len() + classed[1].len()) as u32;
-                            meshes.push(InstMesh { first: first_pool, count, opaque: classed[0].len() as u32, rest_first: 0, rest_count: 0, lo, hi, deforms: false, emits: false });
-                            rigid.instances.push((*ni, instances.len() as u32));
-                            instances.push(Instance { mesh: meshes.len() as u32 - 1, world: w_n, object: oi, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: None, hidden: false });
-                        }
-                        let nm = Mat3::from_mat4(w_n).inverse().transpose();
-                        for &(k, mat) in &classed[2] {
-                            let t = &local[k].1;
-                            let p = t.p.map(|v| w_n.transform_point3(v));
-                            let nn = t.n.map(|v| (nm * v).normalize_or_zero());
-                            let tg = t.tangent.map(|(v, s)| (w_n.transform_vector3(v).normalize_or_zero(), s));
-                            push_tri(&mut tris, &mut tri_flags, &mut attrs, p, nn, t.uv, tg, mat, base_flags | TRI_DYNAMIC);
-                            rigid.rest.mats.push(mat);
-                            rigid.rest_local.push((*ni, t.p, t.n, t.uv, t.tangent));
-                        }
-                    }
-                    for t in &tris[rest_first as usize..] {
-                        for v in t {
-                            olo = olo.min(*v);
-                            ohi = ohi.max(*v);
-                        }
-                    }
                     let pivot = m.transform_point3(Vec3::ZERO);
-                    let size = ohi - olo;
+                    let size = (ohi - olo).max(Vec3A::ZERO);
                     objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
                     for a in &mut attrs[first as usize..] {
                         a.x[1] = f32::from_bits(oi);
                     }
-                    retained.objects.insert(*id, oi);
-                    rigid.rest.first = rest_first;
-                    rigid.rest.object = oi;
                     if tris.len() as u32 > first {
                         tri_nodes.push((n.name.clone(), first, tris.len() as u32));
                     }
-                    if std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "log") {
-                        eprintln!("rigid: {uri}: {} static triangles, {} moving nodes as instances, {} flattened moving triangles", static_tris.len(), rigid.instances.len(), rigid.rest.mats.len());
-                    }
-                    retained.rigid.insert(*id, rigid);
+                    *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Rigid(rigid) };
                     continue;
                 }
-                // A model in a shared pose: an instance of the pose's mesh (`PoseGroup`), made by the group's first.
-                if let Some(key) = pose_key_of.get(id) {
-                    let group = match pose_group_of.get(key) {
-                        Some(g) => *g,
-                        None => {
-                            let a = animation.as_ref().unwrap();
-                            let local = glb.triangles(Mat4::IDENTITY, nodes.as_deref(), Some(a))?;
-                            let mut classed: [Vec<(usize, u32)>; 3] = Default::default();
-                            for (k, t) in local.iter().enumerate() {
-                                let (mat, class) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
-                                classed[class as usize].push((k, mat));
+                // A posed skinned model is an instance of a mesh of its own, in its own space, which the skinning pass
+                // skins at each new pose (`Skinned`). One with emitting triangles is not yet: skinned alone, below.
+                if instancing && posed && m.determinant() != 0.0 && !(nodes.is_none() && glb.rigid()) {
+                    let a = animation.as_ref().unwrap();
+                    let local = glb.triangles(Mat4::IDENTITY, nodes.as_deref(), Some(a))?;
+                    let mut classed: [Vec<(usize, u32)>; 4] = Default::default();
+                    for (k, t) in local.iter().enumerate() {
+                        // (A mesh that deforms does not keep its emitters: the light list does not follow a pose yet.)
+                        let (mat, class, emits) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
+                        classed[if emits { FLAT } else { class as usize }].push((k, mat));
+                    }
+                    if classed[FLAT].is_empty() && !local.is_empty() {
+                        let (order, sects, mine) = model_sections(&kept(&classed));
+                        // (The model's corners in its mesh's order: one copy for every placement of the model.)
+                        let mirrors = glb.mirrored(Some(a))?;
+                        let file = if functions.is_empty() { uri.clone() } else { format!("{uri}\u{0}{functions:?}") };
+                        let skey = (file, nodes.clone(), mirrors.clone());
+                        let (source, tri_order) = match skin_source_of.get(&skey) {
+                            Some(s) => s.clone(),
+                            None => {
+                                let corners = glb.skin_source(nodes.as_deref(), Some(a))?;
+                                skin_sources.push(order.iter().map(|&(k, _, _)| corners[k]).collect());
+                                skin_rest.push(glb.palette(None)?);
+                                let s = (skin_sources.len() as u32 - 1, Arc::new(order.iter().map(|&(k, section, rank)| (k as u32, section, rank)).collect::<Vec<_>>()));
+                                skin_source_of.insert(skey, s.clone());
+                                s
                             }
-                            // Triangles flattened per placement (glass, emissive, functions): each model skinned alone.
-                            let g = (classed[2].is_empty() && !local.is_empty()).then(|| {
-                                let first = pool_tris.len() as u32;
-                                let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
-                                let mut tri_order = Vec::with_capacity(local.len());
-                                for list in &classed[..2] {
-                                    for &(k, mat) in list {
-                                        let t = &local[k];
-                                        for v in t.p {
-                                            lo = lo.min(v.into());
-                                            hi = hi.max(v.into());
-                                        }
-                                        pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
-                                        pool_attrs.push(tri_attr(t.p, t.n, t.uv, t.tangent, mat));
-                                        tri_order.push((k as u32, mat));
-                                    }
-                                }
-                                // Other poses reach further (a stride, a swing): object bounds a quarter wider each way.
-                                let pad = (hi - lo) * 0.25;
-                                meshes.push(InstMesh { first, count: tri_order.len() as u32, opaque: classed[0].len() as u32, rest_first: 0, rest_count: 0, lo: lo - pad, hi: hi + pad, deforms: true, emits: false });
-                                retained.pose_groups.push(PoseGroup { mesh: meshes.len() as u32 - 1, uri: uri.clone(), nodes: nodes.clone(), animation: a.clone(), order: tri_order, members: vec![] });
-                                retained.pose_groups.len() as u32 - 1
-                            });
-                            pose_group_of.insert(key.clone(), g);
-                            g
+                        };
+                        let first = pool_tris.len() as u32;
+                        let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
+                        for &(k, section, rank) in &order {
+                            let t = &local[k];
+                            for v in t.p {
+                                lo = lo.min(v.into());
+                                hi = hi.max(v.into());
+                            }
+                            pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
+                            pool_attrs.push(section_attr(t.n, t.uv, t.tangent, section, rank));
                         }
-                    };
-                    if let Some(g) = group {
-                        let mesh = retained.pose_groups[g as usize].mesh;
+                        // Other poses reach further (a stride, a swing): object bounds a quarter wider each way; one
+                        // the game poses may take any pose (lie down): as far as its size each way.
+                        let pad = if a.nodes.is_empty() { (hi - lo) * 0.25 } else { Vec3A::splat((hi - lo).length()) };
+                        meshes.push(InstMesh { lo: lo - pad, hi: hi + pad, deforms: true, sect_first: sections.len() as u32, sect_count: sects.len() as u32, ..own_inst_mesh(&pool_tris[first as usize..], first) });
+                        let mesh = meshes.len() as u32 - 1;
+                        sections.extend(sects);
+                        retained.mesh_rows.insert(mesh, mine.clone());
                         let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
                         let pivot = m.transform_point3(Vec3::ZERO);
                         let size = hi - lo;
                         let oi = (objects.len() / stride) as u32;
                         objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
-                        retained.objects.insert(*id, oi);
                         let i = instances.len() as u32;
-                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: None, hidden: false });
-                        retained.instance_of.insert(*id, i);
-                        retained.pose_member.insert(*id, g);
-                        retained.pose_groups[g as usize].members.push((*id, i));
+                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                        rows.extend(mine);
+                        retained.skinned.push(Skinned { mesh, uri: uri.clone(), nodes: nodes.clone(), animation: a.clone(), order: tri_order, object: *id, instance: i, source, palette_len: glb.palette_len() as u32, mirrors });
+                        *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: i, mesh: MeshKind::Skinned(retained.skinned.len() as u32 - 1), moves: true }) };
+                        if functions.is_empty() {
+                            retained.skinned_model.entry((uri.clone(), nodes.clone())).or_insert(retained.skinned.len() as u32 - 1);
+                        }
                         continue;
                     }
                 }
-                if instancing && !posed && m.determinant() > 0.0 {
+                if instancing && !posed && m.determinant() != 0.0 {
                     let key = mesh_key.clone();
                     let mesh = match mesh_of.get(&key) {
                         Some(k) => *k,
                         None => {
-                            // Model-space triangles by class: opaque and cutout ones go to the pool (one BLAS, opaque
-                            // geometry then cutout geometry); glass, emissive and function triangles are flattened per
-                            // placement (shadow-ray pass-through, emitter sampling).
+                            // Model-space triangles go to the pool by section, a material of the file (one BLAS),
+                            // those that only emit among them (each instance has its emitters in the light list).
                             let local = glb.triangles(Mat4::IDENTITY, nodes.as_deref(), None)?;
-                            let mut classed: [Vec<(usize, u32)>; 3] = Default::default();
+                            let mut classed: [Vec<(usize, u32)>; 4] = Default::default();
+                            let mut emitting: std::collections::HashSet<u32> = Default::default();
                             for (k, t) in local.iter().enumerate() {
-                                let (mat, class) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
+                                let (mat, class, emits) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
                                 classed[class as usize].push((k, mat));
-                            }
-                            // A pool triangle on exactly the same vertices as a flattened one (Zero Day: masked decals
-                            // over emissive quads of the same shape) is flattened with it. Split between the model's
-                            // BLAS and the world-space triangles, the two met the ray at one t with different rounding,
-                            // and a decal hit that its alpha let through stepped the ray past the emitter too (black
-                            // through the decal; the software BVH, which flattens both, saw the emitter).
-                            if !classed[2].is_empty() {
-                                let key = |k: usize| {
-                                    let mut v = local[k].p.map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
-                                    v.sort_unstable();
-                                    v
-                                };
-                                let flat: std::collections::HashSet<[[u32; 3]; 3]> = classed[2].iter().map(|&(k, _)| key(k)).collect();
-                                for c in 0..2 {
-                                    let (stay, go): (Vec<_>, Vec<_>) = classed[c].iter().partition(|&&(k, _)| !flat.contains(&key(k)));
-                                    classed[c] = stay;
-                                    classed[2].extend(go);
+                                if emits {
+                                    emitting.insert(mat);
                                 }
                             }
-                            let k = (classed[0].len() + classed[1].len() > 0).then(|| {
+                            flatten_coincident(&mut classed, &emitting, &|k| local[k].p);
+                            let k = classed[..FLAT].iter().any(|l| !l.is_empty()).then(|| {
                                 let (first, rest_first) = (pool_tris.len() as u32, rest_tris.len() as u32);
                                 let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
                                 for t in &local {
@@ -1511,21 +2047,27 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                                         hi = hi.max(v.into());
                                     }
                                 }
-                                for (class, list) in classed.iter().enumerate() {
-                                    let (pt, pa) = if class < 2 { (&mut pool_tris, &mut pool_attrs) } else { (&mut rest_tris, &mut rest_attrs) };
-                                    for &(k, mat) in list {
-                                        let t = &local[k];
-                                        pt.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
-                                        pa.push(tri_attr(t.p, t.n, t.uv, t.tangent, mat));
-                                    }
+                                let (order, sects, mine) = model_sections(&kept(&classed));
+                                for &(k, section, rank) in &order {
+                                    let t = &local[k];
+                                    pool_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
+                                    pool_attrs.push(section_attr(t.n, t.uv, t.tangent, section, rank));
                                 }
-                                let count = (classed[0].len() + classed[1].len()) as u32;
-                                meshes.push(InstMesh { first, count, opaque: classed[0].len() as u32, rest_first, rest_count: classed[2].len() as u32, lo, hi, deforms: false, emits: false });
+                                // (What leaves the mesh keeps its material on the triangle: each placement flattens it.)
+                                for &(k, mat) in &classed[FLAT] {
+                                    let t = &local[k];
+                                    rest_tris.push([t.p[0].into(), t.p[1].into(), t.p[2].into()]);
+                                    rest_attrs.push(tri_attr(t.n, t.uv, t.tangent, mat));
+                                }
+                                meshes.push(InstMesh { rest_first, rest_count: classed[FLAT].len() as u32, lo, hi, sect_first: sections.len() as u32, sect_count: sects.len() as u32, ..own_inst_mesh(&pool_tris[first as usize..], first) });
+                                sections.extend(sects);
+                                retained.mesh_rows.insert(meshes.len() as u32 - 1, mine);
                                 meshes.len() as u32 - 1
                             });
                             if std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "log") {
-                                eprintln!("instancing: {uri} {nodes:?}: {} opaque, {} cutout instanced; {} flattened per placement", classed[0].len(), classed[1].len(), classed[2].len());
+                                eprintln!("instancing: {uri} {nodes:?}: {} opaque, {} cutout, {} glass instanced; {} flattened per placement", classed[0].len(), classed[1].len(), classed[2].len(), classed[FLAT].len());
                             }
+                            // (What an edit can place another instance of: a mesh whole in the pool.)
                             if let Some(k) = k.filter(|&k| meshes[k as usize].rest_count == 0) {
                                 retained.model_mesh.insert(key.clone(), k);
                             }
@@ -1541,19 +2083,24 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         let size = hi - lo;
                         let oi = (objects.len() / stride) as u32;
                         objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
-                        retained.objects.insert(*id, oi);
-                        let inst = Instance { mesh, world: m, object: oi, cast_shadow: n.cast_shadow, name: n.name.clone(), sub: None, hidden: false };
-                        // Its glass / emissive triangles as ordinary world-space ones (same object).
+                        retained.proxy(*id).object = Some(oi);
+                        let mine = retained.mesh_rows[&mesh].clone();
+                        let inst = Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 };
+                        rows.extend(mine);
+                        // Its glass / function triangles as ordinary world-space ones (same object).
                         for k in im.rest_first..im.rest_first + im.rest_count {
-                            tris.push(inst.tri(&rest_tris[k as usize]));
+                            let (t, a, _) = inst.flat(&rest_tris[k as usize], &rest_attrs[k as usize], None);
+                            tris.push(t);
                             tri_flags.push(flags);
-                            attrs.push(instance_attr(&rest_attrs[k as usize], m, oi));
+                            attrs.push(a);
                         }
                         if tris.len() as u32 > first {
                             tri_nodes.push((n.name.clone(), first, tris.len() as u32));
                         }
-                        if movable {
-                            retained.instance_of.insert(*id, instances.len() as u32);
+                        // (Its proxy has the instance where the instance is all of it: one with triangles flattened at
+                        // its placement beside is the build's to change, `Draw::Fixed`.)
+                        if im.rest_count == 0 {
+                            retained.proxy(*id).draw = Draw::Instance(InstanceRef { instance: instances.len() as u32, mesh: MeshKind::Model, moves: movable });
                         }
                         instances.push(inst);
                         continue;
@@ -1566,7 +2113,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     mats.push(mat);
                 }
                 if dynamic {
-                    retained.dynamic.insert(*id, DynamicModel { first, mats, ..Default::default() });
+                    retained.proxy(*id).draw = Draw::Dynamic(DynamicModel { first, mats, ..Default::default() });
                 }
             }
             Kind::Light(l) => match (l, gpu_light_shown(l, m, n.power, shown)) {
@@ -1578,70 +2125,42 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     // Visible one-sided emissive quad (importance sampled as an emitter).
                     let mat = materials.len() as u32;
                     materials.push(card_material(*color, *intensity));
-                    retained.cards.insert(*id, mat);
+                    retained.proxy(*id).card = Some(mat);
                     let movable = w.movable(*id);
                     for (v, dir) in card_tris(m, *width, *height) {
                         push_tri(&mut tris, &mut tri_flags, &mut attrs, v, [dir; 3], [Vec2::ZERO; 3], None, mat, if movable { TRI_NO_SHADOW | TRI_DYNAMIC } else { TRI_NO_SHADOW });
                     }
                     if movable {
-                        retained.dynamic.insert(*id, DynamicModel { first, mats: vec![mat; 2], ..Default::default() });
+                        retained.proxy(*id).draw = Draw::Dynamic(DynamicModel { first, mats: vec![mat; 2], ..Default::default() });
                     }
                 }
                 _ => {}
             },
             // (Hidden by its own `visible`: built while the kernel has room after the volumes shown, with no shape,
             // so that showing it is in place: gpu.rs `set_medium_hidden`.)
-            Kind::Volume { function, params, shape, majorant, g, homogeneous, animated, grid } if shown || (w.hidden_built(*id) && media.len() + media_to_show < MAX_MEDIA) => {
+            Kind::Volume { function, shape, grid, .. } if shown || (w.hidden_built(*id) && media.len() + media_to_show < MAX_MEDIA) => {
                 if shown {
                     media_to_show -= 1;
                 }
                 let func = volume_fns.iter().position(|(k, _, _)| k == function).ok_or_else(|| anyhow!("object {}: unknown volume function {function}", n.name))? as u32;
-                let mut p = [0.0f32; 32];
-                for (k, v) in params.iter().take(32).enumerate() {
-                    p[k] = *v;
-                }
                 // Its density grid: where it lies in the atlas and its cells, as bits in b.zw (pathtrace.wgsl `vgrid`).
                 let mut at = [0.0f32; 2];
                 if let Some(gid) = grid {
-                    let dg = w.grids.get(gid).ok_or_else(|| anyhow!("object {}: unknown density grid {gid}", n.name))?;
                     if *shape != 0 {
                         return Err(anyhow!("object {}: a density grid needs a box volume", n.name));
                     }
-                    let k = match grids.iter().position(|b| b.id == *gid) {
-                        Some(k) => k,
-                        None => {
-                            let program = match &dg.program {
-                                Some((name, _)) => Some(grid_programs.iter().position(|(k, _, _)| k == name).ok_or_else(|| anyhow!("object {}: unknown grid program {name}", n.name))? as u32),
-                                None => None,
-                            };
-                            let mut gp = [0.0f32; 32];
-                            for (k, v) in dg.program.iter().flat_map(|(_, p)| p.iter()).take(32).enumerate() {
-                                gp[k] = *v;
-                            }
-                            let z0 = grids.iter().map(|b| b.dims[2]).sum::<u32>();
-                            let cells = grids.iter().chain([&GridBuild { id: 0, dims: dg.dims, z0, data: None, program: None, params: [0.0; 32], node: 0, medium: 0, made: 0 }]).map(|b| b.dims.iter().map(|&d| d as u64).product::<u64>()).sum::<u64>();
-                            // (The atlas is as wide and high as the widest and highest grid: its texels count too.)
-                            let atlas = grids.iter().map(|b| b.dims[0]).chain([dg.dims[0]]).max().unwrap() as u64 * grids.iter().map(|b| b.dims[1]).chain([dg.dims[1]]).max().unwrap() as u64 * (z0 + dg.dims[2]) as u64;
-                            if cells > world::GRID_MAX_SCENE_CELLS || atlas > 2 * world::GRID_MAX_SCENE_CELLS || z0 + dg.dims[2] > world::GRID_MAX_LAYERS {
-                                return Err(anyhow!("object {}: the scene's density grids exceed {} cells or {} layers along z together (or differ too much in width and height)", n.name, world::GRID_MAX_SCENE_CELLS, world::GRID_MAX_LAYERS));
-                            }
-                            grids.push(GridBuild { id: *gid, dims: dg.dims, z0, data: dg.data.clone(), program, params: gp, node: *id, medium: media.len() as u32, made: dg.made });
-                            grids.len() - 1
-                        }
-                    };
-                    let b = &grids[k];
-                    at = [f32::from_bits(b.z0), f32::from_bits(b.dims[0] | b.dims[1] << 10 | b.dims[2] << 20)];
+                    at = grid_of(w, &mut grids, &grid_programs, *gid, *id, media.len() as u32).with_context(|| format!("object {}", n.name))?;
                 }
                 if media.len() >= MAX_MEDIA {
                     return Err(anyhow!("object {}: more than {MAX_MEDIA} volumes shown at once (the kernel takes {MAX_MEDIA}; the rest would not be drawn)", n.name));
                 }
-                media.push(MediumGpu { w: medium_rows(m), a: [func, if shown { *shape } else { MEDIUM_HIDDEN }, *homogeneous as u32, *animated as u32], b: [majorant.max(0.0), g.clamp(-0.99, 0.99), at[0], at[1]], c: n.custom, p });
+                media.push(MediumGpu::of(n, m, func, shown, at).expect("a volume"));
                 media_nodes.push(*id);
             }
             Kind::Procedural { .. } if shown => {
                 if let Some(p) = proc_object(w, *id, m, (objects.len() / stride) as u32, &retained.materials, assets)? {
                     objects.extend_from_slice(&p.object_entry(n)[..stride]);
-                    retained.objects.insert(*id, p.object);
+                    *retained.proxy(*id) = Proxy { object: Some(p.object), card: None, draw: Draw::Procedural(procs.len() as u32) };
                     procs.push(p);
                 }
             }
@@ -1658,7 +2177,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let first = if translucent { trans_tris.len() as u32 } else { first };
                 for k in 0..*count {
                     for uv in corners {
-                        let mut a = tri_attr([pivot; 3], [Vec3::Z; 3], uv, Some((Vec3::X, 1.0)), mat);
+                        let mut a = tri_attr([Vec3::Z; 3], uv, Some([(Vec3::X, 1.0); 3]), mat);
                         a.x[1] = f32::from_bits(object + k);
                         // Light sampling by a nominal area (half a quad per triangle; lib.rs prepare, emit_mis); -1: a
                         // particle not light-sampled (its emission reaches surfaces by their BSDF rays alone).
@@ -1693,7 +2212,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let corners = [[Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0)], [Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)]];
                 for k in 0..*capacity {
                     for uv in corners {
-                        let mut a = tri_attr([pivot; 3], [Vec3::Z; 3], uv, Some((Vec3::X, 1.0)), mat);
+                        let mut a = tri_attr([Vec3::Z; 3], uv, Some([(Vec3::X, 1.0); 3]), mat);
                         a.x[1] = f32::from_bits(object + k);
                         a.x[2] = if *emitter_area > 0.0 { emitter_area * 0.5 } else { -1.0 };
                         tris.push([p; 3]);
@@ -1729,68 +2248,17 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
             for a in &mut attrs[first as usize..] {
                 a.x[1] = f32::from_bits(oi);
             }
-            retained.objects.insert(*id, oi);
-            if let Some(d) = retained.dynamic.get_mut(id) {
+            let proxy = retained.proxy(*id);
+            proxy.object = Some(oi);
+            if let Draw::Dynamic(d) = &mut proxy.draw {
                 d.object = oi;
             }
             tri_nodes.push((n.name.clone(), first, tris.len() as u32));
         }
     }
 
-    let env = &w.environment;
-    let sky = match &env.sky {
-        Sky::Atmosphere { sun, ground_albedo, rayleigh_scale, mie_scale, mie_anisotropy, dynamic, glow, horizon_glow, .. } => {
-            let sun_light = sun.and_then(|s| w.objects.get(&s).map(|o| (s, o)));
-            let (sun_dir, sun_lux) = match sun_light.map(|(s, o)| (worlds.get(&s).copied().unwrap_or(Mat4::IDENTITY), &o.kind)) {
-                Some((m, Kind::Light(Light::Directional { color, intensity, .. }))) => (-m.transform_vector3(Vec3::NEG_Z).normalize(), Vec3::from(*color) * *intensity),
-                _ => (Vec3::Y, Vec3::ZERO),
-            };
-            let idx = sun_light.and_then(|(s, _)| retained.light_nodes.iter().position(|id| *id == s));
-            retained.sun = sun_light.map(|(s, _)| s);
-            SkyData::Atmosphere {
-                sun_dir,
-                sun_lux,
-                rayleigh: *rayleigh_scale,
-                mie: *mie_scale,
-                g: *mie_anisotropy,
-                ground: Vec3::from(*ground_albedo),
-                sun_node: idx,
-                dynamic: *dynamic,
-                glow: crate::sky::glow_of(glow, horizon_glow),
-            }
-        }
-        Sky::Color { color, intensity, .. } if *intensity > 0.0 => SkyData::Color(Vec3::from(*color) * *intensity),
-        Sky::Color { .. } => SkyData::None,
-        Sky::Hdri { .. } => return Err(anyhow!("hdri environments are not supported by the native renderer yet")),
-        Sky::Gradient { zenith, horizon, ground, intensity, horizon_exponent, glow, clouds, .. } => {
-            let cloud_map = match clouds.as_ref().and_then(|c| c.map.map(|m| (c, m))) {
-                Some((c, tid)) => {
-                    let t = w.textures.get(&tid).ok_or_else(|| anyhow!("unknown texture {tid}"))?;
-                    let (key, image) = texture_image(t, assets)?;
-                    Some(crate::sky::CloudMap {
-                        key,
-                        image,
-                        threshold: c.threshold.unwrap_or([0.35, 0.85]),
-                        gain: c.gain.unwrap_or(1.8),
-                        offset: Vec3::from(c.color) * *intensity,
-                        projection: c.projection.unwrap_or(0.35),
-                        bias: c.bias.unwrap_or(0.25),
-                        fade: c.fade.unwrap_or(4.0),
-                    })
-                }
-                None => None,
-            };
-            SkyData::Gradient(crate::sky::Gradient {
-                zenith: Vec3::from(*zenith) * *intensity,
-                horizon: Vec3::from(*horizon) * *intensity,
-                ground: Vec3::from(*ground) * *intensity,
-                horizon_exponent: *horizon_exponent,
-                glow: glow.as_ref().map(|g| (Vec3::from(g.color) * g.intensity * *intensity, g.height.max(1e-3), g.width.map(|w| (w, g.power.unwrap_or(6.0))))),
-                clouds: if cloud_map.is_some() { None } else { clouds.as_ref().map(|c| (c.coverage, Vec3::from(c.color) * *intensity, c.scale.max(0.05), c.seed)) },
-                cloud_map,
-            })
-        }
-    };
+    let (sky, sun) = sky_data(w, assets, &|id| worlds.get(&id).copied().unwrap_or(Mat4::IDENTITY))?;
+    retained.sun = sun;
 
     let mut stats = HashMap::new();
     stats.insert("load_ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -1798,7 +2266,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     stats.insert("triangles", (tris.len() as u64 + instanced) as f64);
     stats.insert("instances", instances.len() as f64);
     stats.insert("instanced_triangles", instanced as f64);
-    // Deforming meshes (shared poses) first in the pool: the previous frame's vertices (`prev_verts`, motion vectors)
+    // Deforming meshes (posed skinned models') first in the pool: the previous frame's vertices (`prev_verts`, motion vectors)
     // cover the dynamic tail and, right after it, them.
     if meshes.iter().any(|m| m.deforms) {
         let (mut pt, mut pa) = (Vec::with_capacity(pool_tris.len()), Vec::with_capacity(pool_attrs.len()));
@@ -1831,9 +2299,10 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
             *f |= TRI_NO_SHADOW;
         }
     }
-    for d in retained.dynamic.values_mut().chain(retained.rigid.values_mut().map(|r| &mut r.rest)) {
+    for d in retained.dynamics_mut() {
         d.flags = tri_flags[d.first as usize..d.first as usize + d.mats.len()].to_vec();
     }
+    retained.asset_materials = asset_materials;
     Ok(Scene {
         name: st.name.clone(),
         emitter_slot: false,
@@ -1853,17 +2322,12 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         lights,
         camera: camera.ok_or_else(|| anyhow!("no camera (settings.camera must name a camera object)"))?,
         sky,
-        fog: env.fog.clone(),
-        wetness: env.wetness.clamp(0.0, 1.0),
-        rain: env.rain.clamp(0.0, 1.0),
-        cloud_cover: env.cloud_cover.clamp(0.0, 1.0),
+        environment: EnvSettings::of(w),
         preset,
         stats,
         tri_nodes,
         tri_instances,
         tinted,
-        background: w.environment.background.map(Vec3::from),
-        aerial: aerial_params(&w.environment.sky),
         retained,
         particles,
         particle_fns,
@@ -1889,6 +2353,12 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         pool_attrs,
         meshes,
         instances,
+        skin_sources,
+        skin_rest,
+        skin_trees: vec![],
+        indexed: Default::default(),
+        sections,
+        rows,
         gpu_instances: vec![],
     })
 }
@@ -1920,7 +2390,11 @@ pub fn aerial_params(sky: &Sky) -> [f32; 4] {
 }
 
 /// `converted`: the model images already in RGBA, by texture key (scene::build converts them up front, in parallel).
-fn gltf_material(gm: Option<gltf::Material>, images: &[gltf::image::Data], key: &str, tc: &mut TexCache, converted: &HashMap<String, Arc<image::RgbaImage>>) -> Result<GpuMaterial> {
+/// A model's material as the GPU has it. `texture((key, sRGB), wrap, image)` gives a texture's slot, and decodes the
+/// image only where the texture is not there yet: the build's set (`TexCache`), or the pages of a scene that runs
+/// (live/edits.rs `place_models`). `converted`: images decoded before.
+#[allow(clippy::type_complexity)]
+pub fn gltf_material(gm: Option<gltf::Material>, images: &[gltf::image::Data], key: &str, texture: &mut dyn FnMut((String, bool), bool, &mut dyn FnMut() -> Result<Arc<image::RgbaImage>>) -> Result<i32>, converted: &HashMap<String, Arc<image::RgbaImage>>) -> Result<GpuMaterial> {
     let Some(gm) = gm else {
         return Ok(GpuMaterial { base_color: [1.0, 1.0, 1.0, 1.0], params: [0.0, 1.0, 0.5, 1.0], tex0: [-1; 4], tex1: [-1, -1, 0, 0], uv: [1.0, 1.0, 0.0, 0.0], ..Default::default() });
     };
@@ -1929,19 +2403,25 @@ fn gltf_material(gm: Option<gltf::Material>, images: &[gltf::image::Data], key: 
         let src = t.source().index();
         let k = format!("{key}#img{src}");
         let pre = converted.get(&k).cloned();
-        tc.add((k, srgb), true, || pre.map_or_else(|| Ok(Arc::new(to_rgba(&images[src])?)), Ok))
+        texture((k, srgb), true, &mut || pre.clone().map_or_else(|| Ok(Arc::new(to_rgba(&images[src])?)), Ok))
     };
     let pbr = gm.pbr_metallic_roughness();
     let mr = tex(pbr.metallic_roughness_texture().map(|t| t.texture()), false)?;
     let strength = gm.emissive_strength().unwrap_or(1.0);
     let e = gm.emissive_factor();
     let clearcoat = |k: &str| gm.extension_value("KHR_materials_clearcoat").and_then(|c| c[k].as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+    // KHR_materials_unlit: shown, never lit nor lighting (three.js MeshBasicMaterial, the kernel's unlit switch). An
+    // unlit material that says an emission shows it (its factor x strength, nits) as its colour: a far city's lit
+    // windows, seen and not light-sampled (tens of thousands of emitters fewer).
+    let unlit = gm.extension_value("KHR_materials_unlit").is_some();
+    let base_color = if unlit && e.iter().any(|&c| c > 0.0) { [e[0] * strength, e[1] * strength, e[2] * strength, 1.0] } else { pbr.base_color_factor() };
+    let (e, strength) = if unlit { ([0.0; 3], 0.0) } else { (e, strength) };
     Ok(GpuMaterial {
-        base_color: pbr.base_color_factor(),
+        base_color,
         emissive: [e[0] * strength, e[1] * strength, e[2] * strength, 0.0],
         params: [pbr.metallic_factor(), pbr.roughness_factor(), 0.5, gm.normal_texture().map(|n| n.scale()).unwrap_or(1.0)],
         tex0: [tex(pbr.base_color_texture().map(|t| t.texture()), true)?, tex(gm.normal_texture().map(|t| t.texture()), false)?, mr, mr],
-        tex1: [tex(gm.emissive_texture().map(|t| t.texture()), true)?, tex(gm.occlusion_texture().map(|t| t.texture()), false)?, if gm.double_sided() { MAT_DOUBLE_SIDED } else { 0 }, 0],
+        tex1: [tex(gm.emissive_texture().map(|t| t.texture()), true)?, tex(gm.occlusion_texture().map(|t| t.texture()), false)?, if unlit { MAT_UNLIT } else if gm.double_sided() { MAT_DOUBLE_SIDED } else { 0 }, 0],
         uv: [1.0, 1.0, gm.transmission().and_then(|t| t.transmission_texture()).map_or(Ok(-1), |t| tex(Some(t.texture()), false))? as f32 + 1.0, 0.0],
         // glTF MASK (and BLEND, approximated) -> alpha cutout
         uv2: [0.0, 0.0, 0.0, match gm.alpha_mode() { gltf::material::AlphaMode::Opaque => 0.0, gltf::material::AlphaMode::Mask => gm.alpha_cutoff().unwrap_or(0.5), gltf::material::AlphaMode::Blend => 0.5 }],
@@ -2007,20 +2487,45 @@ pub fn dynamic_tris(w: &World, id: u32, d: &DynamicModel, assets: &Path) -> Resu
             if tris.len() != d.mats.len() {
                 return Ok(None);
             }
-            Some(tris.iter().zip(&d.mats).map(|(t, &mat)| (t.p, tri_attr(t.p, t.n, t.uv, t.tangent, mat))).collect())
+            Some(tris.iter().zip(&d.mats).map(|(t, &mat)| (t.p, tri_attr(t.n, t.uv, t.tangent, mat))).collect())
         }
         Kind::Light(Light::Rect { width, height, visible: true, .. }) => {
-            Some(card_tris(m, *width, *height).iter().zip(&d.mats).map(|((v, dir), &mat)| (*v, tri_attr(*v, [*dir; 3], [Vec2::ZERO; 3], None, mat))).collect())
+            Some(card_tris(m, *width, *height).iter().zip(&d.mats).map(|((v, dir), &mat)| (*v, tri_attr([*dir; 3], [Vec2::ZERO; 3], None, mat))).collect())
         }
         _ => None,
     })
 }
 
-/// Instancing class of a GPU material: 0 opaque, 1 cutout (any-hit), 2 flattened per placement (glass: shadow rays pass;
-/// emissive: emitter sampling; material functions).
+/// A model's triangles by class (`classed`: opaque, cutout, glass, and `FLAT`: what leaves the mesh; each a triangle's
+/// index and material). Triangles on exactly the same vertices leave the mesh together in two cases: one that emits (a
+/// material of `emitting`) with a cutout over it (Zero Day: masked decals over emissive quads of the same shape), and
+/// glass with whatever lies under it. A cutout hit that its alpha lets through steps the ray on past it
+/// (trace_hw.wgsl), and past what lies at the same t: in one BLAS the emitter under the decal went with it (black
+/// through the decal); and which of two triangles at one distance a closest hit reports is not said. Flattened, the
+/// two are in BLASes apart and the opaque one is met first, as the software BVH has it.
+pub fn flatten_coincident(classed: &mut [Vec<(usize, u32)>; 4], emitting: &std::collections::HashSet<u32>, p: &dyn Fn(usize) -> [Vec3; 3]) {
+    let key = |k: usize| {
+        let mut v = p(k).map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
+        v.sort_unstable();
+        v
+    };
+    let keys = |list: &[(usize, u32)]| -> std::collections::HashSet<[[u32; 3]; 3]> { list.iter().map(|&(k, _)| key(k)).collect() };
+    let (cutouts, glass) = (keys(&classed[1]), keys(&classed[2]));
+    let mut flat = keys(&classed[FLAT]);
+    flat.extend(classed[0].iter().filter(|(_, mat)| emitting.contains(mat)).map(|&(k, _)| key(k)).filter(|v| cutouts.contains(v)));
+    flat.extend(classed[..2].iter().flatten().map(|&(k, _)| key(k)).filter(|v| glass.contains(v)));
+    for c in 0..FLAT {
+        let (stay, go): (Vec<_>, Vec<_>) = classed[c].iter().partition(|&&(k, _)| !flat.contains(&key(k)));
+        classed[c] = stay;
+        classed[FLAT].extend(go);
+    }
+}
+
+/// Whether a material created since the build can be drawn in place (tables.rs `add_materials`): 0 only when it is
+/// opaque, does not emit and is no glass (the build sorts triangles and lights by those).
 pub fn material_class(g: &GpuMaterial) -> u32 {
-    let flat = g.layer[0] > 0.0 || g.tex1[3] != 0 || g.emissive[..3].iter().any(|e| *e > 0.0);
-    if flat {
+    let other = g.layer[0] > 0.0 || g.emissive[..3].iter().any(|e| *e > 0.0);
+    if other {
         2
     } else if g.uv2[3] > 0.0 {
         1
@@ -2063,34 +2568,150 @@ pub fn put_colors(dst: &mut Vec<[u32; 3]>, at: usize, c: Option<Vec<[u32; 3]>>) 
     dst.extend(c);
 }
 
-/// An `own_blas` mesh's triangles in model space and their attributes, as the pool holds them. The build and the live
-/// view's in-place edits (live/edits.rs `edit_geometry`) both make them here, so either path gives the same data.
-pub fn own_mesh_tris(g: &world::Geometry, mat: u32) -> (Vec<[Vec3A; 3]>, Vec<GpuTriAttr>) {
-    let (mut tris, mut flags, mut attrs) = (vec![], vec![], vec![]);
-    append_arrays(g, Mat4::IDENTITY, mat, 0, None, &mut tris, &mut flags, &mut attrs);
-    (tris, attrs)
+/// Whether an object with `materials` materials draws `g` by its groups (three.js's material array: each group with
+/// its own, a triangle in no group not drawn) and not whole, with one material.
+pub fn by_groups(g: &world::Geometry, materials: usize) -> bool {
+    materials > 1 && !g.groups.is_empty()
 }
 
-/// A material that only emits (no glass, no material function): an `own_blas` mesh of it is an emitter mesh
-/// (`InstMesh::emits`) rather than flattened.
-pub fn emits_only(g: &GpuMaterial) -> bool {
-    g.layer[0] <= 0.0 && g.tex1[3] == 0 && g.emissive[..3].iter().any(|e| *e > 0.0)
+/// What `section_mesh` makes: a mesh's triangles in model space and their attributes as the pool holds them, their
+/// vertex colours if it carries them, the mesh and its sections.
+pub struct MeshData {
+    pub tris: Vec<[Vec3A; 3]>,
+    pub attrs: Vec<GpuTriAttr>,
+    pub colors: Option<Vec<[u32; 3]>>,
+    pub mesh: InstMesh,
+    pub sections: Vec<Section>,
 }
 
-/// An emitting `own_blas` mesh's triangles in world space (`m`) and their attributes carrying its object-table index,
-/// as the pool holds them (light sampling reads them without the placement). The build and the live view's in-place
-/// edits both make them here.
-pub fn emitter_mesh_tris(g: &world::Geometry, m: Mat4, mat: u32, object: u32) -> (Vec<[Vec3A; 3]>, Vec<GpuTriAttr>) {
-    let (mut tris, mut flags, mut attrs) = (vec![], vec![], vec![]);
-    append_arrays(g, m, mat, 0, None, &mut tris, &mut flags, &mut attrs);
-    for a in &mut attrs {
-        a.x[1] = f32::from_bits(object);
+/// The mesh of a geometry at pool index `first`, its sections from `sect_first` on: a section after another, each
+/// the triangles of a group in the geometry's order (`grouped`: `by_groups`; a triangle is its last group's, and
+/// one in no group is not drawn), or the whole geometry as one. A triangle's attributes hold its section (uv.w) and
+/// its index in it (x.w, `rank_in_sections`): nothing of a material, so every object of the geometry shares the mesh.
+/// The build and the live view's in-place edits both make it here.
+pub fn section_mesh(g: &world::Geometry, grouped: bool, first: u32, sect_first: u32, colored: bool) -> MeshData {
+    let mut group: Vec<Option<u32>> = vec![if grouped { None } else { Some(0) }; g.indices.len() / 3];
+    if grouped {
+        for (k, &[start, count, _]) in g.groups.iter().enumerate() {
+            for t in (start / 3) as usize..((start + count) / 3) as usize {
+                if let Some(slot) = group.get_mut(t) {
+                    *slot = Some(k as u32);
+                }
+            }
+        }
     }
-    (tris, attrs)
+    let (mut t, mut flags, mut a) = (vec![], vec![], vec![]);
+    append_arrays(g, Mat4::IDENTITY, 0, 0, Some(&group), &mut t, &mut flags, &mut a);
+    // (`append_arrays` left each triangle's group where its material goes.)
+    let group_of = |k: usize| a[k].uv[3].to_bits();
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&k| group_of(k));
+    let (mut sections, mut attrs): (Vec<Section>, Vec<GpuTriAttr>) = (vec![], Vec::with_capacity(order.len()));
+    let mut last = None;
+    for &k in &order {
+        if last != Some(group_of(k)) {
+            last = Some(group_of(k));
+            sections.push(Section { first: attrs.len() as u32, count: 0, slot: if grouped { g.groups[group_of(k) as usize][2] } else { 0 } });
+        }
+        let (at, s) = (sections.len() as u32 - 1, sections.last_mut().unwrap());
+        let mut b = a[k];
+        (b.uv[3], b.x[3]) = (f32::from_bits(at), f32::from_bits(s.count));
+        s.count += 1;
+        attrs.push(b);
+    }
+    let tris: Vec<[Vec3A; 3]> = order.iter().map(|&k| t[k]).collect();
+    let colored = colored && !g.colors.is_empty();
+    let colors = colored.then(|| {
+        let c = tri_colors(g, false, Some(&group.iter().map(|x| x.map(|_| 1)).collect::<Vec<_>>()));
+        order.iter().map(|&k| c[k]).collect()
+    });
+    let mesh = InstMesh { sect_first, sect_count: sections.len() as u32, colored, ..own_inst_mesh(&tris, first) };
+    MeshData { tris, attrs, colors, mesh, sections }
 }
 
-/// The `InstMesh` of an `own_blas` mesh's triangles at pool index `first` (class: `material_class`, 0 or 1).
-pub fn own_inst_mesh(tris: &[[Vec3A; 3]], first: u32, class: u32) -> InstMesh {
+/// Each triangle's index in its section (x.w) as the triangles lie in `attrs`: its rank among those of its section
+/// (uv.w). What a mesh's triangles get again when they are put in another order (a unit's tree's): an emitter's
+/// place in its section's run is this.
+pub fn rank_in_sections(attrs: &mut [GpuTriAttr]) {
+    let mut seen: Vec<u32> = vec![];
+    for a in attrs {
+        let s = a.uv[3].to_bits() as usize;
+        if seen.len() <= s {
+            seen.resize(s + 1, 0);
+        }
+        a.x[3] = f32::from_bits(seen[s]);
+        seen[s] += 1;
+    }
+}
+
+/// A model's mesh laid out by section, a section a material in the order the materials first appear among the
+/// triangles that stay in the mesh (`kept`: each one's index in the model's list, its GPU material and that
+/// material's class, `mesh_class`), a section's triangles in the list's order. Returns the pool's order (the index
+/// in the model's list, the triangle's section and its index in it), the sections, and an instance's rows for them
+/// (`Retained::mesh_rows`: every instance of the mesh has the file's materials).
+#[allow(clippy::type_complexity)]
+pub fn model_sections(kept: &[(usize, u32, u32)]) -> (Vec<(usize, u32, u32)>, Vec<Section>, Vec<Row>) {
+    let mut sorted = kept.to_vec();
+    sorted.sort_unstable_by_key(|k| k.0);
+    let mut section_of: HashMap<u32, u32> = HashMap::new();
+    let (mut lists, mut rows): (Vec<Vec<usize>>, Vec<Row>) = (vec![], vec![]);
+    for &(k, mat, class) in &sorted {
+        let at = *section_of.entry(mat).or_insert_with(|| {
+            lists.push(vec![]);
+            rows.push([mat | [0, ROW_CUTOUT, ROW_GLASS][class as usize], 0, NO_EMITTER, 0]);
+            lists.len() as u32 - 1
+        });
+        lists[at as usize].push(k);
+    }
+    let (mut order, mut sections) = (Vec::with_capacity(sorted.len()), Vec::with_capacity(lists.len()));
+    for (at, list) in lists.iter().enumerate() {
+        sections.push(Section { first: order.len() as u32, count: list.len() as u32, slot: at as u32 });
+        order.extend(list.iter().enumerate().map(|(rank, &k)| (k, at as u32, rank as u32)));
+    }
+    (order, sections, rows)
+}
+
+/// A model's triangle as its mesh holds it: its attributes with its section and its index in it.
+pub fn section_attr(n: [Vec3; 3], uv: [Vec2; 3], tangent: Option<CornerTangents>, section: u32, rank: u32) -> GpuTriAttr {
+    let mut a = tri_attr(n, uv, tangent, section);
+    a.x[3] = f32::from_bits(rank);
+    a
+}
+
+/// The triangles of `classed` that stay in a mesh (`FLAT`'s leave it), for `model_sections`.
+pub fn kept(classed: &[Vec<(usize, u32)>; 4]) -> Vec<(usize, u32, u32)> {
+    classed[..FLAT].iter().enumerate().flat_map(|(class, list)| list.iter().map(move |&(k, mat)| (k, mat, class as u32))).collect()
+}
+
+/// An instance's rows for `sections`, drawn with the object's materials `mats` (GPU indices; a slot past the last is
+/// the last, as three.js clamps).
+pub fn section_rows(sections: &[Section], mats: &[u32], materials: &[GpuMaterial]) -> Vec<Row> {
+    sections.iter().map(|s| row_of(mats[(s.slot as usize).min(mats.len() - 1)], materials)).collect()
+}
+
+/// A material that emits: the triangles drawn with it are their instance's emitters in the light list
+/// (`rows_emitters`; a model's mesh: `InstMesh::emitters`).
+pub fn emissive(g: &GpuMaterial) -> bool {
+    g.emissive[..3].iter().any(|e| *e > 0.0)
+}
+
+/// The class of a material, which an instance's row of it says (`row_of`): 0 opaque, 1 cutout (alpha-tested),
+/// 2 glass (shadow rays pass). A material function or emission is no class: the kernel places a
+/// function's inputs by the instance (`mat_in_at`), and the light list has an instance's emitters.
+pub fn mesh_class(g: &GpuMaterial) -> u32 {
+    if g.layer[0] > 0.0 {
+        2
+    } else {
+        u32::from(g.uv2[3] > 0.0)
+    }
+}
+
+/// `classed`'s last list: what leaves a mesh and is flattened at each placement (`flatten_coincident`'s pairs; the
+/// emitters of a mesh that deforms).
+pub const FLAT: usize = 3;
+
+/// The `InstMesh` of triangles at pool index `first`, with their bounds; its sections are the caller's to set.
+pub fn own_inst_mesh(tris: &[[Vec3A; 3]], first: u32) -> InstMesh {
     let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
     for t in tris {
         for v in t {
@@ -2099,12 +2720,12 @@ pub fn own_inst_mesh(tris: &[[Vec3A; 3]], first: u32, class: u32) -> InstMesh {
         }
     }
     let count = tris.len() as u32;
-    InstMesh { first, count, opaque: if class == 0 { count } else { 0 }, rest_first: 0, rest_count: 0, lo, hi, deforms: false, emits: false }
+    InstMesh { first, count, rest_first: 0, rest_count: 0, lo, hi, deforms: false, sect_first: 0, sect_count: 0, colored: false, vfirst: 0, vcount: 0 }
 }
 
 /// The GPU material of each triangle of a mesh with several (`Kind::Mesh::materials`, here GPU indices) by its
 /// geometry's groups; None for a triangle in no group (not drawn, as three.js). None for a mesh with one material.
-fn group_materials(g: &world::Geometry, mats: &[u32]) -> Option<Vec<Option<u32>>> {
+pub fn group_materials(g: &world::Geometry, mats: &[u32]) -> Option<Vec<Option<u32>>> {
     if mats.len() <= 1 || g.groups.is_empty() {
         return None;
     }
@@ -2159,45 +2780,28 @@ fn push_tri(
     p: [Vec3; 3],
     n: [Vec3; 3],
     uv: [Vec2; 3],
-    tangent: Option<(Vec3, f32)>,
+    tangent: Option<CornerTangents>,
     mat: u32,
     flags: u32,
 ) {
     tris.push([p[0].into(), p[1].into(), p[2].into()]);
     tri_flags.push(flags);
-    attrs.push(tri_attr(p, n, uv, tangent, mat));
+    attrs.push(tri_attr(n, uv, tangent, mat));
 }
 
-/// Shading attributes of a triangle (normals, UVs, tangent frame, texel density, material).
-pub fn tri_attr(p: [Vec3; 3], n: [Vec3; 3], uv: [Vec2; 3], tangent: Option<(Vec3, f32)>, mat: u32) -> GpuTriAttr {
-    // Per-triangle tangent frame from UVs (glTF convention: v grows downward in the image).
-    let (t, sign) = tangent.unwrap_or_else(|| {
-        let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
-        let (d1, d2) = (uv[1] - uv[0], uv[2] - uv[0]);
-        let det = d1.x * d2.y - d2.x * d1.y;
-        if det.abs() < 1e-12 {
-            let any = if n[0].x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
-            return (n[0].cross(any).normalize(), 1.0);
-        }
-        let r = 1.0 / det;
-        let t = ((e1 * d2.y - e2 * d1.y) * r).normalize_or_zero();
-        let b = (e2 * d1.x - e1 * d2.x) * r;
-        // glTF/MikkTSpace: bitangent = cross(N, T) * w, pointing toward decreasing v (image "up").
-        let w = if n[0].cross(t).dot(b) < 0.0 { 1.0 } else { -1.0 };
-        (t, w)
-    });
-    // Texel density for ray-cone mip selection: lod = log2(cone width) + 0.5*log2(uv area / world area) + log2(size).
-    let world_area = 0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length();
-    let (d1, d2) = (uv[1] - uv[0], uv[2] - uv[0]);
-    let uv_area = 0.5 * (d1.x * d2.y - d2.x * d1.y).abs();
-    let lod_k = if world_area > 1e-12 && uv_area > 1e-14 { 0.5 * (uv_area / world_area).log2() } else { 0.0 };
+/// Shading attributes of a triangle: normals, UVs, its tangents if it has them, its material.
+pub fn tri_attr(n: [Vec3; 3], uv: [Vec2; 3], tangent: Option<CornerTangents>, mat: u32) -> GpuTriAttr {
+    let t = |c: usize| tangent.map_or([0.0; 4], |t| [t[c].0.x, t[c].0.y, t[c].0.z, t[c].1]);
+    // (Its texel density, for the mip choice, is the hit's to compute: pathtrace.wgsl `mesh_density`.)
     GpuTriAttr {
         n0: [n[0].x, n[0].y, n[0].z, uv[0].x],
         n1: [n[1].x, n[1].y, n[1].z, uv[0].y],
         n2: [n[2].x, n[2].y, n[2].z, uv[1].x],
         uv: [uv[1].y, uv[2].x, uv[2].y, f32::from_bits(mat)],
-        t: [t.x, t.y, t.z, sign],
-        x: [lod_k, 0.0, 0.0, 0.0],
+        t: t(0),
+        x: [0.0; 4],
+        t1: t(1),
+        t2: t(2),
     }
 }
 
@@ -2272,31 +2876,49 @@ mod instance_tests {
         assert_eq!(texture_image(&tex(0), assets).unwrap().0, kb);
     }
 
-    /// An instance's placed triangle and attributes equal flattening the same triangle at the instance transform.
+    /// An instance's placed triangle and attributes equal flattening the same triangle at the instance transform: as
+    /// the flattening path has them (`Instance::flat`) against the triangle built in world space as `append_arrays`
+    /// builds it, under a transform that keeps the hand and under one that mirrors (the second and third vertex
+    /// change places, the tangent frame changes hand), with distinct normals, UVs, tangents and vertex colours a
+    /// vertex.
     #[test]
     fn instance_matches_flattening() {
         let p = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.5, 0.2)];
-        let n = [Vec3::new(0.0, -0.37, 0.93).normalize(); 3];
-        let uv = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
-        let w = Mat4::from_scale_rotation_translation(Vec3::splat(2.0), glam::Quat::from_rotation_y(0.7) * glam::Quat::from_rotation_x(-0.3), Vec3::new(5.0, 1.0, -3.0));
-        let local = tri_attr(p, n, uv, None, 7);
-        let inst = Instance { mesh: 0, world: w, object: 3, cast_shadow: true, name: "x".into(), sub: None, hidden: false };
-        let placed = inst.tri(&[p[0].into(), p[1].into(), p[2].into()]);
-        let wp = p.map(|v| w.transform_point3(v));
-        let flat = tri_attr(wp, n.map(|v| (glam::Mat3::from_mat4(w).inverse().transpose() * v).normalize()), uv, None, 7);
-        let got = instance_attr(&local, w, 3);
-        for k in 0..3 {
-            assert!((Vec3::from(placed[k]) - wp[k]).length() < 1e-5);
+        let n = [Vec3::new(0.0, -0.37, 0.93).normalize(), Vec3::new(0.1, -0.3, 0.9).normalize(), Vec3::new(-0.2, -0.4, 0.8).normalize()];
+        let uv = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.25), Vec2::new(0.5, 1.0)];
+        let colors = [1, 2, 3];
+        let keeps = Mat4::from_scale_rotation_translation(Vec3::splat(2.0), glam::Quat::from_rotation_y(0.7) * glam::Quat::from_rotation_x(-0.3), Vec3::new(5.0, 1.0, -3.0));
+        let tg = [(Vec3::new(1.0, 0.1, 0.0).normalize(), 1.0), (Vec3::new(0.9, 0.0, 0.3).normalize(), 1.0), (Vec3::new(0.8, -0.2, 0.1).normalize(), 1.0)];
+        let local = tri_attr(n, uv, Some(tg), 7);
+        for (w, mirrored) in [(keeps, false), (keeps * Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)), true)] {
+            assert_eq!(mirrors(w), mirrored);
+            let inst = Instance { mesh: 0, world: w, object: 3, cast_shadow: true, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0, verts: 0 };
+            assert_eq!(inst.gpu(0).n[1][3].to_bits(), if mirrored { INST_MIRRORED } else { 0 }, "the record says whether it mirrors");
+            let (placed, got, got_colors) = inst.flat(&[p[0].into(), p[1].into(), p[2].into()], &local, Some(colors));
+            // The world-space triangle: its vertices in the order the build flattens a placement in.
+            let order = if mirrored { [0, 2, 1] } else { [0, 1, 2] };
+            let nm = glam::Mat3::from_mat4(w).inverse().transpose();
+            let wp = order.map(|k| w.transform_point3(p[k]));
+            let hand = if mirrored { -1.0 } else { 1.0 };
+            let flat = tri_attr(order.map(|k| (nm * n[k]).normalize()), order.map(|k| uv[k]), Some(order.map(|k| (w.transform_vector3(tg[k].0).normalize(), tg[k].1 * hand))), 7);
+            for k in 0..3 {
+                assert!((Vec3::from(placed[k]) - wp[k]).length() < 1e-5, "mirrored {mirrored}: vertex {k}");
+            }
+            assert!((placed[1] - placed[0]).cross(placed[2] - placed[0]).dot(Vec3A::from(nm * n[0])) > 0.0, "mirrored {mirrored}: it faces as its normals do");
+            for (a, b) in [(got.n0, flat.n0), (got.n1, flat.n1), (got.n2, flat.n2), (got.t, flat.t), (got.t1, flat.t1), (got.t2, flat.t2)] {
+                assert!((Vec3::new(a[0], a[1], a[2]) - Vec3::new(b[0], b[1], b[2])).length() < 1e-5, "mirrored {mirrored}: {a:?} vs {b:?}");
+                assert_eq!(a[3], b[3], "mirrored {mirrored}: the UV packed there, the tangent frame's hand");
+            }
+            assert_eq!(got.uv, flat.uv, "mirrored {mirrored}");
+            // (`placed_tri` places a triangle the same way.)
+            let (_, pn, puv, ptg) = placed_tri(w, &p, &n, &uv, Some(tg));
+            let by = tri_attr(pn, puv, ptg, 7);
+            for (a, b) in [(by.n0, flat.n0), (by.n1, flat.n1), (by.n2, flat.n2), (by.t, flat.t), (by.t1, flat.t1), (by.t2, flat.t2)] {
+                assert!((Vec3::new(a[0], a[1], a[2]) - Vec3::new(b[0], b[1], b[2])).length() < 1e-5 && a[3] == b[3], "mirrored {mirrored}, placed_tri: {a:?} vs {b:?}");
+            }
+            assert_eq!(got_colors, Some(order.map(|k| colors[k])), "mirrored {mirrored}: the vertex colours follow their vertices");
+            assert_eq!(got.x[1].to_bits(), 3);
         }
-        for (a, b) in [(got.n0, flat.n0), (got.n1, flat.n1), (got.n2, flat.n2), (got.t, flat.t)] {
-            assert!((Vec3::new(a[0], a[1], a[2]) - Vec3::new(b[0], b[1], b[2])).length() < 1e-5, "{a:?} vs {b:?}");
-            assert_eq!(a[3], b[3]);
-        }
-        // Uniform scale 2: texel density per metre halves (LOD constant - 1), exactly as the world-space triangle.
-        assert!((got.x[0] - flat.x[0]).abs() < 1e-5);
-        assert!((lod_offset(w) + 1.0).abs() < 1e-5);
-        assert_eq!(got.x[1].to_bits(), 3);
-        assert_eq!(got.uv, flat.uv);
     }
 
     /// Software traversal flattens instances: a cutout material's triangles keep TRI_MASKED (any-hit alpha test),
@@ -2307,18 +2929,17 @@ mod instance_tests {
         let mut cutout = GpuMaterial::default();
         cutout.uv2[3] = 0.5;
         let mats = [opaque, cutout];
-        let p = [Vec3::ZERO, Vec3::X, Vec3::Y];
-        let a = |m: u32| tri_attr(p, [Vec3::Z; 3], [Vec2::ZERO, Vec2::X, Vec2::Y], None, m);
-        let inst = |shadow: bool| Instance { mesh: 0, world: Mat4::IDENTITY, object: 0, cast_shadow: shadow, name: "x".into(), sub: None, hidden: false };
+        let a = |m: u32| tri_attr([Vec3::Z; 3], [Vec2::ZERO, Vec2::X, Vec2::Y], None, m);
+        let inst = |shadow: bool| Instance { mesh: 0, world: Mat4::IDENTITY, object: 0, cast_shadow: shadow, name: "x".into(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: 0, prev: 0, verts: 0 };
         assert_eq!(instance_tri_flags(&inst(true), &a(0), &mats), 0);
         assert_eq!(instance_tri_flags(&inst(true), &a(1), &mats), TRI_MASKED);
         assert_eq!(instance_tri_flags(&inst(false), &a(1), &mats), TRI_MASKED | TRI_NO_SHADOW);
     }
 
-    /// A node's triangles may come in two ranges (an instance's glass part flattened at build, its mesh appended by
-    /// software traversal): selection outlines need both.
+    /// A node's triangles may come in two ranges (what the build flattened of an instance's mesh, the mesh appended
+    /// by software traversal): selection outlines need both.
     /// An instanced object: one shared mesh, an instance and an object entry per copy (capacity, not count), hidden
-    /// past the count and where a matrix scales to 0; mirrored copies flatten every drawn copy.
+    /// past the count and where a matrix scales to 0; a copy may mirror the mesh.
     #[test]
     fn instanced_objects_share_one_mesh() {
         let mut w = World::default();
@@ -2335,12 +2956,251 @@ mod instance_tests {
         assert_eq!((sc.meshes.len(), sc.instances.len(), sc.tris.len(), sc.objects.len() / 4), (1, 4, 0, 4), "tinted: 4 vec4s an object");
         assert_eq!(sc.instances.iter().map(|i| (i.sub, i.hidden)).collect::<Vec<_>>(), vec![(Some(0), false), (Some(1), false), (Some(2), true), (Some(3), true)]);
         assert_eq!((sc.objects[4][0], sc.objects[4 + 3]), (1.0, [0.5, 0.5, 0.5, 0.0]));
-        assert!(sc.tinted && sc.retained.instanced[&2].capacity == 4);
+        assert!(sc.tinted && sc.retained.instanced(2).unwrap().capacity == 4);
         let mut m = m.map(|m| m.to_cols_array()).concat();
         m[0] = -1.0;
         w.set_instances(2, 3, Some(m), None, None).unwrap();
         let sc = build(&w, Path::new("."), &crate::default_presets_dir(), None).unwrap();
-        assert_eq!((sc.instances.len(), sc.tris.len(), sc.tri_instances.iter().map(|r| r.2).collect::<Vec<_>>()), (0, 2, vec![0, 1]), "mirrored: the drawn copies flattened");
+        assert_eq!((sc.instances.len(), sc.tris.len()), (4, 0), "a copy that mirrors the mesh is an instance as the others");
+        assert_eq!(sc.instances.iter().map(|i| i.gpu(0).n[1][3].to_bits()).collect::<Vec<_>>(), [INST_MIRRORED, 0, 0, 0], "and its record says so");
+    }
+
+    /// An instanced object whose material only emits is placed as any other: one shared mesh, which has the emitters,
+    /// an instance a copy; a hidden copy's entry has no power. `prepare` gives every copy, the hidden too, its run of
+    /// the light list, of emitters that move: a hidden copy's at its mesh's own area and no weight.
+    #[test]
+    fn an_emitting_instanced_object_is_instances() {
+        let mut w = World::default();
+        w.set_material(1, serde_json::from_value(serde_json::json!({ "name": "m", "color": [0, 0, 0], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [1, 1, 1], "emissiveIntensity": 5, "doubleSided": false })).unwrap());
+        let g = world::Geometry { positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], normals: vec![0.0, 0.0, 1.0].repeat(3), uvs: vec![0.0; 6], indices: vec![0, 1, 2], groups: vec![], colors: vec![] };
+        w.set_geometry(1, g).unwrap();
+        w.set_object(2, "lamps".into(), None, Kind::Instanced { geometry: 1, procedural: false, materials: vec![1], capacity: 4 }, true, false).unwrap();
+        w.set_power(2, 2.0).unwrap();
+        let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+        w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+        w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+        let m = [Mat4::from_scale(Vec3::splat(2.0)), Mat4::from_translation(Vec3::X), Mat4::from_scale(Vec3::ZERO), Mat4::from_translation(Vec3::Y)];
+        w.set_instances(2, 3, Some(m.iter().flat_map(|m| m.to_cols_array()).collect()), None, None).unwrap();
+        let mut sc = build(&w, Path::new("."), &crate::default_presets_dir(), None).unwrap();
+        assert_eq!((sc.meshes.len(), sc.meshes[0].sect_count, sc.instances.len(), sc.tris.len()), (1, 1, 4, 0));
+        assert_eq!(sc.instances.iter().map(|i| (i.rows, i.bits)).collect::<Vec<_>>(), [(0, 0), (1, 0), (2, 0), (3, 0)], "a row a copy");
+        let (st, first) = (sc.object_stride(), sc.retained.instanced(2).unwrap().object as usize);
+        assert_eq!((0..4).map(|i| sc.objects[(first + i) * st][3]).collect::<Vec<_>>(), [2.0, 2.0, 0.0, 0.0], "a hidden copy's entry has no power");
+        let prep = crate::prepare_as(true, false, &mut sc, &mut vec![]);
+        let e = &prep.emitter_tris;
+        assert_eq!(e.iter().map(|e| (e.inst, e.obj as usize - first, e.moves, e.area)).collect::<Vec<_>>(), [(0, 0, true, 2.0), (1, 1, true, 0.5), (2, 2, true, 0.5), (3, 3, true, 0.5)]);
+        assert_eq!(sc.instances.iter().map(|i| i.first_emitter).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        let power = |i: usize| crate::emitter_power(&e[i], &sc.materials, &sc.objects, st);
+        assert_eq!([power(0), power(1), power(2), power(3)], [4.0 * power(1), power(1), 0.0, 0.0], "weights: by size, none when hidden");
+        assert!(power(1) > 0.0 && crate::switchable_power(&e[2], &sc.materials, &sc.objects, st) > 0.0, "a hidden copy's emitter is one the light tree would have");
+    }
+
+    /// A model placed mirrored (a negative scale) is an instance as one placed straight is, of the same mesh: a model
+    /// that stays and a rigid model's moving node (tests/render/data/panel-decal.glb). The meshes do not depend on
+    /// the placement's hand; the instances' records say that they mirror; what the build flattens of them keeps
+    /// facing as its normals do.
+    #[test]
+    fn a_mirrored_model_is_an_instance_of_the_same_mesh() {
+        let scene = |x: f32| {
+            let mut w = World::default();
+            let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+            w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+            w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+            let model = |animation| Kind::Model { uri: "tests/render/data/panel-decal.glb".into(), nodes: None, animation, functions: vec![] };
+            w.set_object(1, "still".into(), None, model(None), true, false).unwrap();
+            w.set_object(2, "posed".into(), None, model(Some(desc::Animation { clip: "slide".into(), time: 0.25, r#loop: true, nodes: Default::default() })), true, false).unwrap();
+            for id in [1, 2] {
+                w.set_transform(id, Vec3::new(id as f32, 0.0, 0.0), glam::Quat::from_rotation_y(0.4), Vec3::new(x, 1.0, 1.0)).unwrap();
+            }
+            build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap()
+        };
+        let (straight, mirrored) = (scene(1.0), scene(-1.0));
+        let meshes = |sc: &Scene| sc.meshes.iter().map(|m| (m.first, m.count, m.sect_count, m.rest_count)).collect::<Vec<_>>();
+        assert_eq!(meshes(&mirrored), meshes(&straight));
+        assert_eq!(mirrored.pool_tris, straight.pool_tris, "the meshes' triangles are the model's own, whatever places them");
+        assert_eq!((mirrored.instances.len(), mirrored.tris.len()), (straight.instances.len(), straight.tris.len()));
+        assert_eq!((&mirrored.sections, &mirrored.rows), (&straight.sections, &straight.rows), "and their sections and rows");
+        assert!(straight.instances.len() >= 2 && straight.instances.iter().all(|i| i.gpu(0).n[1][3].to_bits() & INST_MIRRORED == 0));
+        assert!(mirrored.instances.iter().all(|i| i.gpu(0).n[1][3].to_bits() & INST_MIRRORED != 0), "every instance of a mirrored model mirrors");
+        // What is flattened of them (the cutout on an emitter with its emitter: a still model's, a moving node's) faces
+        // as its normals do, mirrored too.
+        for (sc, what) in [(&straight, "straight"), (&mirrored, "mirrored")] {
+            assert!(!sc.tris.is_empty());
+            for (t, a) in sc.tris.iter().zip(&sc.attrs) {
+                assert!((t[1] - t[0]).cross(t[2] - t[0]).dot(Vec3A::new(a.n0[0], a.n0[1], a.n0[2])) > 0.0, "{what}: a flattened triangle faces away from its normals");
+            }
+        }
+    }
+
+    /// A mesh of a geometry drawn by its groups lies by section, a group after another: a triangle in no group is not
+    /// drawn, one in two groups is its last group's. Its triangles hold their section and their index in it and
+    /// nothing of a material; an instance's rows say the materials, by the groups' slots: their classes, whether it
+    /// casts, how many emitters it has and where each section's start. Drawn with one material, the geometry whole is
+    /// one section.
+    #[test]
+    fn a_mesh_lies_by_section_and_an_instances_rows_say_its_materials() {
+        // Five quads along x: a group each but the third, which has none; a fifth group takes the first quad's second
+        // triangle.
+        let (mut positions, mut indices) = (vec![], vec![]);
+        for q in 0..5u32 {
+            let x = q as f32;
+            positions.extend([x, 0.0, 0.0, x + 1.0, 0.0, 0.0, x + 1.0, 1.0, 0.0, x, 1.0, 0.0]);
+            indices.extend([0, 1, 2, 0, 2, 3].map(|i| 4 * q + i));
+        }
+        let colors: Vec<f32> = (0..20).flat_map(|v| [(v / 4) as f32 / 4.0, 0.0, 0.0]).collect();
+        let g = world::Geometry { normals: [0.0, 0.0, 1.0].repeat(20), uvs: vec![0.0; 40], positions, indices, groups: vec![[0, 6, 0], [6, 6, 1], [18, 6, 2], [24, 6, 3], [3, 3, 1]], colors: vec![] };
+        assert!(by_groups(&g, 2) && !by_groups(&g, 1) && !by_groups(&world::Geometry { groups: vec![], ..g.clone() }, 4));
+        let d = section_mesh(&g, true, 10, 7, true);
+        let sect = |first, count, slot| Section { first, count, slot };
+        assert_eq!(d.sections, [sect(0, 1, 0), sect(1, 2, 1), sect(3, 2, 2), sect(5, 2, 3), sect(7, 1, 1)]);
+        assert_eq!(d.tris.iter().map(|t| t[0].x.min(t[1].x).min(t[2].x)).collect::<Vec<_>>(), [0.0, 1.0, 1.0, 3.0, 3.0, 4.0, 4.0, 0.0], "each triangle in its last group's section");
+        assert_eq!(d.attrs.iter().map(|a| (a.uv[3].to_bits(), a.x[3].to_bits())).collect::<Vec<_>>(), [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1), (4, 0)]);
+        let im = d.mesh;
+        assert_eq!((im.first, im.count, im.sect_first, im.sect_count, im.colored), (10, 8, 7, 5, false), "no colours: the geometry has none");
+        assert_eq!((im.lo, im.hi), (Vec3A::new(0.0, 0.0, 0.0), Vec3A::new(5.0, 1.0, 0.0)), "bounds of what is drawn");
+        let mut all = vec![sect(9, 9, 9); 7];
+        all.extend(&d.sections);
+        assert_eq!(im.parts(&all), [(0, 1), (1, 2), (3, 2), (5, 2), (7, 1)], "a geometry a section");
+        assert!(d.colors.is_none());
+        // Its geometry's colours, where it has them and they are asked for: the drawn triangles', as they lie.
+        let tinted = section_mesh(&world::Geometry { colors, ..g.clone() }, true, 0, 0, true);
+        let red = |c: &[u32; 3]| c[0] & 0xff;
+        assert!(tinted.mesh.colored && !section_mesh(&world::Geometry { colors: vec![1.0; 60], ..g.clone() }, true, 0, 0, false).mesh.colored);
+        assert_eq!(tinted.colors.as_ref().map(|c| c.iter().map(red).collect::<Vec<_>>()), Some(vec![0, 137, 137, 225, 225, 255, 255, 0]));
+        // An instance's rows: glass, a cutout, an emitter, a plain material by the slots 0 to 3.
+        let materials = [GpuMaterial { layer: [1.0, 1.5, 0.0, 0.0], ..Default::default() }, GpuMaterial { uv2: [0.0, 0.0, 0.0, 0.5], ..Default::default() }, GpuMaterial { emissive: [1.0, 1.0, 1.0, 0.0], ..Default::default() }, GpuMaterial::default()];
+        let rows = section_rows(&d.sections, &[0, 1, 2, 3], &materials);
+        assert_eq!(rows, [[ROW_GLASS, 0, NO_EMITTER, 0], [1 | ROW_CUTOUT, 0, NO_EMITTER, 0], [2, 0, NO_EMITTER, 0], [3, 0, NO_EMITTER, 0], [1 | ROW_CUTOUT, 0, NO_EMITTER, 0]]);
+        assert_eq!(rows.iter().map(row_material).collect::<Vec<_>>(), [0, 1, 2, 3, 1]);
+        assert_eq!((rows_cast(&rows, true), rows_cast(&rows, false), rows_bits(&rows)), (true, false, INST_CUTOUT | INST_GLASS));
+        let starts = section_emitters(&d.sections, &rows, &materials);
+        assert_eq!((rows_emitters(&d.sections, &rows, &materials), &starts[..]), (2, &[None, None, Some(0), None, None][..]));
+        assert_eq!((section_slot(&d.attrs[4], &rows, &starts), section_slot(&d.attrs[5], &rows, &starts)), (Some((1, 2, 2)), None), "an emitter's place (its section's start and its index), its material and its section");
+        // Two materials for four slots: a slot past the last is the last. Emitters in two sections, one after another.
+        let two = section_rows(&d.sections, &[2, 0], &materials);
+        assert_eq!(two.iter().map(row_material).collect::<Vec<_>>(), [2, 0, 0, 0, 0]);
+        assert_eq!((rows_emitters(&d.sections, &two, &materials), rows_bits(&two), rows_cast(&two, true)), (1, INST_GLASS, true));
+        let lit = section_rows(&d.sections, &[2, 3, 3, 2], &materials);
+        assert_eq!((rows_emitters(&d.sections, &lit, &materials), section_emitters(&d.sections, &lit, &materials)), (3, vec![Some(0), None, None, Some(1), None]));
+        // All glass: it casts no shadow, whatever its object says.
+        let glass = section_rows(&d.sections, &[0, 0], &materials);
+        assert_eq!((rows_cast(&glass, true), rows_bits(&glass)), (false, INST_GLASS));
+        // Put in another order (a unit's tree's), the triangles are numbered again in their sections.
+        let mut back: Vec<GpuTriAttr> = d.attrs.iter().rev().copied().collect();
+        rank_in_sections(&mut back);
+        assert_eq!(back.iter().map(|a| (a.uv[3].to_bits(), a.x[3].to_bits())).collect::<Vec<_>>(), [(4, 0), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)]);
+        // One material: the geometry whole, as it has its triangles, one section.
+        let one = section_mesh(&g, false, 0, 0, false);
+        assert_eq!((one.sections.clone(), one.mesh.sect_count, one.attrs.len()), (vec![sect(0, 10, 0)], 1, 10));
+        assert_eq!(one.attrs.iter().map(|a| (a.uv[3].to_bits(), a.x[3].to_bits())).collect::<Vec<_>>(), (0..10).map(|k| (0, k)).collect::<Vec<_>>());
+        assert_eq!(section_rows(&one.sections, &[1], &materials), [[1 | ROW_CUTOUT, 0, NO_EMITTER, 0]]);
+    }
+
+    /// A model's mesh lies by section, a section a material of the file (tests/render/data/frame-pane.glb: an opaque,
+    /// a cutout and a glass quad; placed twice): one mesh of three sections, nothing flattened. Each instance has its
+    /// three rows, with the classes, and casts (not all of it is glass); its record has the rows' first, a row where
+    /// its section's triangles start; the kernel's features for a cutout and for glass among other sections are set.
+    #[test]
+    fn a_models_mesh_lies_by_section_a_material_of_the_file() {
+        let mut w = World::default();
+        let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+        w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+        w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+        for id in [1, 2] {
+            w.set_object(id, format!("model{id}"), None, Kind::Model { uri: "tests/render/data/frame-pane.glb".into(), nodes: None, animation: None, functions: vec![] }, true, false).unwrap();
+            w.set_transform(id, Vec3::new(id as f32 * 5.0, 0.0, 0.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        }
+        let mut sc = build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap();
+        assert_eq!(sc.meshes.iter().map(|m| (m.count, m.sect_count, m.rest_count)).collect::<Vec<_>>(), [(6, 3, 0)]);
+        assert_eq!((sc.instances.len(), sc.tris.len()), (2, 0));
+        assert_eq!(sc.meshes[0].parts(&sc.sections), [(0, 2), (2, 2), (4, 2)], "a geometry a section");
+        assert_eq!(sc.pool_attrs.iter().map(|a| (a.uv[3].to_bits(), a.x[3].to_bits())).collect::<Vec<_>>(), [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)], "a triangle's section and its index in it");
+        assert_eq!(sc.instances.iter().map(|i| (i.rows, i.bits, i.cast_shadow)).collect::<Vec<_>>(), [(0, INST_CUTOUT | INST_GLASS, true), (3, INST_CUTOUT | INST_GLASS, true)], "rows of its own an instance");
+        for i in &sc.instances {
+            let mine = &sc.rows[i.rows as usize..][..3];
+            let mut classes: Vec<u32> = mine.iter().map(|r| r[0] & (ROW_CUTOUT | ROW_GLASS)).collect();
+            classes.sort_unstable();
+            assert_eq!(classes, [0, ROW_CUTOUT, ROW_GLASS], "an opaque, a cutout and a glass section");
+            assert_eq!(mine, &sc.retained.mesh_rows[&i.mesh][..], "the mesh's rows, the file's materials");
+        }
+        crate::prepare_as(true, false, &mut sc, &mut vec![]);
+        for (r, i) in sc.gpu_instances.iter().zip(&sc.instances) {
+            assert_eq!(r.info[3], i.rows, "the record has its rows' first");
+            assert_eq!(sc.rows[i.rows as usize..][..3].iter().map(|row| row[1] - r.info[0]).collect::<Vec<_>>(), [0, 2, 4], "a row has where its section starts");
+        }
+        let f = crate::gpu::instance_features(&sc);
+        assert_eq!(f & (crate::gpu::F_IGLASS | crate::gpu::F_MASKED), crate::gpu::F_IGLASS | crate::gpu::F_MASKED);
+        // The sections of a list of triangles: a material after another as they first appear, the list's order in each.
+        let (order, sections, rows) = model_sections(&[(5, 9, 2), (0, 7, 0), (3, 9, 2), (1, 8, 1), (4, 7, 0)]);
+        assert_eq!(order, [(0, 0, 0), (4, 0, 1), (1, 1, 0), (3, 2, 0), (5, 2, 1)]);
+        assert_eq!(sections, [Section { first: 0, count: 2, slot: 0 }, Section { first: 2, count: 1, slot: 1 }, Section { first: 3, count: 2, slot: 2 }]);
+        assert_eq!(rows, [[7, 0, NO_EMITTER, 0], [8 | ROW_CUTOUT, 0, NO_EMITTER, 0], [9 | ROW_GLASS, 0, NO_EMITTER, 0]]);
+    }
+
+    /// A cutout on exactly an emitter's vertices leaves the mesh with it (`flatten_coincident`), in a model that stays
+    /// and in a rigid model's moving node (tests/render/data/panel-decal.glb: panel.glb, a grey quad and an emitting
+    /// one, with a masked quad on the emitting one's vertices): each mesh keeps the grey quad alone.
+    #[test]
+    fn a_cutout_on_an_emitter_is_flattened_with_it() {
+        let mut w = World::default();
+        let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+        w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+        w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+        let model = |animation| Kind::Model { uri: "tests/render/data/panel-decal.glb".into(), nodes: None, animation, functions: vec![] };
+        w.set_object(1, "still".into(), None, model(None), true, false).unwrap();
+        w.set_object(2, "posed".into(), None, model(Some(desc::Animation { clip: "slide".into(), time: 0.25, r#loop: true, nodes: Default::default() })), true, false).unwrap();
+        let sc = build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap();
+        let mesh = |name: &str| {
+            let i = sc.instances.iter().find(|i| i.name == name).unwrap();
+            let m = &sc.meshes[i.mesh as usize];
+            (m.count, m.rest_count, rows_emitters(m.sections(&sc.sections), &sc.rows[i.rows as usize..][..m.sect_count as usize], &sc.materials))
+        };
+        assert_eq!((mesh("still"), mesh("posed")), ((2, 4, 0), (2, 0, 0)), "(triangles in the mesh, flattened a placement, emitters of the instance)");
+        let count = |f: &dyn Fn(usize) -> bool| (0..sc.tris.len()).filter(|&k| f(k)).count();
+        let emits = |k: usize| sc.materials[sc.attrs[k].uv[3].to_bits() as usize].emissive[..3].iter().any(|e| *e > 0.0);
+        let flattened = (sc.tris.len(), count(&emits), count(&|k| sc.tri_flags[k] & TRI_MASKED != 0), count(&|k| sc.tri_flags[k] & TRI_DYNAMIC != 0));
+        assert_eq!(flattened, (8, 4, 4, 4), "flattened: (triangles, emitting, cutout, the moving node's)");
+        let Draw::Rigid(r) = &sc.retained.proxies[&2].draw else { panic!("the posed model is rigid") };
+        assert_eq!((r.instances.len(), r.rest.mats.len()), (1, 4));
+    }
+
+    /// A posed rigid model is its parts (tests/render/data/panel-slider.glb: a node its clip leaves alone, a grey quad
+    /// and an emitting one, and a node it moves, a grey quad): the nodes left alone one mesh in the model's space,
+    /// the moved node a mesh in its own, both shared by the placements of the model with the clip, whatever its time.
+    /// Nothing is flattened. The part left alone's emitters are still ones, movable object or not.
+    #[test]
+    fn a_posed_rigid_model_is_instances_of_its_parts_meshes() {
+        let mut w = World::default();
+        let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+        w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+        w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+        for (id, time, movable) in [(1, 0.25, false), (2, 0.75, true)] {
+            let animation = Some(desc::Animation { clip: "slide".into(), time, r#loop: true, nodes: Default::default() });
+            w.set_object(id, format!("model{id}"), None, Kind::Model { uri: "tests/render/data/panel-slider.glb".into(), nodes: None, animation, functions: vec![] }, true, movable).unwrap();
+            w.set_transform(id, Vec3::new(id as f32 * 20.0, 0.0, 0.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        }
+        let mut sc = build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap();
+        assert_eq!(sc.meshes.iter().map(|m| (m.count, m.sect_count, m.rest_count)).collect::<Vec<_>>(), [(4, 2, 0), (2, 1, 0)], "the part left alone (two materials), the moved node");
+        assert_eq!((sc.meshes[0].lo.x, sc.meshes[0].hi.x, sc.meshes[1].lo.x, sc.meshes[1].hi.x), (1.0, 9.0, -1.0, 1.0), "the part left alone in the model's space (its node 5 m along x), the moved node in its own");
+        assert_eq!((sc.instances.len(), sc.tris.len()), (4, 0), "two instances a placement, nothing flattened");
+        let rigid = |sc: &Scene, id: u32| match &sc.retained.proxies[&id].draw {
+            Draw::Rigid(r) => r.clone(),
+            _ => panic!("a posed rigid model"),
+        };
+        for (id, y, movable) in [(1, 0.75, false), (2, 2.25, true)] {
+            let r = rigid(&sc, id);
+            let (still, node) = (&sc.instances[r.still.expect("it has nodes left alone") as usize], &sc.instances[r.instances[0].1 as usize]);
+            assert_eq!((r.instances.len(), r.instances[0].0, still.mesh, node.mesh), (1, 1, 0, 1), "model {id}: the meshes every placement shares");
+            let at = id as f32 * 20.0;
+            assert_eq!((still.world.w_axis.truncate(), node.world.w_axis.truncate()), (Vec3::new(at, 0.0, 0.0), Vec3::new(at + 11.0, y, 0.0)), "model {id}: the object's place, and the node's by the clip");
+            assert_eq!((r.records().len(), r.moving(), movable), (2, vec![r.instances[0].1], id == 2), "model {id}: the node alone has moving emitters at the build");
+            assert_eq!(&sc.rows[still.rows as usize..][..2], &sc.retained.mesh_rows[&0][..], "model {id}: its rows are the mesh's");
+        }
+        // Its emitters are its instances': the part left alone's two triangles a placement, still ones (in the light
+        // tree) until the object first moves.
+        let prep = crate::prepare_as(true, false, &mut sc, &mut vec![]);
+        let of = |id: u32| { let r = rigid(&sc, id); prep.emitter_tris.iter().filter(|e| Some(e.inst) == r.still).map(|e| e.moves).collect::<Vec<bool>>() };
+        assert_eq!((of(1), of(2)), (vec![false; 2], vec![false; 2]));
     }
 
     #[test]

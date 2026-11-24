@@ -4,8 +4,8 @@ A material function is a WGSL body attached to a material, run by the path trace
 (camera hits, every bounce, shadow-ray alpha tests and emitter sampling). It is our equivalent of a UE material graph or
 a Custom-HLSL node. The DSL declares it once with named parameters and texture slots, and each material instance binds
 its own values. Expressiveness lives in code instead of in a growing list of built-in material fields, so a UE master
-material can be ported line for line (the Kabukichō port in `games/kabukicho/street.ts` mirrors the UE session's nine
-master materials this way).
+material can be ported line for line (the standard library's nine street materials, below, were ported this way from
+the master materials of a UE 5.8 night-street level).
 
 ```ts
 import { MaterialFunction, MeshStandardMaterial, Texture } from "@threert/scene";
@@ -24,13 +24,13 @@ const SIGN = new MaterialFunction("sign", {
 });
 
 const mat = new MeshStandardMaterial({ name: "sign_ramen" });
-mat.shader = SIGN.with({ Intensity: 20 }, { SignTex: new Texture("assets/kabukicho/textures/T_Sign_ramen.png") });
+mat.shader = SIGN.with({ Intensity: 20 }, { SignTex: new Texture("assets/my-game/sign_ramen.png") });
 ```
 
 ## Standard library
 
 Most scenes need the same few materials, so `@threert/scene` ships them as Three-like constructors
-(`packages/scene/src/materials.ts`): fill in parameters, no shading code. Nine are the Kabukichō master materials
+(`packages/scene/src/materials.ts`): fill in parameters, no shading code. Nine are the UE level's master materials
 above, taken line for line; `SurfaceMaterial` is the renderer's former built-in material fields (world mapping,
 wetness, puddles, grime, facade windows), moved out of the kernel line for line. The constructors take metres and
 three.js names (`map`, `roughnessMap`, `normalMap`, `color`, `roughness` as the roughness map's multiplier) and bind
@@ -52,11 +52,12 @@ neutral 1×1 maps for slots left empty.
 ```ts
 import { NeonSignMaterial, Texture, WetGroundMaterial } from "@threert/scene";
 
-const ph = (id: string, m: string) => new Texture(`assets/polyhaven/tex/${id}/${id}_${m}_2k.jpg`, m === "diff" ? "srgb" : "linear");
-const street = new WetGroundMaterial({ map: ph("worn_asphalt", "diff"), roughnessMap: ph("worn_asphalt", "rough"),
-  normalMap: ph("worn_asphalt", "nor_gl"), puddleMap: new Texture("assets/kabukicho/masks/T_PuddleMask.png", "linear"),
+// Poly Haven sets: node tools/fetch-polyhaven.ts --set street
+const ph = (id: string, m: string) => new Texture(`assets/polyhaven/tex/${id}/${id}_${m}_1k.jpg`, m === "diff" ? "srgb" : "linear");
+const street = new WetGroundMaterial({ map: ph("clean_asphalt", "diff"), roughnessMap: ph("clean_asphalt", "rough"),
+  normalMap: ph("clean_asphalt", "nor_gl"), puddleMap: new Texture("assets/my-game/puddle_mask.png", "linear"),
   textureScale: 2, puddles: 1.1, color: [0.85, 0.8, 0.8] });
-const sign = new NeonSignMaterial({ map: new Texture("assets/kabukicho/textures/T_SignH_00.png"), intensity: 9, flicker: true, glow: [1, 0.5, 0.2] });
+const sign = new NeonSignMaterial({ map: new Texture("assets/my-game/sign_bar.png"), intensity: 9, flicker: true, glow: [1, 0.5, 0.2] });
 sign.set({ intensity: 14 });   // parameters are read when a material is made; set() changes them later
 ```
 
@@ -74,7 +75,7 @@ or only adjust a part.
 |---|---|
 | `wp` | world position (m) |
 | `n`, `ng` | vertex / geometric normal, facing the viewer |
-| `t`, `b` | tangent (+u), bitangent (image up) |
+| `t`, `b` | tangent (+u), bitangent (image up): the surface's own at the point (a model's vertices', a file's or made for it) or, for geometry without tangents, its triangle's |
 | `uv`, `uvd` | mesh UV0 (v down); `exp2(uvd)` = UV units per metre (pass it to `msample` for the mip) |
 | `view` | unit vector toward the ray origin |
 | `op`, `ob` | object pivot and world bounds size (UE `ObjectPositionWS` / `ObjectBounds`) |
@@ -224,7 +225,7 @@ radiance above.
 - Layer A `volume/lighting` checks the live voxels: a white particle at the centre of a closed cube with one lit
   wall reads 1/6 of the wall's radiance. `volume/lighting-offline` checks the same with the offline estimate.
 
-`RainCurtain` (the standard library's rain, UE's AKabukichoRain + M_Rain) is a `Particles` node built this way: its
+`RainCurtain` (the standard library's rain, UE's camera-wrapped rain actor + M_Rain) is a `Particles` node built this way: its
 particle function wraps 16 000 streaks in a box around the camera, and its material function gives M_Rain's streak
 profile, colour and distance fades.
 
@@ -416,7 +417,9 @@ cloud.scale.set(8, 8, 8);
 - **Rendering.** As any medium: delta tracking and ratio tracking offline; live, the camera rays' march and the volume
   voxels' in-scattering (above). A medium with a grid is marched in 64 steps instead of 8 (a grid has detail 8 steps
   miss), and its empty steps skip the voxel lookup.
-- **Changing it from the game.** Write `grid.data`, set `grid.needsUpdate`: uploaded in place, no rebuild.
+- **Changing it from the game.** Write `grid.data`, set `grid.needsUpdate`: uploaded in place. A volume with a
+  grid the scene had not, a grid of another size or with another program, comes in place too (the scene's grids
+  are made again together; docs/RUNTIME.md "What comes in place").
 - **Simulating it.** With a `GridProgram`, the grid changes on the GPU every frame (`renderer/shaders/grid_sim.wgsl`,
   WGSL compute only). The grid then holds a second field B of four numbers, the program's own (a velocity, say).
   - The program is a WGSL body run once per cell, with `$Name` parameters. It gets the cell's `s.a` and `s.b` and
@@ -432,8 +435,9 @@ cloud.scale.set(8, 8, 8);
     a program that adds what a source gives adds it once). At most 64 a frame.
   - Offline, a still at scene time t runs the program for round(t × 60) frames (at most 36,000) from the setup's
     sources, then renders.
-  - A rebuild of the live scene keeps what the program has simulated, while the grid is the same grid: its size and
-    its program (new parameters keep it). A new size or another program starts it again from its data.
+  - What the program has simulated stays while the grid is the same grid: its size and its program (new
+    parameters and a change of the program's code keep it), across the scene's grids being made again and across a
+    rebuild of the live scene. A new size or another program starts it again from its data.
 
 ```ts
 // The whole of an advection: each cell takes what was upstream of it.
@@ -699,8 +703,8 @@ other files (`World::files`). Layer A: `procedural/asset`, `procedural/asset-bit
 The scene binding sends each function to the engine once (`engine.shader(name, wgsl, helpers)`) and each binding with
 its material (`shader`: function id, 32 parameter floats, texture handles). The renderer splices all of a scene's functions into one kernel module behind a
 `material_function` switch and compiles a pipeline variant per (feature mask, code hash), so scenes without functions
-pay nothing. On the Kabukichō port (nine functions on ~2.6 k nodes) they cost about 20 % of the live frame. The usual
-lever is cheaper evaluation at `i.depth > 0` (indirect hits), where fine normal or grime detail is invisible.
+pay nothing. On the Kabukichō port (a street demo since removed: nine functions on ~2.6 k nodes) they cost about 20 %
+of the live frame. The usual lever is cheaper evaluation at `i.depth > 0` (indirect hits), where fine normal or grime detail is invisible.
 
 Names must be WGSL identifiers. Two different bodies with the same name are rejected, and an unknown `$Name` or an
 unbound texture slot is an error in the scene binding, before anything reaches the renderer.

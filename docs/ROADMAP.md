@@ -11,6 +11,16 @@ No demos that repeat what is already proven.
 
 ## Direction
 
+Direction of 2026-11-24 (the user's, relayed by the supervisor, who rewrites the roadmap by it): § 0's order changes.
+The streamed city lives in its own repository, [threert/TokyoRT](https://github.com/threert/TokyoRT) (this engine as
+its submodule); its step 2 architecture is in (cells by distance, the kit as instances, in-place adds, incremental
+TLAS), none of step 2's acceptance is met yet. The user's review of a street-level day shot (Golden Gai) found the
+popping between levels the most visible fault, and the street level reading as generated: ground too clean, walls as
+boxes, weathering as tiled noise, windows without depth, props without purpose. So, after the script engine's GC
+hitches: a ΔE / SSIM tool against the offline render, then the popping, then the street level's look (step 6, split
+into 6a–6d), and only then the rest of step 2 (Shibuya stitched in) and steps 3 onward. Every PR reports frame start
+p95 and ΔE / SSIM; detail does not buy back frame time. A supervisor checks the line every two hours.
+
 Direction of 2026-11-10 (the user's, relayed by the supervisor, who rewrites the roadmap by it): the day / night cycle
 and the weather are developed and measured on Tokyo, in this phase (§ 0 steps 1a and 1b), after step 1 and before
 streaming; there is no separate scene for them. The main line takes over the time of day the supervisor brought
@@ -523,7 +533,19 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
        - The translucency pass compiles only its particles' material functions: with every function of Tokyo's kernel
          in it, the Metal compiler failed on the `translucent` pipeline once the ground had wetLayer and the rain
          curtain was in the scene.
-  Order: 1 (complete with its part 3, signs and road markings) → 1a → 1b → 2 → 3 → 4 → 5 → 6 → 7.
+  Order: 1 (complete with its part 3, signs and road markings) → 1a → 1b → 2 → 3 → 4 → 5 → 6 → 7 (until 2026-11-24).
+  Order since 2026-11-24 (the user's; the work in threert/TokyoRT, engine changes here):
+    - (1) step 2's frame budget: the script engine's GC hitches (~100 ms a few times a minute over ~1 M live JS objects)
+        → p99 ≤ 25 ms, no frame over 50 ms, by making fewer objects, not by switching collection off;
+    - (2) a ΔE / SSIM tool for the streamed city: fixed poses, live against our offline render, and streamed against
+        everything resident at full detail (step 2's ΔE ≤ 1.0 / SSIM ≥ 0.98); every PR reports it from here on;
+    - (3) popping between levels (step 2's "streaming invisible"): first the levels agree (colour, material and outline
+        of the same building far, mid and near: the far level's dark Tochō against the mid level's light curtain wall),
+        then a dithered transition for the ~140 m swap; ΔE across a swap at fixed poses;
+    - (4) step 6a–6d below, in that order;
+    - (5) the rest of step 2: Shibuya stitched in (~20 km²), the drive, expressway and flight paths, resident memory,
+        the first frame;
+    - (6) then 3 → 4 → 5 → 7. Step 1b (weather) waits: its place is the user's to set.
   2. **Streaming.** Tiles resident by distance:
      - geometry, textures and BLASes per tile, in a bounded pool;
      - the far field as proxies (merged, simplified tile meshes; roofs and facades as photo-textured blocks);
@@ -557,6 +579,20 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
      generated facades read flat.
      - Acceptance: street-level poses live vs our offline render no worse than step 1; crops beside photos of the same
        places (qualitative, in the PR); the budget held.
+     - Brought forward (the user's review, 2026-11-24, a Golden Gai day shot): what the street level lacks, in order.
+       Each part lands with a before / after pair at the same day poses, frame start p95 and ΔE / SSIM. Repeated parts
+       go into the kit (instances), so detail costs memory once.
+       - 6a. **Weathering by cause, and the ground.** Ageing that follows rain, gravity, sun, structure and use, not a
+         tiled noise: streaks under sills and air conditioners, splash and grime at the wall's foot, the cleaner band
+         under eaves, sun-faded faces. The ground: gutters, manholes, asphalt patches, seams, dust at the kerb, slight
+         unevenness (gratings and manholes are kit pieces already: their density and placement). The stucco's relief is
+         too coarse and strong where the sun rakes it.
+       - 6b. **Secondary structure on the walls.** Pipes, meters, conduits, vents, layered window frames, eaves, door
+         sills and joints: what keeps a building from reading as a box.
+       - 6c. **Props with a purpose.** Props in groups by what happens there: beer crates, bins, the exhaust duct and the
+         mop bucket at a bar's back door; the A-board, planters and umbrella stand at its front.
+       - 6d. **Windows and glass.** Shopfronts first: rooms with depth behind the glass (interior mapping), the street
+         reflected in it, things standing behind it, dirt on it. Upper windows after. Placeholder posters replaced.
   7. **Milestone 2, the open city.** Shinjuku and Shibuya at night, and by day:
      - a montage per view: our offline render | ThreeRT live | the source three.js app, each tile with its frame rate
        and ΔE / SSIM;
@@ -2493,6 +2529,727 @@ Zero Day 9.41 -> 8.41 ms (-10.6 %), Bistro 8.57 -> 8.05 (-6.1 %) and 4.58 -> 4.3
 slice 9.00 -> 8.29, a glass scene 4.97 -> 4.60, Kabukichō 16.23 -> 14.61 guarded (-10 %); scenes without cutouts
 (lamp-rooms, the fire scene, Tokyo) as they were. The shortcuts now save Zero Day 0.3 ms where they cost it 0.4.
 
+**A second pass for the pixels that go on (2026-11-16, after it).** Where a live path ends in the cache most pixels
+read a warm voxel and are done; some have more to trace: a training path (1 tile in 8), a cold voxel's estimate, a
+reflection hit's lights (a third of Zero Day's pixels). Traced in `main` they held their SIMD groups, and their code
+cost every pixel (`main` without it: Bistro 8.06 -> 6.54 ms). They leave a 96-byte record now, and the kernel's
+`finish` pass traces the records after each sample, one invocation each, and adds the light to the pixel as the
+epilogue splits it. The estimator is the same: bench-window's shots as main's (Bistro 1.81, lamp-rooms 0.63, the
+slice 5.40, Kabukichō 4.66); render-identity: no offline picture differs, 13 live ones of 229 at single pixels with
+the image's mean within 4e-5 (which slot a voxel takes follows the order of inserts), and the build repeats itself
+to the byte where main did not (its lookups raced its own training). The trace: Bistro 8.16 -> 7.29 ms (-10.7 %)
+and 4.36 -> 3.98 along its camera path, Zero Day 8.52 -> 7.75 (-9.0 %), lamp-rooms 3.79 -> 3.24 (-14.5 %), the
+Bistro slice 8.32 -> 7.31 (-12.1 %); guarded, Tokyo 4.74 -> 4.28 (-9.7 %) and Kabukichō 14.60 -> 13.64 (-6.6 %:
+the pass costs 2.7 ms there, the wet street's material function run again for each record). The layout as written
+only; the merged one ends its paths in `main` as before. The records' buffer follows the traced size (50 MB at
+960 x 540). It is the kernel's 23rd binding, and the translucency pass, at Metal's 29 a stage already, binds
+group 1 without it: the next buffer needs a layout for each pass of what it reads. (Kabukichō's profile, for
+whoever reads it next: the particles' BLAS slot is 0.45 ms when the frame fits a display interval and 1.0 to 1.7
+with a spread of 3 when it is between one and two, in main's build too: it times a wait.) Next here: the segment
+test, whose pixels can go to the pass; a record that carries the surface where its material function is dear.
+
+**Glass as a rough dielectric (2026-11-16, after it).** Frosted glass was a delta event whatever its roughness: the
+ray refracted through a sampled microfacet with the weight of smooth glass, so the lobe had no value and no
+density, lights were never sampled through it, and a ray totally reflected inside took the glass's tint (a grey
+sheet seen past the critical angle read 0.5 of the sky). It is Walter et al. 2007's interface now (docs/RUNTIME.md
+"Glass"): reflection or refraction at a visible microfacet by the exact Fresnel reflectance, both with a value and
+a density; lights sampled on both sides, their shadow rays from the side they light; a delta lobe below roughness
+0.05 only; the energy single scattering loses returned from a table (Turquin 2019). Held by eleven `glass/*` tests
+against the BSDF's integral (lib.rs `glass_energy_tests`): one interface in a white sky 0.957 for 0.9573 entering,
+0.738 for 0.739 and 0.648 for 0.647 leaving, 0.999 and 0.992 with compensation, a lamp through frosted glass 4.01
+for 4.04, a frosted sphere in a furnace 0.999. Pictures without glass are as they were (render-identity: 196 of
+239 to the byte, the rest glass and water; Bistro's offline render to the byte, Kabukichō's still 4.66). The glass
+scene's offline render moved by ΔE 0.36 and its live frame keeps its distance to it (1.16 -> 1.18). The trace:
+the glass scene 3.95 -> 4.40 ms (+11 %), of which 0.36 ms is the lights now sampled through frosted glass;
+Bistro, Zero Day, lamp-rooms, Kabukichō, Tokyo as they were. bench-window kept one offline reference a shot
+whatever renderer made it: a build that changes the offline picture was read against the old one; the reference
+is keyed by the renderer's binary now, and the tool has a glass shot. Not here: thin walls (a pane is a solid's
+face), absorption by distance, the shadow rays' share (a Schlick albedo still, on a straight ray). Two things the
+kernel's shape decided: a shadow ray's origin on the side it leaves from is every surface's rule, but written into
+every kernel it cost Bistro's trace 4 %, so only kernels with glass have it; and the energy table's vec4 indexed
+by a variable cost the glass scene 1.5 %, a select chain nothing.
+
+**What is not the scene's no longer rebuilds it (2026-11-16, after it).** One flag, `Changes::structural`, sends an
+edit to a rebuild of the whole GPU scene, and it was set for things no part of the scene is built from: the scene
+camera's field of view, its depth of field, its exposure's mode, near and far (read by nothing), a camera that is
+not the scene's, fog appearing or turning volumetric, a background appearing, the preset and its overrides, and an
+offline render's size and clock. Bistro: a change of lens rebuilt for 884 and 724 ms; now the frame is as any other
+(15 to 17 ms). Each is applied where it lives: the lens by the view (as a camera's move), depth of field and
+exposure by the post passes and the kernel's clamp, fog and a background by the kernel's variant with them, the
+preset by the few parameters taken from it. A GPU test (`live::inplace_tests`) takes twelve such edits in place on
+one view and holds each to a view built from the edited world: no rebuild, the kernel's parameters the same
+whole, the same state after them, the same picture.
+Found by it: the emitter cull's view cone is made from the lens and was made again only when the camera moved or
+turned, so a lens changed in place kept the old one (it follows the lens now); and after an edit to the light (fog
+gone), the radiance cache and the frames' histories keep the old light for hundreds of frames (5 of 255 steps off
+after 264), here as after a rebuild; the test compares with the histories cleared. Still a rebuild: another sky, and the output's size (a view cannot be resized). The first of the
+scene model's steps: the proxy table next.
+
+**Another sky in place (2026-11-16, after it).** A sky's kind or parameters rebuilt the scene too. The build's sky
+is two functions now, the sky's data from the world (`scene::sky_data`) and its bake (`bake_sky`), and the live view
+calls them for an edit: the environment map and its CDF are written in place when they keep their size, else a new
+texture and the CDF's section grown, the scene bound again (`Gpu::put_env`); the parameters that say how the sky is
+read follow; the atmosphere's sun takes its colour from the bake, and a light that is the sun no longer is a light
+of its own colour again. The same test holds six sky edits (one colour, a gradient, an atmosphere with its sun,
+the same as a dynamic sky, one colour again, none) to a view built from the edited world. What the frame that
+takes one pays is the bake: 0.1 ms for a colour, 6 for a gradient, 47 for an atmosphere (a rebuild paid that and
+the scene's 0.5 to 0.9 s). No picture changed (render-identity; the live volume tests' own spread is wider than
+two runs show: five runs a side, none differ).
+
+**The view's state and the environment beside the scene's data (2026-11-16, after it).** The live view kept the
+scene camera's lens, depth of field and exposure, the preset, and the sky's state in the struct a rebuild replaces
+with the scene's data, the fog and the background in the tables beside materials and lights, and wrote each from
+two places, the load and an edit, which a test held equal (and found apart once: the emitter cull's cone). They
+are two objects of the view now (`live/state.rs`): `ViewState` and `Environment`, each derived whole from the world
+by one function, at load and on an edit, and the kernel's parameters each of them says are written by one function
+that the build calls too (`Params::set_preset`, `EnvSettings::write`, `SkyBaked::write`). Two change flags that
+came to mean the same (the camera's exposure, its depth of field) are one. No behaviour is meant to change, and
+one does: after a rebuild that changed the cloud cover, the next commit no longer bakes the sky again.
+What other engines do was read first: a scene container without camera, size or post state, size-dependent
+buffers and histories owned by the view, and the environment an object of its own are common to all read; which
+side the environment hangs on is not (here the scene's, as the scene DSL has it). Still against that: the
+per-pixel accumulation buffer is made with the scene's data. Resize moves it to the view.
+
+**The view at another size (2026-11-16, scene step A3).** A view's size was fixed when it opened: the window could
+not be resized, and the per-pixel samples were made with the scene's data. The view owns every buffer that follows
+its size now (`live/targets.rs`: the samples, the passes' own and their bind groups, the output, the kernel's
+four), and `LiveCore::resize` makes those again and nothing else: the scene's data, its acceleration structures
+and the radiance cache stay, the frames' histories start again. Bistro, to 1920 × 1080 or 2560 × 1440: 0.5 ms on
+the CPU, and the next frame waits for the GPU about half a frame longer, once (a rebuild there is 0.7–0.9 s). The
+window (`play`) is resizable and follows its size and its display's density (`view.rs` `fit`), and takes each
+answer of the surface as wgpu documents it (`acquire`): before, a window the system resized (moved to a display
+of another scale) reported `surface: Outdated` on every frame from then on (#101). A covered or minimised window
+has no present to pace its loop: it configured its surface and printed an error on every turn and took a core
+(96 %); it says so once now and waits for the next frame's time (3–4 %), the game's frame running as ever. The
+headless runner takes `{"cmd":"resize"}`. A test holds a resized view to one built at that size
+(state, picture; the scene's buffers and the cache the same handles) and fails with each of four steps of
+`resize` left out; on Bistro a view resized and back is the view only reset (dE 0.18, SSIM 0.9995 at the same
+frames). Left: the browser host's view is still fixed; the merged layout keeps the cache in one buffer with the
+size's buffers, so a resize there empties it; a drag makes every buffer again at each step.
+
+**One build above the triangles a commit (2026-11-16, scene step B, first part).** Each edit a commit applies in
+place (moved instances, an instanced object's copies, procedural geometry, a rigid model's pose, a shared pose's
+mesh, re-transformed triangles, a geometry edit) built the acceleration structures it had touched itself, in its
+own submit, and was told by an argument whether a later one would build the TLAS for it; a geometry edit always
+built it, so an edit with a move built it twice. They now write their data and note what is to build
+(`gpu::TopBuild`), and the commit builds once at its end (`LiveCore::build_top`): every BLAS named and the TLAS in
+one call, or software traversal's top tree; its CPU time is the frame log's `build`, and `edit`, `instanced`,
+`skin` and `upload` no longer hold a build's share (numbers read before this are not comparable there). That call
+is also the only safe shape on Metal, where a TLAS built
+apart from a BLAS it references can see it unbuilt and lose its instance, in the next submit too: a shared pose
+that changed with nothing moving built its mesh in one submit and the TLAS in the next, and in a process that had
+rendered other scenes before the models were gone. `tests/render/skinning-shared-pose-live` passed through it
+(where the old arm was, there was sky: with no model too); it now holds the chest against that place, and fails on
+the code before. A test holds moves and edits in place, alone and several in a commit, to a view built from the
+world as it is then (`live::inplace_tests::moves_in_place_leave_what_a_build_does`: 0.02–0.08 of an 8-bit step;
+0.9 with nothing built), with one build a commit. No other picture changes (render-identity: 239 outputs).
+
+**One proxy an object (2026-11-17, scene step B, second part).** Where what an object draws landed was spread over
+fourteen maps keyed by the object: nine the build filled (its object-table entry, its card, its dynamic triangles,
+its instance, whether its moves are the instance's, its rigid model, its pose group, whether its mesh is its own,
+its emitter mesh, its instanced copies), four the edits kept beside them for what they placed (its record, its
+value as picks test it, an instanced range, the mesh it draws) and one for procedural objects. They are one table,
+`scene::Retained::proxies`: `Proxy { object, card, draw }`, `Draw` = Fixed | Dynamic | Instance | Procedural |
+Rigid | Instanced. A proxy holds the object's record; the record's value is in `instances[record]` or
+`procs[record - the first procedural record]`, for what an edit places as for the build's, and a record's slot is
+`inst_base` + it for all of them. "An edit placed it" is its record being the room's (`EditState::in_room`); a
+mesh a body drives moves as an instance because its proxy says so, whoever placed it. Lights, media and particles
+keep their tables' own indices (a table a kind). No picture changes (render-identity: 239 outputs), the voxel
+level's debris and batch routes time as before. Two faults went with the maps, each shown by a test first: an
+instanced object the build flattened had an entry in none of them, so removing it in place did nothing and it
+stayed in the picture (it has a proxy now, and is rebuilt out); an instanced object an edit added had an object
+entry of its own beside its copies', so its node's power or customData wrote over copy 0's. Still two mechanisms
+in what they can do: what the build flattened or placed as a model's instance is rebuilt to change, what an edit
+placed is not moved unless a body drives it (step E).
+
+**The light list holds its triangles (2026-11-17, scene step D, first part).** Light sampling read an emitter's
+triangle from the triangles' table as world space, so whatever emits had to be stored there in world space:
+flattened, or a mesh of its own written in world space (Tokyo: 1,627,052 triangles flattened for it). The list has
+its own copy now, the way real-time engines keep a light list: `Table::EmitterTris`, one `GpuEmitterTri` an emitter
+(v0, e1, e2 in world space; its triangle, for the attributes; its object, for its power; the light tree's path
+code). The kernel's emitter sampling, light LOD, cull and the BSDF rays' weight (`emit_mis`) read it; a CDF entry
+names its emitter, and a triangle's attributes its emitter entry (`x.w`, where the path code was). The copies
+follow what moves: those of the emitters the CPU moves are rewritten when they do (`move_emitters`), those of the
+emitters edits make are written with their entries (`write_emitters`). A particle's is still read where its pass
+places it (F_PEMIT). Nothing is placed otherwise yet. What it costs: 48 B an emitter (Tokyo +78 MB); the trace
++0.07 to 0.10 ms where emitters are sampled (Bistro 7.18 -> 7.29 ms, Zero Day 7.52 -> 7.59, the crowd 7.25 ->
+7.32, Kabukichō 12.57 -> 12.63, Tokyo 4.41 -> 4.42; nothing in a scene without emitters), not attributed: a typed
+view of the table times the same, so does reading the rows without the record's struct; the crowd's 21,280 moving
+emitters take 0.2 ms of CPU a frame to rewrite (commit 4.88 -> 5.08 ms), which a GPU pass is to take over, with
+the particles' and the instances' (the next parts). Pictures: the big scenes within main's own run-to-run
+difference; of the suite's 239 outputs, 26 that repeat themselves differ from main's, in the last bits offline
+(up to 3.7e-7) and by a sample that falls otherwise in a few live ones (up to 2.1e-3 of a value; sums within
+3e-5). That is Metal's compiler rounding the new kernel otherwise: on Vulkan (RTX 5090) every one of the 26 is
+byte-identical to main's, natively and under software traversal.
+
+**The light list is filled on the GPU (2026-11-17, scene step D, second part).** What moves an emitter after the
+list was written is copied into it by a pass (`emitter_fill.wgsl`, what real-time engines call preparing the
+lights): a run of the list an invocation row, each emitter's rows taken again from its triangle. Two sets of runs a
+scene (`EmitterRuns`, `gpu::EmitterFills`): the emitters of the triangles the CPU reposes, filled after a commit that
+moved them, in place of the CPU's rewrite (the crowd's commit back at main's: 4.5 ms in a guarded run, 4.9 to 5.0
+with the rewrite); and the particles', filled after their passes, so the kernel reads every emitter from the list
+and its particle case is gone. Pictures: against the first part, 217 of the suite's 239 outputs byte-identical, 19
+within their own spread, the two light-sampled particle tests in their last bits (their kernel variant reads
+other code); Bistro and the crowd within main's own run-to-run difference. Next: emitters on instances, their runs
+filled by the same pass through the instance's matrix.
+
+**Emitters on instances: a mesh of its own (2026-11-17, scene step D, third part).** A mesh with its own BLAS
+whose material only emits was a case apart: its triangles written in world space at an identity placement, never
+shared, rebuilt to move. It is a mesh as any other now: in model space, shared by the objects of its geometry and
+material, placed by its instance's matrix, moved by the instance when a body drives it. The light list has a run
+an instance (`Instance::first_emitter`: its first, carried in its record; the mesh's triangles are numbered in their
+attributes, `InstMesh::emitters`), each emitter with its triangle in world space and the instance that places it
+(`GpuEmitterTri::inst`, where the object was): a light sample still reads no matrix, and takes its attributes
+through the instance as a hit does (the object, the texture LOD's offset). A ray that hits an emitting triangle
+finds its emitter at the instance's first plus the triangle's number. An instance that moves has its run filled by
+the pass through its matrix. The edits in place work as before (a mesh added, given other triangles, removed: the
+instance's run reused or left at no weight). Under software traversal a unit's two flags share a word, and the
+word freed is every instance's first emitter. Pictures: the tests with such a mesh render other samples (13 of
+the suite's outputs differ from before, sums within 1e-4, every verdict as before); the voxel night level, whose
+192 lamps are instances of shared meshes now, reads the same to 0.15 % over a 4 x 4 grid, with 0.4 MB less BLAS; the
+voxel level's destruction bench runs as before (no fallback, edit 0.7 ms). No cost: the trace on Bistro 7.17 ->
+7.10 ms, the crowd 7.33 -> 7.29, the night level 4.16 -> 4.16. A new test holds the weight of a ray
+that hits an instance's emitter to its analytic value (`geometry/emitter-instance`: no test saw that entry). A
+model's and an instanced object's emitters are still flattened (the next parts).
+
+**Emitters on instances: a model's (2026-11-17, scene step D, fourth part).** A model's triangles that only emit
+were flattened at every placement (world space, for light sampling: the reason #147 took away), and a movable or
+posed model re-transformed them on the CPU every frame. They stay in the model's mesh now, as every real-time
+engine has them: a static placement's, a movable model's (the instance moves), and a rigid posed model's moving
+nodes' (`repose_rigid` fills their runs of the light list through the pass). The mesh's emitting triangles are
+numbered among its triangles (`number_emitters`), an instance's are a run of the list. What the build flattens of a
+model is its glass and its material functions, and one case of emitters: a triangle that emits with a cutout on
+exactly its vertices goes with the cutout (Zero Day has one such pair: kept in one mesh the decal's pass-through
+stepped the ray past the emitter, a region 3 % dark; the unbiased check on Zero Day is the guard, and fails
+without the rule; `flatten_coincident`, for a still placement and a rigid model's moving node alike). A mesh that deforms (a shared pose, a skinned model) still flattens its emitters; a model with
+emitters added in place still rebuilds, as before. Flattened a placement: Tokyo 1,800,744 -> 0 triangles, Bistro
+20,638 -> 0, Zero Day 10,105 -> 4, the crowd's Bistro's moving nodes 18,400 -> 0.
+Cost and gain (trace p50, main -> this): the crowd 7.38 -> 7.37 ms and its commit 4.46 -> 3.61 ms (the 18,400
+triangles are no longer re-transformed, uploaded and built again each frame); Bistro 7.20 -> 7.13; Zero Day 7.68
+-> 7.71; **Tokyo 4.47 -> 4.60 (+2.9 %)**. Tokyo's cost is the emitting triangles' being instanced: with every model
+flattened (`THREERT_INSTANCING=0`) both builds read 4.44 to 4.48, and instancing the other 21.3 M triangles costs
+nothing. Its mechanism is not established (ruled out, each by a build: the record's reads, the attributes' and
+the list's order, `emit_mis`'s descents, the shadow rays' ends; it grows with the paths' depth). Taken on the
+user's word (2026-11-17): the mesh whole in its instance is the standard structure, and what direct-light
+resampling and moving a still model in place need; the way back, if wanted, is merging still geometry whole, as
+its own measured step, not taking emitters out of their meshes again.
+Tests: `geometry/emitter-model` (a model's emitters, analytic; tests/render/data/panel.glb), the readback test
+with a model still, movable and posed. Still flattened: an instanced object's copies (the next part).
+
+**An instanced object's emitters (2026-11-18).** The copies of an instanced mesh whose material only emits are
+instances of its one mesh, as any other copies are, each with its run of the light list (the capacity's, shown or
+not). A copy not shown (past `count`, or scaled to 0) has no power in its object entry: its emitters stay in the
+list and in the light tree at no weight, at their mesh's own area, so showing it needs no new entry; while hidden
+it bounds nothing there (the refit of the tree's moving subtree skips a hidden instance's emitters). A change in
+place (`update_instanced`) takes the copies' triangles again on the GPU and refits the tree's moving subtree; when a
+copy changed size or power, or was shown or hidden, the emitters are weighed again in the same commit (the CDF and
+the tree's powers whole, on the CPU, as a power edit without the worker: a scene with such copies has none).
+Removed in place, its emitters go as an instance's do. Still a rebuild: an emitting instanced object added in
+place. Still flattened: glass, material functions, mirrored copies (the next parts).
+Tests: `geometry/emitter-instanced` (analytic), `geometry/emitter-instanced-live` (copies moved, scaled up and
+shown in place), the build's, and the edits in place against a build (a copy moved, larger, shown, hidden two ways,
+the node's power, the object removed; with and without a light tree).
+
+**Material functions and mirrored placements on instances (2026-11-18).** Two more reasons to flatten a mesh at
+every placement are gone. A material function's inputs outside full shading (the alpha test of a candidate hit, an
+emitter's radiance in light sampling: `mat_in_at`) read the triangle as world space; they now place it by its
+instance, as full shading does. A placement with a negative scale (a mesh, a model, an instanced object's copy, a
+rigid model's node, whose mesh was built with its winding swapped instead) is an instance whose record says that it
+mirrors (`INST_MIRRORED`): the kernel's placement takes the sign for the geometric normal's side and the tangent
+frame's hand. The flattening path (software traversal without units, a model's glass part) swaps the second and
+third vertex of such an instance's triangles, with their attributes and vertex colours. A copy may become mirrored
+in place. An emitting instanced object added in place now gets its emitters there (a run a copy at the list's end,
+by power share where a tree has no place for them, as a driven mesh added in place). What the build still flattens
+at a placement: glass (the next part).
+Tests: a function's emission and a function's alpha on a mesh far from the origin, the tangent frame's hand and the
+geometric normal through a function on a mirrored mesh, vertex colours on one (each natively and under software
+traversal); the flattening of an instance against the build's flattening, mirrored too; a mirrored model's build; a
+copy mirrored in place; an emitting instanced object added, changed and removed in place against a build.
+
+**A mesh is its geometry's alone (2026-11-19, the material on the instance, first part).** A mesh was shared by the
+objects of one geometry and the same materials, a triangle holding its material: two objects of a geometry with
+different materials held its triangles and its BLAS twice. Now a scene mesh's and an instanced object's mesh is
+keyed by its geometry (`Retained::own_mesh`, `scene::section_mesh`). Its triangles lie by section, a geometry group
+or the whole geometry, each a geometry of the BLAS, all flagged opaque, and hold their section and their index in
+it. An instance has a row a section in the words' heap (`scene::Row`, heap.rs `Stream::Rows`; its record has their
+first): the material with its class, the section's first triangle, its first emitter. The kernel reads a hit's
+material, whether it is a cutout or glass, and its emitter through the row (`material_of`, `row_word`); the
+trace's test of a hit reads no attribute and no material. Whether an instance casts a shadow,
+has a cutout or glass, emits: its rows say (`rows_cast`, `rows_bits`, `rows_emitters`). Glass among an instance's
+other sections is stepped through by a shadow ray, as a cutout that lets it pass is; an instance that is all glass
+is out of its way by its mask, as before. Vertex colours are the geometry's, and a material says whether it reads
+them, where they were baked white for one that did not. Software traversal: a unit's cutouts and glass by its rows,
+asked only of a unit that has some.
+Models kept their layout until the next part (materials on triangles, a BLAS geometry a class). Edits place what
+they placed (one section; a row a record of the room). A material that starts emitting gives the instances with a
+row of it their emitters, and writes no attribute. Still a rebuild: a several-material mesh edited, a material that
+turns glass or cutout, vertex colours asked of a mesh made without them.
+Tests: a geometry's sections and an instance's rows; six objects of one geometry with six materials (one reads its
+vertex colours, cutouts, glass, an emitter) against a geometry an object, at the build, one placed in place, two
+given another material; a pane and its frame as one mesh against a mesh each, under a sky sampled as a light; the
+light list's emitters found through the rows.
+
+**Every mesh has sections and rows: models too (2026-11-19, the material on the instance, second part).** A glTF
+model's mesh kept the old layout: its materials on its triangles, a BLAS geometry a class. Now it lies by section
+as a scene mesh does, a section a material of the file (`scene::model_sections`): a still model's mesh, a posed
+rigid model's moving nodes, a shared pose's mesh (skinned again with each triangle in its section). Its instances
+have its rows (`Retained::mesh_rows`). With one layout left the kernel has no feature for it: an instance's hit
+reads its material, its class and its emitter through its row, and only world-space triangles hold their material
+(the still scene's, what is flattened).
+An instance's rows are a run of the rows' room, as many as its mesh's sections (`EditState::rows`, `take_rows`,
+`give_rows`): a model of several materials is placed and removed in place, and what is removed gives its rows back.
+As before: a model is one mesh with one BLAS; a posed rigid model's still nodes are flattened; a deforming mesh's
+emitters are flattened.
+Measured: the meshes and their memory as before (Bistro one mesh of 132 sections, its BLAS 390.3 MB). GPU time a
+frame on twelve scenes, four alternated pairs against main: Kabukichō -1.5 to -2.1 %, a crowd of skinned models
++0.1 to +1.5 %, the voxel level +0.1 to +0.6 %, the other nine within 0.8 %.
+Tried and dropped: a TLAS instance's custom data its rows' first, with the record in the row. About 1 % slower on
+two scenes, not explained. Not tried: the same with the record from the hit's instance index, which reads no row
+for it.
+Tests: a model's sections and rows at the build (`a_models_mesh_lies_by_section_a_material_of_the_file`); a model of
+three materials placed, removed and placed again in place, its rows on the GPU; rows apart from records in the
+in-place tests' world, rows given back; two models in a shared pose posed again in place
+(tests/render/data/arm.glb, a skinned strip of two materials); `geometry/emitter-model-live` (a model's emitting
+section that is not its first, the model a unit under software traversal).
+
+**Textures, models, functions and lights come in place; the kernel is made beside the frames (2026-11-23).**
+A game that brought a texture, a model, a material function or a light while it ran had the scene built again from
+the world, and a feature a scene first used had the next frame wait for the driver's compile. On Bistro (2.8 M
+triangles, 960 x 540, an M5 Pro), the frame the edit landed in:
+
+| | before | now |
+|---|---|---|
+| fog appears (a kernel variant not compiled before) | 0.8 to 2.4 s | no long frame (28 ms at most) |
+| a mesh with a new 256 x 256 texture | 4.5 to 4.6 s | 39 to 56 ms |
+| a mesh with a new material function | 2.3 to 4.2 s | no long frame (19 ms) |
+| a model the scene has not (15 k triangles, five 2048 x 2048 textures) | 4.8 to 5.2 s | 223 to 233 ms, then 85 to 138 ms |
+| a point light comes | 1.5 s | no long frame (19 to 26 ms) |
+| the light goes | 1.3 s | no long frame (17 to 22 ms) |
+
+The texture pages keep where each texture lies (`texpack::Atlas`) and take another without being packed again,
+growing by a copy on the GPU; a still model's materials, textures and mesh are made by the code the build and the
+scene meshes' edits use; functions are numbered in the order they come; a light's entry is added, dropped or
+sorted within the table as a build lists it. A new kernel variant is made on another thread while the view runs
+the one it has (docs/RUNTIME.md "What comes in place" has the rules and what still rebuilds). The model's frame
+is its images' decode, on the frame's thread still.
+Not freed: a texture or a material nothing uses any more keeps its place until the scene loads again (the
+allocator's step).
+Tests: each kind of edit against a build of the edited world, state and picture (`textures_come_and_change_in_place`,
+`a_model_the_scene_has_not_got_comes_in_place`, `material_functions_come_and_change_in_place`,
+`lights_come_and_go_in_place`); a variant made while the frames go on; the atlas's places; the world's rules.
+Mutations: 26. 25 failed a test there was; one, a texture put on a shelf too low for it, none, and has its case now.
+Found by review: a translucent particle's material given another function kept the kernel's old dispatch for the
+translucency pass, which has its particles' functions alone; the kernel is made again where those are others.
+
+**Volumes and density grids come in place (2026-11-23, after it).** A volume that came, went or was set again
+while a game ran, a still volume's first move, a volume function, a new density grid and a grid program each had
+the scene built again. On Bistro (as above), the frame the edit landed in:
+
+| | before | now |
+|---|---|---|
+| a homogeneous volume comes (the scene's first medium) | 1.4 to 1.6 s | no long frame (18 ms at most) |
+| a volume with a 32³ density grid comes | 1.3 to 1.4 s | no long frame (27 ms) |
+| a volume whose 32³ grid a program simulates comes | 1.2 to 1.4 s | 128 ms, the program's pass compiled; 19 ms once the driver has it |
+| the first volume goes | 1.1 to 1.2 s | no long frame (21 ms) |
+| the simulated one goes | 1.2 s | no long frame (18 ms) |
+
+Before, a rebuild that needed a kernel variant the driver had not compiled took 5.1 to 5.4 s instead; now the
+variant is made beside the frames, and the volume is drawn when it is there.
+
+The media table is made whole from the world by the code the build has for it (`LiveCore::set_media`,
+`scene::MediumGpu::of`), volume functions are numbered in the order they come, and the kernel's count of media
+and its media features follow. The density grids follow the volumes that name them (`Gpu::put_grids`), stacked by
+the function the build stacks them with (`scene::grid_of`): when a grid comes, goes, or has another size or
+program, or a program's code changes, the atlas and the programs' pass are made again and what the programs had
+simulated is copied on the GPU to the grids that are the same still; new parameters, and a grid that passes to
+another of its volumes, make nothing again.
+Costs that stay: a grid program's pass is compiled in the frame it comes in (the 128 ms above), and one atlas
+holds every grid, so all are made again when one comes or goes.
+Tests: `volumes_come_and_go_in_place` and `density_grids_come_and_change_in_place`, each edit against a build of
+the edited world, state and picture, with the cells a program had simulated read back; the world's rules.
+Mutations: 23. 20 failed a test. Two had none, a media table that grew and was not bound again (the tests had
+two volumes, the table room for two) and a grid counted the same although its volume was another, and have their
+cases now. One was no fault: where a grid lies follows from the grids before it, and that comparison is gone.
+Found by review: a still volume that was moved left its grid's program running in the box where it had stood; a
+volume edit in place did not hold the lighting's histories short for the frames after it, as a rebuild did (nor
+had a volume shown or hidden in place before this).
+
+**A tangent is a vertex's (2026-11-23).** A triangle had one tangent, its first corner's, and a model whose file
+had none had its frame made a triangle at a time where it was hit: a normal map's detail turned at every edge of a
+curved surface. Now each corner of a file's triangle carries its own through the build, corners that differ in
+tangent are vertices apart, and the kernel takes a hit's tangent from its three vertices at the hit (the hand from
+the first). A primitive of a file with UVs and no tangents has them made where it is loaded, as the glTF
+specification says, by MikkTSpace (`tangents.rs`, on `bevy_mikktspace`, a crate without dependencies), a corner
+each. Made for every such primitive, not only where a material reads a frame: 1.4 to 2.9 M triangles a second on
+one thread, and 0 to 0.4 % more vertices on the files measured, so a material that starts reading a frame needs
+no rebuild. Against the tangents two sample files carry themselves, 897,150 corners: 3 more than a degree off, none
+of the other hand. A scene's own geometries, which have no tangent attribute, keep the frame made at the hit.
+Pictures: offline at 8 samples against the build before, three scenes without normal-mapped models are the same
+bytes; the home showcase (models without tangents under normal maps) differs in 5.4 % of its pixels, by 0.08 steps
+in the mean; the museum in 1.2 %. A frame's GPU time in twelve scenes, one run against the build before: between
+-1.2 % and +0.6 %, which one run does not tell from none.
+Tests: a quad whose file has a tangent of its own on each side, by the gradient a function draws of it
+(`material/function-vertex-tangents`: 1 with one tangent a triangle); two quads whose file gives one hand each, by
+the side their bitangent points to (`material/function-file-hand`); the tangents made for a quad, upright and
+mirrored, and for a primitive whose texture mirrors along an edge (the edge's vertices twice, their joints and
+weights with them); corners apart by tangent or by hand, a skinned mesh's too; a model's triangles, its skin's
+corners and a placed triangle each with a tangent a corner, under a mirroring placement too.
+Mutations: 18 (15 of the build, 3 of the kernel). 15 failed a test there was; one, a hand never read at a hit, none,
+and has the hand's test now; one, a corner without a tangent that says it has one, none, and is asserted now; one
+changed nothing: a branch of the generator that its last pass repeats, removed.
+
+**The kernel's loops are bounded (2026-11-23).** The kernel was the one shader compiled without wgpu's loop
+bounding (every loop given a count its compiler can see the end of); every other pass has it. Its loops end on
+sound data, which is no promise to a compiler that they end. Without the bound, the kernels Metal's compiler made
+lost the state of whole SIMD groups (8 × 4 pixels) on the home showcase, a scene with cutouts, one build and not the
+next. Nine builds of this kernel that differ by a statement that changes nothing (a counter, a
+branch never taken), under the loop guard: in six the guard stopped 14 to 43 invocations a run; with the bound, in
+none. Five builds of the next change's kernel (triangles as vertices and indices) drew 94,000 to 112,000 of the
+picture's 518,400 pixels wrong without the guard; with the bound each drew the right picture. Bounds checks and
+ray-query tracking, turned on alone, changed nothing and stay off. `THREERT_CHECKED=0` is the kernel as it was.
+What it costs: under hardware traversal a frame's GPU time in twelve scenes, alternated twice with the kernel before,
+is -1 % to +4 % (Zero Day +4.0, the neon street +3.8, the colour room +3.6, the crowd +2.9, the others under 2, Tokyo
+-1.0); under software traversal, whose tree walks are loops, the trace of a crowd of 3.3 M triangles is 85.3 -> 90.6 ms
+(+6 %). The pictures and the suites are the ones before.
+**Triangles are vertices and indices (2026-11-22).** Every triangle carried its own three vertices (48 bytes), its
+shading attributes (96) and, under hardware traversal, its positions again as the BLAS's input (36). Now the scene
+has vertices, a record of 48 bytes each (position and u; normal and v; tangent), and a triangle is three indices
+(`renderer/src/indexed.rs`; docs/RUNTIME.md "The scene's triangles"): one layout for both traversals, and the
+BLASes are built from the same vertices through the indices. A mesh's vertices are a run of their own: the
+skinning pass skins a vertex once (it skinned every corner), the particle passes and the light list's fill write
+and read vertices, the previous frame's are kept a vertex, and an edit in place takes a run of vertices with its
+triangles. The kernel binds one buffer fewer.
+A mesh's triangle has no data of its own besides. Its hit says which section of its mesh it is in (the BLAS's
+geometry; under software traversal its tree's leaf); the section's row of its instance has the material, the
+instance's record the object and whether the mesh deforms; the light list's record (64 bytes, was 48) has an
+emitter's section. A triangle no instance places keeps a row of four words.
+Software traversal's trees keep their triangles in their leaves, their own copy as an acceleration structure has
+one (48 bytes a triangle: v0, the edges, its section and its index there): a candidate's test read through the
+indices and the 48-byte vertices cost its trace 6 % (a crowd standing still, 85 -> 90 ms); from the leaves it is
+81 ms. A pass takes a posed mesh's leaves again from its vertices.
+On the GPU, data and BLASes together: Tokyo (23 M triangles) 6.4 GB -> 3.9, Zero Day 1.6 GB -> 0.95, a small scene
+15 MB -> 7.5. The BLASes themselves are as large as they were.
+A frame's GPU time under hardware traversal, twelve scenes alternated twice with the kernel before: the home
+showcase +4.2 %, the colour room +2.0, the museum +1.9, the crowd -2.5, Tokyo -1.2, the others within 1 %.
+What changes in a picture. A triangle's tangent frame, where its file gives none, is made where it is hit, not at
+the build: rounding (offline, software traversal, against the build before: two scenes the same bytes, one with
+411 of 921,600 pixels off by 2 steps at most). Under hardware traversal the driver's tree over indexed geometry is
+another tree, and a few rays at shared edges meet the other triangle: five scenes at 8 samples differ in 3 to
+2,408 pixels, by 3 steps at most but for single samples (8 steps; in one scene one sample, 22 steps over the 11 x 11
+pixels the denoiser spreads it to).
+A skinned vertex whose position is not finite is at its mesh's origin now; its triangles were left out before.
+The build finds the sharing again, 1.2 s on Tokyo (a file's indices are flattened before: historical, a later step).
+Tests: indexed.rs's own (sharing; a seam or a crease; a first corner's tangent; a triangle that is not finite); the
+build's triangles through their indices against the scene's; the in-place tests read every triangle they check
+back through its indices (the light list's emitters with their sections; a skinned mesh's corners, normals, UVs,
+tangents and previous positions against the CPU skin, its record's deforming bit, each triangle's section and its
+index there); a mesh changed in place to more vertices; a moved card beside another, a drifting particle and a
+drifting GPU particle, by their motion vectors; a skinned primitive without normals, by the normal the camera sees;
+emitters in a mesh's second section against the same triangles a mesh each (live, and offline for the weight of a
+ray that meets one); a first frames' bounce off a mesh's second section and off a particle, which the kernel's
+second pass shades; a cutout particle; an emitting particle's two sides beside a light's card;
+`material/function-file-tangent` (a file's tangent is the one a function is given); the rasterized first hit
+(`THREERT_RASTER`, which had no test and is off in any scene with a mesh since meshes are instances) against the
+traced picture.
+Fixed on the way: a still mesh that emits, moved for the first time, had the pass that places moved emitters run
+over the emitters the move had just made, which the light list did not hold yet (its write landed on the list's
+last record); they are made where the mesh stands and the pass leaves them alone.
+Mutations: 28 of the first form (20 failed a test there was, 8 none and have their tests above), 27 of this
+one (17 and 8; one changes nothing, no deforming instance has its materials' classes remade in place; one is
+reached only by a live view without units, `THREERT_UNITS=0`, and has no test) and 17 of the trees' leaves (15
+failed a test, one the walk's transcription alone, one none until the emitters' test had three at right angles).
+Next: tangents a vertex, interpolated (generated where a file has none); vertices packed to 32 bytes; a file's
+indices carried through the build.
+
+**A triangle's texel density is the hit's to compute (2026-11-22).** Every triangle carried a constant for its mip
+choice, half the log of its UV area over its area, made when the scene was built; an instance added an offset for
+its scale, the skinning pass and the particle passes wrote it again each pose and frame. Now the kernel takes it
+from the triangle where it is hit, from its two edges as it stands in the world and its UVs (`mesh_density`), and
+nothing stores or writes it: the attributes' first `x` word and the record's third `info` word are spare. A level
+is one division and one logarithm (`mesh_lod`: the density, a footprint's square, what else divides); it was three
+logarithms. With a logarithm a term the frame cost up to 1.7 % more on the clips with textures or cutouts.
+What changes in a picture: nothing under a uniform scale but rounding (five scenes offline against the build
+before: four the same bytes, one with 21 of 921,600 pixels off by 6 steps at most). An instance scaled otherwise
+has its triangles' own density now; its offset was the cube root of its volume's scale.
+A fault found on the way: a shadow ray through glass on a scaled instance added the instance's offset twice, so a
+pane's colour or transmission map was read some levels off (a pane scaled to 1 / 32: five too high).
+The cutout test of a candidate hit reads its triangle's edges now too, where its material has an alpha map.
+Tests: the kernel's own `mesh_density` and `mesh_lod`, their text run on the GPU for 512 triangles (a millimetre to a hundred metres,
+UVs a hundredth of the texture to a hundred repeats, ones without area) against 64-bit values; a checker on an
+instance scaled 32 times, a square's inside reading its colour (a level five too high reads grey); the checker in
+a cutout's alpha on one scaled 256 times; a shadow through a pane with a colour map, the pane scaled 1 / 32 and 32
+times (the first fails on the build before). Not held by a test: the density a light sample, a material function's input and a
+translucent particle read, and the ray's angle a surface's level is divided by (a wrong level there changes
+noise, or sharpens: no mean sees it).
+12 mutations: eight of the two functions fail the unit test, four of the places that use them fail a render test.
+One did not at first: a cutout three levels too high still has each square's middle on its side of the test, so
+that test's instance is scaled 256 times.
+
+**A posed skinned model is posed in place under software traversal (2026-11-22).** Under software traversal a mesh
+that deforms was written out into the still scene's tree, so every pose rebuilt the scene. Now it is a unit as any
+mesh. Its tree has the shape of a tree built once over its model's bind pose, one shape for every placement of the
+model (the pass's corners and each such mesh's triangles are in that tree's order), and the boxes of its pose. A new
+pose places the model's corners on the CPU, takes the boxes again (`units::refit`), writes the nodes where they lie
+and gives the top tree the unit's new bounds; the skinning pass writes the triangles and attributes as under
+hardware traversal, without the BLAS input. Hidden, shown and removed, it goes as any unit.
+Why the boxes alone: a tree made again for a pose costs sixty times as much (a character of 13,744 triangles, one
+core: 3.0 ms against 0.05) and walks 4 to 11 % shorter by its nodes' areas; the clip's first pose is no better a
+shape than the bind pose.
+Still a rebuild under software traversal: a skinned model added (its triangles and its tree need room, which a
+scene has there only with geometry of its own to edit, and which does not grow there).
+Measured, software traversal. A game with a character posed every frame: every frame rebuilt the scene, 30.6 ms of
+CPU; now none does, 3.2 ms. A crowd of 150 walkers: 2.0 s a frame; now no rebuild, 7.6 ms of commit. What a frame's
+trace pays, nothing moving, at 1280 x 720: four characters filling the view, 4.67 ms before and 5.20 now (+11 %),
+of which 6.5 % is the scene having units at all (its kernel had no unit walk) and 4.9 % the kept shape (the same
+units with trees built for the pose: 4.97); the crowd standing in a street, 85 ms either way.
+What a pose costs the CPU there: the corners' positions (0.2 ms a character of 13,744 triangles, one core) and the
+boxes (0.05). The crowd's commit is 7.6 ms, against 3.3 under hardware traversal, whose BLASes the GPU builds.
+Tests, under both traversals: four models of two files, each mesh's triangles, attributes and previous vertices on
+the GPU against the CPU skin; under software traversal each mesh's tree read back (its model's links, a leaf's box
+its triangles', an interior node's its children's), its bounds its root's, its unit's leaf of the top tree; the
+motion vectors of a pose no longer than the furthest a corner went; one hidden, posed while hidden, shown; one
+removed. A unit test of the boxes taken again (corners that are not finite too).
+22 mutations of the new logic: 20 fail a test under software traversal, one natively (the pass bound again when the
+scene's buffers grow, which they do under hardware traversal alone), and one is equivalent (the pass writing the
+BLAS input under software traversal: the writes fall in a spare word no one reads; the constant saves the work).
+Three lines that told the traversals apart where no test could were taken out: the pose path is one for both.
+
+**A posed skinned model is added and removed in place (2026-11-21).** A character that comes or goes while the game
+runs rebuilt the scene. Now one of a model the scene has is added as the build makes one: a mesh of its own in the
+room for edits, its triangles skinned on the CPU once for the pose it comes in, a job of the skinning pass for its
+next poses (the pass's table grows), skinned from the model's one copy of its corners. Removed, its instance is out
+(the build's or an edit's); one an edit placed gives back its triangles, its record and rows, its previous vertices
+and its job's slot, and the next one placed takes them.
+A mesh that deforms has its previous frame's vertices where its instance says (`scene::Instance::prev`, in its
+record): the kernel found them by the triangle's place among the dynamic triangles, which a mesh in the room does
+not have. Their buffer grows as the triangles' does. The kernel's read is a feature of its own (`F_DEFORM`: a scene
+with a mesh that deforms): in every kernel, a scene without one paid 0.6 % of its GPU frame for it (a flight over a
+city, five pairs of five).
+A fault found on the way: what a batch changed of an object (a pose, a move, its visibility) stayed when the same
+batch removed it, and the renderer rebuilt for an object it could not find. It goes with the object now.
+Still a rebuild: a skinned model the scene has not (its materials and textures load with one), one whose pose
+mirrors other primitives than the scene's, one added hidden and shown later, one added in a scene with particle
+systems (the rooms for edits do not grow there, for any edit: the particle passes hold the scene's buffers), and
+any under software traversal.
+Measured, hardware traversal, a game that spawns a character every half second and takes the oldest away (twelve
+at most): each spawn and each despawn rebuilt the scene, 31 times in 16 s, 46 ms each (the longest frame 79 ms);
+now none does, a frame that spawns or despawns commits in 3.5 ms (4.9 at most) and the longest frame is 21 ms. The
+frame between is the same: eight spawned and then none, at 1280 x 720, the GPU's frame is 10.6 ms either way (the
+trace 3.5, the BLAS builds 0.58).
+Tests: one added against the CPU skin (triangles, attributes, BLAS input, previous vertices) and a build's picture;
+its motion vectors at a new pose against a built one's, none longer than the furthest a corner went; moved, hidden,
+shown; 40 added at once (every room grows), posed on, half of them hidden and shown; 24 more in a commit that
+grows the pass's buffers alone; previous vertices kept mesh by mesh (a model removed before a frame is drawn, two
+whose triangles are neighbours and whose previous vertices are not, one posed twice between frames); one removed
+and the next added in what it had; a built one removed (shown, hidden, posed in the same batch); the three that
+rebuild. The pictures are compared with the build's frames counted from the live view's (a frame's samples go by
+its number: at another count a picture of many thin models is two thirds of a step from itself).
+36 mutations of the new logic: 33 fail a test natively, two under software traversal, and one is equivalent (the
+CPU's copy of an added model's triangles: a fallback no path reads while the model loads). Eight did not at first:
+the scenes had no moving triangles before the meshes, motion vectors were compared with a build's alone (wrong
+alike in both), other rooms grew in every commit that grew the pass's, and no frame was skipped between two edits.
+
+**A posed skinned model is a mesh of its own (2026-11-21).** Models in the same pose (the same clip and time) shared
+one mesh, found by the build; one of them taking another pose had to leave it, and that rebuilt the scene (and a
+rebuild grouped whichever models then happened to be in one pose). A model alone in its pose was no mesh at all:
+world-space triangles, skinned on the CPU. Now every posed skinned model is an instance of a mesh of its own
+(`scene::Skinned`), skinned by the pass at each new pose, never shared: another clip or time is in place whatever the
+others do, and the model is hidden and shown in place by its instance (hidden, a new pose skins nothing; shown, it
+is skinned as it is posed then). What the pass reads of a model is still one copy for all its placements. The
+grouping, its key and the switch that turned it off are gone.
+Still a rebuild: a skinned model added or removed; one hidden when the scene was built, shown; every pose under
+software traversal (the next step). Still world-space triangles skinned on the CPU: a model with emitting triangles.
+Measured, a crowd of 150 walkers (8 walk phases), hardware traversal, the builds in turn at 60 fps: a frame's commit
+3.3 ms with a mesh a walker, against 2.1 with the 8 shared meshes and 2.9 before the pass; the BLAS builds 0.6 ms
+against 0.24. With the CPU skin the same 150 meshes cost 20 ms of commit (40 fps): the reason the pass came first.
+Tests: two models in one pose are two meshes skinned from one copy of the model's corners, posed again in place,
+and one posed alone in place; one hidden, posed and moved while hidden, shown (under software traversal, hidden and
+shown by a rebuild); four models of two files, each mesh's triangles, attributes and BLAS input on the GPU against
+the CPU skin, one posed alone and the others' left as they were, one moved alone. 10 mutations of the new logic:
+nine fail a test natively, the tenth (a model hidden where it has no instance to mask) under software traversal.
+
+**Meshes that deform are skinned on the GPU (2026-11-21).** A new pose of a shared pose's mesh was skinned on the
+CPU and every triangle of it sent again: 180 bytes each (its vertices, its shading attributes, the BLAS's input).
+Now the CPU sends the pose's matrices (48 bytes a joint) and a compute pass skins the mesh where it lies
+(`shaders/skin.wgsl`, `Gpu::skin`): a triangle an invocation, from its model's corners as the file has them
+(`skin::SkinCorner`: position, normal, tangent, four matrices and weights; one copy a model, whatever its poses,
+`Scene::skin_sources`) and the pose's matrices (`skin::Model::palette`: a skin's joints, and the nodes of primitives
+beside it), into the triangles, the attributes' normals, tangent and texel density, and the BLAS's input. The
+commit builds the mesh's BLAS after it, as before (a BLAS is built again: wgpu has no update yet).
+The CPU keeps no triangles of such a pose: a click or a query skins the mesh when it asks (`LiveCore::mesh_tris`).
+A pose that mirrors other primitives than the one the mesh was made for has its triangles in another order: a
+rebuild's. An authored tangent of a skinned vertex follows its joints now (it was placed by the object alone).
+Still on the CPU: a posed model alone in its pose (world-space triangles: the next step makes it a mesh of its own),
+and every pose under software traversal (a rebuild there).
+Measured, a crowd of 150 walkers in 8 shared poses, hardware traversal, alternated: a frame's commit 2.9 ms -> 2.1
+(the upload 0.82 -> 0.18, the skin 0.45 -> 0.30); the trace the same. With every walker a mesh of its own (a switch
+of the experiment, not in the tree): the CPU's frame 24 ms with the CPU skin (15 ms of upload: 40 fps), 7.4 ms with
+the pass (60 fps), against 7.1 with the 8 shared poses.
+A fault found on the way, older than this: a posed model the scene did not call movable was moved by skinning it
+again where it stands, so its move was recorded as a new pose. One that is an instance of a mesh that deforms was
+then not moved at all (no pose had changed), and nothing rebuilt. A posed model's move is a move now
+(`World::note_move`): the renderer moves an instance, and skins world-space triangles again.
+Tests: the pass's output read back from the GPU and compared word by word with the CPU skin after each new pose, for
+two model files in two poses (`tests/render/data/skin-blend.glb`: more triangles than a block of the pass, vertices
+two joints hold, weights that do not sum to one, a primitive with tangents, one without normals, a joint turned
+about an axis that is neither the normals' nor the tangents', a mesh on a node beside the skin that mirrors it,
+materials in an order the mesh does not keep), with world-space triangles before the meshes'; the previous frame's
+vertices, the mesh as the CPU has it when asked, the picture against a build's; a model moved alone, posed and
+moved at once, posed after the scene's buffers grew; a pose that mirrors other primitives, by a rebuild; the
+corners placed by the palette on the CPU against the model's triangles. 27 mutations of the new logic: each fails a
+test (two did not at first: the mesh's triangles were in the model's order and first in the GPU's, in every scene
+the tests had).
+
+**A posed rigid model is edited in place (2026-11-20).** As a mesh and a still model are. Hidden, its parts are
+instances no ray sees, their emitters at no weight, and it is posed and moved on; shown, it is placed where it
+stands (`show_meshes`, `repose_rigid`). Removed, its instances are no object's (`edit_geometry`). One the scene has
+is placed again as an instance of each of its parts' meshes (`Retained::rigid_meshes`), a part a record of the room,
+in a run. Its pose update goes through what is above the instances under either traversal (the TLAS,
+or the units' top tree): under software traversal a new pose or a move was a rebuild's.
+An edit places an instance by one function now (`place_instance`: its rows, its emitters, its record, its place
+above the triangles), for a mesh, a still model and a rigid model's part alike. With it a still model whose mesh
+emits is placed again in place, where that was a rebuild's.
+Its parts are the nodes any clip of the file moves, not those of the clip it plays (`skin::Model::moving_nodes`),
+and the nodes its pose names: another clip is posed in place. Until now the parts were the playing clip's, and a
+model given another clip, or a pose that named another node, was posed in place with the wrong parts (the nodes
+the new pose moves stayed in the part merged for the old one). A pose that names other nodes is a rebuild's
+(`RigidModel::pose`).
+Still a rebuild: one with triangles flattened beside its parts (`flatten_coincident`'s) hidden, removed or placed
+again; a pose that names other nodes than the last; a model hidden when the scene was built, shown; a skinned model
+added, hidden or removed; a model the scene has not, added.
+Measured, software traversal, an interior of 7,300 nodes whose clip plays (4,181 units): every frame rebuilt the
+scene, 2.9 s a frame; now none does, a frame's commit is 1.2 ms and the frame 19 ms (1280 x 720 at half scale).
+Tests, natively and under software traversal, each against a build's light list and picture: a posed rigid model
+hidden, posed and moved while hidden, shown, removed; a still and a posed rigid model with emitters placed again,
+the latter then posed, moved, hidden, shown and removed, its records and rows the room's again and the next one's;
+one with flattened triangles hidden and removed by a rebuild; one given another clip of its file, in place
+(`tests/render/data/two-clips.glb`); one whose pose names a node no clip moves, by a rebuild.
+
+**A posed rigid model is its parts' instances (2026-11-20).** A model posed by a clip that moves nodes, without
+skins, was built in two ways at once: the nodes the clip leaves alone flattened into world-space triangles a
+placement, each node it moves an instance of a mesh made a placement. Now the model is parts (`scene::RigidModel`),
+each an instance of a mesh every placement of the model with the clip shares: the nodes left alone merged into one
+mesh in the model's space, each moved node a mesh in its own. Nothing of it is flattened (but what
+`flatten_coincident` takes out).
+A movable one moved in place left the nodes its clip does not move where they were built: they move with the object
+now (`repose_rigid`), and one that is not movable moves in place the same way. The part left alone has still
+emitters, in the light tree, until the object first moves; that move makes them moving ones, as a still mesh's
+first move does (`emitters_start_moving`).
+Measured: every node an instance of a mesh of its own (no part merged; `THREERT_RIGID_NODES=all`) costs 4 % of GPU
+time a frame on a street of 1,300 nodes and 8 to 10 % on an interior of 7,300, four alternated pairs each, so the
+nodes that do not move relative to each other are merged. With them merged, against the build before: the street
++0.2 to +1.1 % (six pairs), the interior -0.5 and -0.7 %, ten other scenes within 1.0 %. The two scenes hold
+2.8 M and 3.5 M triangles fewer in world space; meshes, instances and memory otherwise as before.
+Tried and set right: the part left alone with moving emitters from the build where the object is movable. An
+interior's six thousand emitters were then sampled without the light tree: 7 % faster and worse against its
+reference (two pairs).
+Still a rebuild: such a model hidden, shown, removed or placed a second time; a pose change under software
+traversal. Two nodes of one mesh of the file do not share it.
+Tests: the parts' meshes shared by two placements, the part left alone in the model's space; a new pose, a move,
+both at once, a move of one that is not movable, each against a build's light list and picture; a new pose of a
+model under two groups (the build's product of its transforms and an update's differ in their last bits: it is
+not taken for moved); the floor under a
+panel on a node its clip leaves alone (`geometry/emitter-rigid`), and under one moved 300 m in place with its clip
+playing (`geometry/emitter-rigid-moved-live`: it read nothing before).
+
+**Materials are edited through the rows (2026-11-19, the material on the instance, third part).** With a
+material on its instances' rows, what changes one is no longer the triangles' business. In place now, each a
+rebuild before:
+- a mesh of several materials added, re-created, given another geometry or other materials: its mesh made with its
+  geometry's sections, placed by the code that places a mesh of one material (`edit_geometry`);
+- a material that turns glass or stops being glass, becomes a cutout or stops being one: the rows, the record's
+  bits and the shadow mask of every instance with a row of it (`Tables::reclassed`, live/edits.rs
+  `remake_classes`);
+- a material of any class made after the build (`Tables::add_materials`);
+- a material that starts emitting on any instance, a mesh's or an instanced object's copies, one made after the
+  build too (`add_material_emitters`, by the instances' rows);
+- an instanced object given another material: its copies' rows (`update_instanced`);
+- a mesh an edit places while it is hidden or has no size: an instance no ray sees, as the build has it.
+The sets that said which materials were triangles' go (`fixed_mats`, `mesh_mats`). Software traversal keeps each
+pool triangle's section and its index in it (`LoadedScene::pool_place`: a unit's tree orders them), where an edit
+made the mesh again to find them. A geometry rewritten where it lies needs the same sections, not only as many
+triangles (a BLAS's geometries keep their sizes).
+Still a rebuild: a class change or emission starting for a material of world-space triangles (still ones are
+grouped by whether they are cutouts, dynamic ones as particles' carry their class); the scene's first cutout, first material function on an instance, first vertex colours, first shadow caster with glass
+among its sections (kernel features); a texture or a material function that comes or goes. An instanced object is
+drawn with its first material only.
+Tests, each against a build's light list, weights and picture, natively and under software traversal: a mesh of
+three materials added, given others, shared, its geometry changed with and without its sections, removed; an alpha
+test that comes and goes on a mesh, a mesh of two materials and an instanced object's copies, and the scene's first
+cutout; a material turned glass and plain again; materials of every class made after the build; emission starting
+on an instanced object's material, with a copy that is not shown; an instanced object given a material that emits,
+a cutout, glass, a plain one; a material turned glass that takes its instance's shadow with it; what still
+rebuilds. (A model's materials are the file's: no edit names them.)
+
+**Meshes are edited in place (2026-11-18, scene step E, second part).** With every mesh an instance, what the
+scene does to one is a change of its instance, not a rebuild. Hidden or shown (itself, or a group above it): the
+instance's mask; a hidden mesh is built as an instance no ray sees, its row without power (`Instance::masked`,
+`show_meshes`). A still mesh's first move: its instance moves from then on, and one that emits has its emitters as
+moving ones, a new run of the light list (`Changes::started`, `start_moving`). Its geometry changed, the mesh
+re-created or removed, a group of meshes removed, a movable mesh added: in place whether or not the scene said it
+edits the mesh (`world::edits_in_place`; `dynamicGeometry` now only keeps room for it at the build). A placement
+without size is an unseen instance everywhere: built so, moved so, a posed rigid model's node too. A still model
+whose instance is all of it is hidden, moved and removed the same way (`whole`).
+Still a rebuild: a mesh of several materials changed or added; a mesh shown after its geometry changed while it was
+hidden; a model hidden when the scene was built, or with triangles flattened beside its instance; an animated model's
+first move; a hidden mesh under software traversal without units.
+Tests, each against a build's light list, weights and picture: meshes hidden and shown (still, emitting, hidden at
+the build, a group, moved while hidden); a still mesh's first move (emitting, plain, a group, one built without
+size); meshes changed without the scene's word (a shared geometry, a re-creation, a movable one added, removals); a
+still model hidden, removed and moved. `volume/grid-rebuild-live` rebuilds by adding a group.
+
+**A mesh is an instance of its geometry's mesh (2026-11-18, scene step E, first part).** A mesh was an instance
+only where scene code asked (`dynamicGeometry`) or a body drove it; every other one was flattened into the
+still scene's world-space groups, a movable one re-transformed on the CPU at each move. Now every shown mesh with a
+size is an instance: its triangles once in model space in the pool, one BLAS, shared by the objects of the same
+geometry and materials. A mesh of several materials (a geometry group each) is one mesh, its triangles ordered by
+class, a BLAS geometry a class (`scene::own_mesh`). A movable mesh's move is its instance's transform
+(`InstanceRef::moves`): no vertex is written again, and under software traversal it moves in place too. A material
+that starts emitting gives each instance of its meshes its emitters in place (`Tables::mesh_mats`, live/edits.rs
+`add_material_emitters`: the mesh's emitting triangles numbered again, a new run of the light list an instance, the
+old one at no weight); one a model or an instanced object has too still rebuilds. Room for edits in place stays
+where the scene said a mesh is edited or driven (`Retained::edits_meshes`).
+A moved instance whose placement has no size (scene code hides by scaling to 0) stands at a point, hidden, and
+comes back in place (`scene::placed_world`, as an instanced object's copy does).
+Still flattened: a mesh without size, `THREERT_INSTANCING=0`, a light's card, particles, triangles on the same
+vertices (`flatten_coincident`), deforming meshes. Still a rebuild, the next part: hiding a mesh, a still mesh's
+first move, removing or changing the geometry of one the scene did not say it edits.
+Not the common structure, a step of its own after this one: a mesh is shared by geometry and materials, the
+material being a triangle's attribute (two objects of one geometry with different materials hold its triangles
+twice); the common one has the material on the instance.
+Tests: a mesh of three materials whose geometry has the glass first (`shadow/glass-groups`, `-frame`, `-cutout`,
+`-live-exact`); a several-material mesh's order and counts; a material that starts emitting, against a build (a
+shared mesh, a movable one moved after, a mesh of two materials one of which emitted already, a mesh added in
+place; one an instanced object has too rebuilds); a movable mesh scaled to nothing and back. Under software
+traversal `wind/pivot-sway-live` passes now.
+
+**Glass is a part of its mesh (2026-11-18).** The last reason to flatten a material's triangles at every placement
+goes. A mesh's glass is a geometry of its BLAS beside the opaque and the cutout one, the only one not flagged opaque
+(`InstMesh::parts`; a hit's triangle from its geometry and primitive by two starts in the instance's record). A shadow
+ray passed glass by the still scene's masks, and passes an instance of a mesh that is all glass the same way
+(`InstMesh::casts`). Where a mesh mixes glass with other triangles it culls the geometry that is not opaque (kernel
+feature `F_IGLASS`; software traversal: a flag a triangle). `glass_tr` weighs what the glass lets through as before.
+Measured first on Metal with every geometry flagged opaque: the same pictures, at most 0.5 % of a frame's GPU time;
+the cull flag's old cost (Bistro +1.7 ms) was its use for cutouts. With the cull in every pane's own BLAS a scene of
+400 panes traced about 15 % slower under the loop guard; by the mask it does not. Which side of a surface a ray meets
+goes by the instance's sign (a mirrored glass instance). What still leaves a mesh: triangles on exactly the same
+vertices (`flatten_coincident`: a cutout on an emitter, glass on whatever lies under it), and the emitters of a mesh
+that deforms. A mesh that is all glass is added in place, the mask needing no kernel feature; a material of instances'
+triangles that turns glass, or stops being glass, rebuilds.
+Tests: a shadow through an instance's glass (a mesh of its own, offline and live; an instanced copy; a model whose
+one mesh has an opaque, a cutout and a glass part, with the other two parts' shadows, offline and live), a mirrored
+glass instance, the model's build, a glass mesh added in place.
+
+**An emitter's probability is what the picker used (2026-11-18).** An emitter that changed size in place (a movable
+model or mesh scaled, a skinned one) kept the weight it was loaded with, while the kernel took its probability from
+formulas that assumed the weight was the triangle's: scaled three times larger as a scene's main light it read 3 to
+8 % dark, three times smaller 12 % bright (a move alone was right; older than step D). Now a candidate is weighed by
+the density it was drawn with (its pick's probability over the triangle's own area), and a BSDF ray's hit takes the
+same probability from where the picker reads it: the tree's path, or the emitter's entry in the CDF, which its code
+names (`emitter_codes`). A weight that is out of date costs noise, not light. Gone with the formulas: the particles'
+case apart (a nominal area), the cull test at a hit, "MIS by power alone". Test: an emitter scaled in place, a model
+and a mesh, with and without a light tree, against a build's picture.
+
 ## 2. Temporal fixes
 
 Targets (2026-11-08): bench-temporal, bench-ghosting and their UE MRQ references move to Bistro night (§ 0 step 7); the
@@ -3032,6 +3789,7 @@ dynamic-resolution floor, 60 Hz camera input.
    - The mannequin plaza's car now has clearcoated paint and a glass cabin with seats inside.
    - Not yet:
      - Thin-walled glass: a single-plane pane refracts as if solid.
+     - (Rough glass as a BSDF with a value and a density: done 2026-11-16, § 1.)
      - Tinted shadows.
      - Light through windows in the radiance cache: it treats glass as a surface, not a window.
      - glTF KHR_materials_transmission / clearcoat.
@@ -4246,6 +5004,8 @@ benchmark level. The order follows the dependencies; a step that meets a further
        build gives them emitter entries (in the light tree with the static emitters); the live view's in-place edits
        add, replace and remove them: a placed mesh's entries go to area 0 (their weight; the tree keeps its shape and
        is refit), new ones are appended to the CDF's power-share part (path code 0, as the tree's moving emitters).
+       (Since 2026-11-17 such a mesh is a mesh as any other, in model space and shared, and each instance's emitters
+       are a run of the light list: § 1, "Emitters on instances".)
      - A material that starts emitting gets emitter entries in place from its flattened static triangles (`prepare`
        keeps each material's runs of them); one that also covers pool (instanced) or dynamic triangles still rebuilds.
      - The emitter buffer grows (and the scene's bind group is made again) only when entries are added past it: a

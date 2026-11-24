@@ -4,12 +4,12 @@
 //
 // A unit is a model instance (`instances`, as hardware traversal's): its mesh's triangles in model space in
 // `tri_verts`, from the record's first triangle; its mesh's tree in `nodes`, from the root in the record's `n0.w`
-// (child indices count from that root, a leaf's triangles from the mesh's first). `n1.w`: the unit casts shadows.
+// (child indices count from that root, a leaf's triangles from the mesh's first). `n1.w` (bits): its flags.
 // The top tree, over the units' world boxes, starts at node `P.motion.z` (bits; child indices count from it); each of
 // its leaves is one unit, `left_or_first` its record. `P.motion.w` (bits): how many units there are. (`P.motion.y`
-// is `render --signals`'.) `n2.w` (bits): the unit is placed by a translation alone, its normal rows the identity's
-// (units.rs `unit_record`): the ray keeps its direction and only its origin moves, which is what the rows would have
-// made of it.
+// is `render --signals`'.) The flags (units.rs `unit_record`): UNIT_SHADOW, the unit casts shadows; UNIT_SHIFTED, it
+// is placed by a translation alone, its normal rows the identity's: the ray keeps its direction and only its origin
+// moves, which is what the rows would have made of it.
 //
 // `trace` walks the still scene first and calls this with its hit: the ray is already cut to it.
 //
@@ -33,7 +33,16 @@
 //
 // The root's box is tested before the walk: a ray that meets no unit reads one node, and a scene of one unit is a
 // root that is a leaf, whose record only the rays that meet its box read.
+const UNIT_SHADOW: u32 = 1u;
+const UNIT_SHIFTED: u32 = 2u;
 @if(units) var<private> stack: array<u32, 64>;
+
+// The flags of a triangle of a unit with rows (from `first` on), of its section `part`: the section's row says
+// whether it is a cutout's (TRI_MASKED) or glass (TRI_NO_SHADOW). Asked of the units that have such a section.
+@if(units) fn row_flags(first: u32, part: u32) -> u32 {
+    let x = row_word(first, part, 0u);
+    return select(0u, TRI_MASKED, (x & ROW_CUTOUT) != 0u) | select(0u, TRI_NO_SHADOW, (x & ROW_GLASS) != 0u);
+}
 
 @if(units) fn trace_units(o: vec3<f32>, d: vec3<f32>, inv_d: vec3<f32>, hit_in: Hit, mode: u32) -> Hit {
     var hit = hit_in;
@@ -50,6 +59,9 @@
     var off = top;
     var first = 0u;
     var base = 0u;
+    // The unit's bits and its rows' first (a unit with rows has its cutouts and its glass by them: `row_flags`).
+    var ubits = 0u;
+    var urows = 0u;
     loop {
         let n = nodes[node];
         if (n.count == 0u) {
@@ -78,16 +90,18 @@
             // A top leaf: one unit. The ray in the unit's space (its direction not renormalised: t is the world's):
             // `proc_point`, `proc_dir`, or the origin moved alone.
             let u = instance_at(n.left_or_first);
-            if (mode != TRACE_SHADOW || bitcast<u32>(u.n1.w) != 0u) {
+            if (mode != TRACE_SHADOW || (bitcast<u32>(u.n1.w) & UNIT_SHADOW) != 0u) {
                 rec = n.left_or_first;
                 ro = o - vec3<f32>(u.m0.w, u.m1.w, u.m2.w);
-                if (bitcast<u32>(u.n2.w) == 0u) {
+                if ((bitcast<u32>(u.n1.w) & UNIT_SHIFTED) == 0u) {
                     ro = proc_dir(u, ro);
                     rd = proc_dir(u, d);
                     rinv = 1.0 / select(rd, vec3<f32>(1e-20), abs(rd) < vec3<f32>(1e-20));
                 }
                 off = bitcast<u32>(u.n0.w);
                 first = u.info.x;
+                ubits = bitcast<u32>(u.n1.w);
+                urows = u.info.w;
                 base = sp;
                 node = off;
                 continue;
@@ -97,9 +111,13 @@
                 let ti = first + n.left_or_first + k;
                 let x = intersect_tri(ro, rd, ti, hit.t);
                 if (x.x < hit.t) {
-                    let flags = bitcast<u32>(tri_verts[ti * 3u].w);
-                    if (has(F_MASKED) && (flags & TRI_MASKED) != 0u && !cutouts_opaque() && mode != TRACE_ANY_OPAQUE && !alpha_pass(ti, rec, x.y, x.z, x.x)) { shadow_hole = true; continue; }
-                    hit = Hit(x.x, ti, x.y, x.z, rec);
+                    // (Its section: its leaf's id.)
+                    let part = leaf_id(ti, 0u);
+                    var flags = 0u;
+                    if ((ubits & (INST_CUTOUT | INST_GLASS)) != 0u) { flags = row_flags(urows, part); }
+                    if (has(F_IGLASS) && mode == TRACE_SHADOW && (flags & TRI_NO_SHADOW) != 0u) { continue; }
+                    if (has(F_MASKED) && (flags & TRI_MASKED) != 0u && !cutouts_opaque() && mode != TRACE_ANY_OPAQUE && !alpha_pass(ti, rec, part, x.y, x.z, x.x)) { shadow_hole = true; continue; }
+                    hit = Hit(x.x, ti, x.y, x.z, rec, part);
                     if (mode != TRACE_CLOSEST) { return hit; }
                 }
             }

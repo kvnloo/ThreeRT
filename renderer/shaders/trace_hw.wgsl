@@ -1,16 +1,18 @@
 // Hardware ray tracing (wgpu ray query). Up to four instances (see Prepared::groups): shadow casters mask 1, the rest
-// mask 2; opaque groups never report candidates, alpha-cutout groups are confirmed by `alpha_pass`.
+// mask 2 (glass among them; an instance's glass among its other sections is stepped through by its row). Every
+// geometry is flagged opaque: none reports candidates, and a cutout's hit is confirmed by `alpha_pass`.
 // instance_custom_data holds the instance's first global triangle index, or in scenes where a group starts beyond
 // 2^24 triangles (F_HUGE: custom data has 24 bits) its traversal group, whose first triangle is in P.group_first.
 @if(hwrt) @group(0) @binding(19) var acc: acceleration_structure;
 
 @if(hwrt) fn trace(o: vec3<f32>, d: vec3<f32>, tmax_in: f32, mode: u32) -> Hit {
     // Ray tracing off (pathtrace.wgsl `rays_off`): past the camera ray, every ray misses.
-    if (rays_off) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST); }
+    if (rays_off) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST, 0u); }
     let mask = select(0xffu, 1u, mode == TRACE_SHADOW);
     let any = mode != TRACE_CLOSEST;
-    // (A scene without cutouts: one query. A feature bit: the kernel has this or what follows, not both.)
-    if (!has(F_MASKED)) { return trace_opaque(o, d, tmax_in, mask, any); }
+    // (A scene without cutouts: one query. A feature bit: the kernel has this or what follows, not both. Glass among an
+    // instance's other sections is stepped through as a cutout is: `passes`.)
+    if (!has(F_MASKED) && !has(F_IGLASS)) { return trace_opaque(o, d, tmax_in, mask, any); }
     // Whether a cutout stops this ray as any triangle does: A_CUTOUT_PATHS, A_CUTOUT_EMITTERS (TRACE_ANY_OPAQUE)
     // (pathtrace.wgsl `cutouts_opaque`, `emitter_tr`).
     @if(!cutout_lite) let solid = cutouts_opaque() || mode == TRACE_ANY_OPAQUE;
@@ -22,7 +24,8 @@
     // renders of Kabukichō differed in 75 % of their pixels). Fewer whole-scene steps (the opaque instances once, then
     // the cutout instances alone; or one candidate loop on them) came out within ±0.4 ms on Bistro: the leaves' alpha
     // tests and the traversal past them cost it, however the queries are arranged. Culling the cutout geometry by its
-    // non-opaque flag (RAY_FLAG_CULL_NO_OPAQUE) is slow on Metal (Bistro's trace +1.7 ms).
+    // non-opaque flag (RAY_FLAG_CULL_NO_OPAQUE) was slow on Metal (Bistro's trace +1.7 ms); every geometry is flagged
+    // opaque.
     //
     // In order, each query starting past the last cutout hit its alpha let through. Shadow rays take up to 64 of them
     // and count as blocked past that: with 16, as closest hits take, the rest counted as unblocked (light through dense
@@ -36,24 +39,32 @@
     // origin.
     var first = any;
     var t0 = 0.0;
+    var hole = false;
     for (var k = 0u; k < steps + u32(any); k++) {
         let h = trace_opaque(o + d * t0, d, tmax_in - t0, mask, first);
         if (h.tri == 0xffffffffu) {
-            // (A shadow ray comes here in order only past a cutout that let it through: `shadow_hole`.)
-            if (any && !first) { shadow_hole = true; }
-            return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST);
+            // (A shadow ray comes here in order only past a cutout that let it through, `shadow_hole`, or past glass.)
+            if (any && !first && hole) { shadow_hole = true; }
+            return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST, 0u);
         }
         let t = t0 + h.t;
-        if (solid || is_proc(h) || !cutout(h.tri) || alpha_pass(h.tri, h.inst, h.u, h.v, t)) { return Hit(t, h.tri, h.u, h.v, h.inst); }
+        // A shadow ray passes the glass among an instance's sections (its row says so; an instance that is all glass is
+        // out of its way by its mask).
+        let passes = has(F_IGLASS) && mask == 1u && hit_row != NO_ROW && (hit_row & ROW_GLASS) != 0u;
+        if (!passes) {
+            if (!has(F_MASKED) || solid || is_proc(h) || !cutout_hit(h) || alpha_pass(h.tri, h.inst, h.part, h.u, h.v, t)) { return Hit(t, h.tri, h.u, h.v, h.inst, h.part); }
+            hole = true;
+        }
         if (first) { first = false; } else { t0 = t + 1e-4 * max(1.0, t); }
     }
-    if (any) { return Hit(t0, 0u, 0.0, 0.0, NO_INST); }
-    return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST);
+    if (any) { return Hit(t0, 0u, 0.0, 0.0, NO_INST, 0u); }
+    return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST, 0u);
 }
 
 // The closest (or with `any`, the first found) hit, every triangle opaque.
 @if(hwrt) fn trace_opaque(o: vec3<f32>, d: vec3<f32>, tmax_in: f32, mask: u32, any: bool) -> Hit {
-    @if(strict) if (ray_bad(o, d, tmax_in)) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST); }
+    hit_row = NO_ROW;
+    @if(strict) if (ray_bad(o, d, tmax_in)) { return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST, 0u); }
     var rq: ray_query;
     let flags = select(RAY_FLAG_FORCE_OPAQUE, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT, any);
     rayQueryInitialize(&rq, acc, RayDesc(flags, mask, 0.0, tmax_in, o, d));
@@ -83,18 +94,25 @@
     }
     let it = rayQueryGetCommittedIntersection(&rq);
     if (it.kind == RAY_QUERY_INTERSECTION_NONE) {
-        return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST);
+        return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST, 0u);
     }
     if (has(F_PROC) && it.kind == RAY_QUERY_INTERSECTION_GENERATED) { return proc_hit(it.t, pg, pprim, it.instance_custom_data); }
     let ti = hit_tri(it.instance_custom_data, it.geometry_index, it.primitive_index);
-    // Model instance (F_INST, custom data bit 23 | record): ti is its model-space pool triangle.
-    return Hit(it.t, ti, it.barycentrics.x, it.barycentrics.y, hit_inst(it.instance_custom_data));
+    // Model instance (F_INST, custom data bit 23 | record): ti is its model-space pool triangle, and the geometry it
+    // was hit in its section. A traversal group's triangle is in the world: its row is its own.
+    let inst = hit_inst(it.instance_custom_data);
+    return Hit(it.t, ti, it.barycentrics.x, it.barycentrics.y, inst, select(it.geometry_index, ti, inst == NO_INST));
 }
 
-// An alpha-cutout triangle: its material has an alpha test (as the build flags TRI_MASKED; model instances' pool
-// triangles carry no flags).
-@if(hwrt) fn cutout(ti: u32) -> bool {
-    return material_at(bitcast<u32>(attrs[ti].uv.w)).uv2.w > 0.0;
+// The first word of the row of the hit `trace_opaque` last found (its material and class bits), NO_ROW where its
+// instance has no rows: the trace's tests of a hit read no attribute and no material then.
+@if(hwrt) var<private> hit_row: u32;
+@if(hwrt) const NO_ROW: u32 = 0xffffffffu;
+// Whether that hit is an alpha-cutout's: its row says, or without a row (a triangle no instance places) its own
+// material has an alpha test, as the build flags TRI_MASKED.
+@if(hwrt) fn cutout_hit(h: Hit) -> bool {
+    if (has(F_INST) && hit_row != NO_ROW) { return (hit_row & ROW_CUTOUT) != 0u; }
+    return material_at(tri_row(h.part).x).uv2.w > 0.0;
 }
 
 // The model-instance record a hit's custom data names (F_INST), or NO_INST for a traversal group.
@@ -104,12 +122,16 @@
 
 @if(hwrt) const INSTANCE_BIT: u32 = 0x800000u;
 
-// Global triangle of a hit: a model instance's pool triangle (its cutout geometry 1 after the opaque one), or a
-// traversal group's.
+// Global triangle of a hit: an instance's pool triangle, or a traversal group's. An instance's geometry is a section
+// of its mesh, and its row has where the section's triangles start (the first section starts where the mesh does);
+// the row's class is read where the trace tests a hit by it.
 @if(hwrt) fn hit_tri(custom: u32, geometry: u32, prim: u32) -> u32 {
     if (has(F_INST) && (custom & INSTANCE_BIT) != 0u) {
-        let r = instance_at(custom & (INSTANCE_BIT - 1u)).info;
-        return r.x + select(0u, r.w, geometry == 1u) + prim;
+        let rec = instance_at(custom & (INSTANCE_BIT - 1u));
+        if (has(F_MASKED) || has(F_IGLASS)) { hit_row = row_word(rec.info.w, geometry, 0u); }
+        var first = rec.info.x;
+        if (geometry != 0u) { first = row_word(rec.info.w, geometry, 1u); }
+        return first + prim;
     }
     return group_tri(custom, prim);
 }

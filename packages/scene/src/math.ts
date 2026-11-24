@@ -69,6 +69,12 @@ export class Vector3 {
   distanceTo(v: Vector3): number {
     return Math.hypot(this.x - v.x, this.y - v.y, this.z - v.z);
   }
+  angleTo(v: Vector3): number {
+    const denominator = Math.sqrt(this.lengthSq() * v.lengthSq());
+    if (denominator === 0) return Math.PI / 2;
+    const theta = this.dot(v) / denominator;
+    return Math.acos(Math.max(-1, Math.min(1, theta)));
+  }
   lerp(v: Vector3, t: number): this {
     return this.set(this.x + (v.x - this.x) * t, this.y + (v.y - this.y) * t, this.z + (v.z - this.z) * t);
   }
@@ -98,6 +104,15 @@ export class Vector3 {
   setFromMatrixPosition(m: Matrix4): this {
     return this.set(m.elements[12], m.elements[13], m.elements[14]);
   }
+  /** The magnitudes of a transformation matrix's three basis columns (three.js r187). */
+  setFromMatrixScale(m: Matrix4): this {
+    const e = m.elements;
+    return this.set(
+      Math.hypot(e[0], e[1], e[2]),
+      Math.hypot(e[4], e[5], e[6]),
+      Math.hypot(e[8], e[9], e[10]),
+    );
+  }
   toArray(): [number, number, number] {
     return [this.x, this.y, this.z];
   }
@@ -115,7 +130,10 @@ export class Quaternion {
   _z: number;
   /** @internal */
   _w: number;
-  _onChange: () => void = () => {};
+  /** Called after a change (an object's rotation / quaternion keep each other and the object in step). */
+  _onChange(): void {}
+  /** @internal The object whose rotation this is, if any (weakly: no cycle). */
+  declare _owner: WeakRef<object> | undefined;
   constructor(x = 0, y = 0, z = 0, w = 1) {
     this._x = x;
     this._y = y;
@@ -149,6 +167,28 @@ export class Quaternion {
     const h = angle / 2;
     const s = Math.sin(h);
     return this.set(axis.x * s, axis.y * s, axis.z * s, Math.cos(h));
+  }
+  /** Rotation between normalized directions, including antiparallel vectors (three.js r187). */
+  setFromUnitVectors(vFrom: Vector3, vTo: Vector3): this {
+    let r = vFrom.dot(vTo) + 1;
+    if (r < 1e-8) {
+      r = 0;
+      if (Math.abs(vFrom.x) > Math.abs(vFrom.z)) {
+        this._x = -vFrom.y;
+        this._y = vFrom.x;
+        this._z = 0;
+      } else {
+        this._x = 0;
+        this._y = -vFrom.z;
+        this._z = vFrom.y;
+      }
+    } else {
+      this._x = vFrom.y * vTo.z - vFrom.z * vTo.y;
+      this._y = vFrom.z * vTo.x - vFrom.x * vTo.z;
+      this._z = vFrom.x * vTo.y - vFrom.y * vTo.x;
+    }
+    this._w = r;
+    return this.normalize();
   }
   setFromEuler(e: Euler, notify = true): this {
     const c1 = Math.cos(e.x / 2), c2 = Math.cos(e.y / 2), c3 = Math.cos(e.z / 2);
@@ -204,7 +244,8 @@ export class Quaternion {
     );
   }
   normalize(): this {
-    const l = Math.hypot(this._x, this._y, this._z, this._w) || 1;
+    const l = Math.hypot(this._x, this._y, this._z, this._w);
+    if (l === 0) return this.set(0, 0, 0, 1);
     return this.set(this._x / l, this._y / l, this._z / l, this._w / l);
   }
   slerp(qb: Quaternion, t: number): this {
@@ -228,6 +269,12 @@ export class Quaternion {
   /** The angle of the rotation from this one to `q`, radians. */
   angleTo(q: Quaternion): number {
     return 2 * Math.acos(Math.min(1, Math.abs(this.dot(q))));
+  }
+  /** Rotate toward a unit quaternion by at most `step` radians (three.js). */
+  rotateTowards(q: Quaternion, step: number): this {
+    const angle = this.angleTo(q);
+    if (angle === 0) return this;
+    return this.slerp(q, Math.min(1, step / angle));
   }
   /** The inverse rotation (of a unit quaternion). */
   invert(): this {
@@ -256,14 +303,20 @@ export class Euler {
   private _x: number;
   private _y: number;
   private _z: number;
-  order: EulerOrder;
-  _onChange: () => void = () => {};
+  private _order: EulerOrder;
+  /** Called after a change (an object's rotation / quaternion keep each other and the object in step). */
+  _onChange(): void {}
+  /** @internal The object whose rotation this is, if any (weakly: no cycle). */
+  declare _owner: WeakRef<object> | undefined;
   constructor(x = 0, y = 0, z = 0, order: EulerOrder = "XYZ") {
     this._x = x;
     this._y = y;
     this._z = z;
-    this.order = order;
+    this._order = order;
   }
+  /** Assigning the order recomposes the object's quaternion, as three.js does. */
+  get order() { return this._order; }
+  set order(value: EulerOrder) { this._order = value; this._onChange(); }
   get x() { return this._x; }
   set x(v) { this._x = v; this._onChange(); }
   get y() { return this._y; }
@@ -274,7 +327,7 @@ export class Euler {
     this._x = x;
     this._y = y;
     this._z = z;
-    this.order = order;
+    this._order = order;
     this._onChange();
     return this;
   }
@@ -294,7 +347,7 @@ export class Euler {
       this._x = Math.atan2(m32, m22);
       this._z = 0;
     }
-    this.order = "XYZ";
+    this._order = "XYZ";
     if (notify) this._onChange();
     return this;
   }
@@ -373,11 +426,20 @@ export class Matrix4 {
   }
   decompose(p: Vector3, q: Quaternion, s: Vector3): this {
     const te = this.elements;
+    p.set(te[12], te[13], te[14]);
+    // three.js r187 uses the affine determinant and leaves a singular matrix undecomposed.
+    const det = te[0] * (te[5] * te[10] - te[6] * te[9])
+      - te[4] * (te[1] * te[10] - te[2] * te[9])
+      + te[8] * (te[1] * te[6] - te[2] * te[5]);
+    if (det === 0) {
+      s.set(1, 1, 1);
+      q.set(0, 0, 0, 1);
+      return this;
+    }
     let sx = Math.hypot(te[0], te[1], te[2]);
     const sy = Math.hypot(te[4], te[5], te[6]);
     const sz = Math.hypot(te[8], te[9], te[10]);
-    if (this.determinant() < 0) sx = -sx;
-    p.set(te[12], te[13], te[14]);
+    if (det < 0) sx = -sx;
     const m = this.clone();
     const me = m.elements;
     me[0] /= sx; me[1] /= sx; me[2] /= sx;
@@ -399,6 +461,18 @@ export class Matrix4 {
       n43 * (+n11 * n24 * n32 - n11 * n22 * n34 - n14 * n21 * n32 + n12 * n21 * n34 + n14 * n22 * n31 - n12 * n24 * n31) +
       n44 * (-n13 * n22 * n31 - n11 * n23 * n32 + n11 * n22 * n33 + n13 * n21 * n32 - n12 * n21 * n33 + n12 * n23 * n31)
     );
+  }
+  /** Transpose in place, as three.js does. */
+  transpose(): this {
+    const te = this.elements;
+    let tmp: number;
+    tmp = te[1]; te[1] = te[4]; te[4] = tmp;
+    tmp = te[2]; te[2] = te[8]; te[8] = tmp;
+    tmp = te[6]; te[6] = te[9]; te[9] = tmp;
+    tmp = te[3]; te[3] = te[12]; te[12] = tmp;
+    tmp = te[7]; te[7] = te[13]; te[13] = tmp;
+    tmp = te[11]; te[11] = te[14]; te[14] = tmp;
+    return this;
   }
   /** Row-major arguments, as three.js. */
   set(n11: number, n12: number, n13: number, n14: number, n21: number, n22: number, n23: number, n24: number, n31: number, n32: number, n33: number, n34: number, n41: number, n42: number, n43: number, n44: number): this {
@@ -554,6 +628,14 @@ export class Color {
   lerp(c: Color, t: number): this {
     return this.setRGB(this.r + (c.r - this.r) * t, this.g + (c.g - this.g) * t, this.b + (c.b - this.b) * t);
   }
+  /** Interpolates two source colors in linear RGB, regardless of this color's previous value. */
+  lerpColors(color1: Color, color2: Color, alpha: number): this {
+    return this.setRGB(
+      color1.r + (color2.r - color1.r) * alpha,
+      color1.g + (color2.g - color1.g) * alpha,
+      color1.b + (color2.b - color1.b) * alpha,
+    );
+  }
   add(c: Color): this {
     return this.setRGB(this.r + c.r, this.g + c.g, this.b + c.b);
   }
@@ -634,8 +716,14 @@ export class Vector2 {
   multiplyScalar(s: number): this {
     return this.set(this.x * s, this.y * s);
   }
+  roundToZero(): this {
+    return this.set(Math.trunc(this.x), Math.trunc(this.y));
+  }
   dot(v: Vector2): number {
     return this.x * v.x + this.y * v.y;
+  }
+  cross(v: Vector2): number {
+    return this.x * v.y - this.y * v.x;
   }
   length(): number {
     return Math.hypot(this.x, this.y);
@@ -702,6 +790,13 @@ export class Box3 {
   union(b: Box3): this {
     return this.expandByPoint(b.min).expandByPoint(b.max);
   }
+  /** Narrows this box to its overlap with `b` (three.js). */
+  intersect(b: Box3): this {
+    this.min.set(Math.max(this.min.x, b.min.x), Math.max(this.min.y, b.min.y), Math.max(this.min.z, b.min.z));
+    this.max.set(Math.min(this.max.x, b.max.x), Math.min(this.max.y, b.max.y), Math.min(this.max.z, b.max.z));
+    if (this.isEmpty()) this.makeEmpty();
+    return this;
+  }
   /** The box of the box transformed by `m` (its eight corners). */
   applyMatrix4(m: Matrix4): this {
     if (this.isEmpty()) return this;
@@ -717,6 +812,11 @@ export class Box3 {
   }
   containsPoint(p: Vector3): boolean {
     return p.x >= this.min.x && p.x <= this.max.x && p.y >= this.min.y && p.y <= this.max.y && p.z >= this.min.z && p.z <= this.max.z;
+  }
+  containsBox(b: Box3): boolean {
+    return this.min.x <= b.min.x && b.max.x <= this.max.x &&
+      this.min.y <= b.min.y && b.max.y <= this.max.y &&
+      this.min.z <= b.min.z && b.max.z <= this.max.z;
   }
   intersectsBox(b: Box3): boolean {
     return b.max.x >= this.min.x && b.min.x <= this.max.x && b.max.y >= this.min.y && b.min.y <= this.max.y && b.max.z >= this.min.z && b.min.z <= this.max.z;
@@ -748,6 +848,25 @@ export class Sphere {
     this.radius = Math.sqrt(r2);
     return this;
   }
+  /** Grow the sphere to include a point, as three.js Sphere.expandByPoint does. */
+  expandByPoint(point: Vector3): this {
+    if (this.radius < 0) {
+      this.center.copy(point);
+      this.radius = 0;
+      return this;
+    }
+
+    const offset = new Vector3().subVectors(point, this.center);
+    const lengthSq = offset.lengthSq();
+    if (lengthSq > this.radius * this.radius) {
+      const length = Math.sqrt(lengthSq);
+      const delta = (length - this.radius) * 0.5;
+      this.center.addScaledVector(offset, delta / length);
+      this.radius += delta;
+    }
+    return this;
+  }
+
   clone(): Sphere {
     return new Sphere(this.center.clone(), this.radius);
   }
@@ -770,9 +889,8 @@ export class Ray {
     return target.set(this.origin.x + this.direction.x * t, this.origin.y + this.direction.y * t, this.origin.z + this.direction.z * t);
   }
   applyMatrix4(m: Matrix4): this {
-    const end = this.at(1).applyMatrix4(m);
     this.origin.applyMatrix4(m);
-    this.direction.subVectors(end, this.origin);
+    this.direction.transformDirection(m);
     return this;
   }
   /** The ray parameter where it enters `b` (0 inside), or null. */
@@ -850,5 +968,6 @@ export const MathUtils = {
   degToRad: (d: number) => (d * Math.PI) / 180,
   radToDeg: (r: number) => (r * 180) / Math.PI,
   clamp: (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v)),
+  euclideanModulo: (n: number, m: number) => ((n % m) + m) % m,
   lerp: (a: number, b: number, t: number) => a + (b - a) * t,
 };

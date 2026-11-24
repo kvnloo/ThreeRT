@@ -77,7 +77,7 @@ pub fn set_log_sink(sink: Option<fn(&str, &str)>) {
 }
 
 /// The game code a session runs: a one-script bundle (tools/bundle-game.ts), or a game module on the runtime module
-/// (`ScriptHost::from_modules`, the cloud's layout; the clients' playground code).
+/// (`ScriptHost::from_modules`, the cloud's layout).
 pub enum GameCode<'a> {
     Bundle(&'a str),
     Modules { game: &'a str, runtime: &'a str },
@@ -92,6 +92,63 @@ const FRAME_MS: u64 = 50;
 /// drains, a render node's, keeps the first of them and drops the rest), and the most bytes of one.
 const MAX_POSTS: usize = 1024;
 const MAX_POST_BYTES: usize = 1 << 20;
+/// A `store.write` carries a file (docs/RUNTIME.md "Files": at most 64 MiB, in base64): the most bytes of one, and of
+/// the whole queue.
+const MAX_STORE_WRITE_BYTES: usize = 96 << 20;
+const MAX_QUEUE_BYTES: usize = 192 << 20;
+
+/// The asset root scene code may read files under (`__engine.readAsset`): set by the host before a game loads.
+static ASSET_ROOT: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// Where `__engine.readAsset` reads (the host's `--assets`).
+pub fn set_asset_root(root: &std::path::Path) {
+    *ASSET_ROOT.write().unwrap() = Some(root.to_path_buf());
+}
+
+/// `__engine.readAsset(path)`: a file under the asset root, whole, as an ArrayBuffer (a streamed city's tiles, baked data
+/// a game reads as it goes). Relative paths only, no `..`: nothing outside the root.
+fn read_asset(path: &str, range: Option<(u64, usize)>) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let p = std::path::Path::new(path);
+    anyhow::ensure!(p.is_relative() && !p.components().any(|c| matches!(c, std::path::Component::ParentDir)), "readAsset: {path}: a relative path under the asset root");
+    let root = ASSET_ROOT.read().unwrap().clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let full = root.join(p);
+    match range {
+        None => std::fs::read(&full).map_err(|e| anyhow::anyhow!("readAsset: {path}: {e}")),
+        // (a part of it: a streamed cell's next meshes, without reading the rest)
+        Some((offset, length)) => {
+            let mut f = std::fs::File::open(&full).map_err(|e| anyhow::anyhow!("readAsset: {path}: {e}"))?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; length];
+            f.read_exact(&mut buf).map_err(|e| anyhow::anyhow!("readAsset: {path} [{offset}, +{length}]: {e}"))?;
+            Ok(buf)
+        }
+    }
+}
+
+/// `__host_base64_encode(bytes: Uint8Array): string`.
+fn base64_encode<'js>(ctx: Ctx<'js>, bytes: Value<'js>) -> rquickjs::Result<String> {
+    use base64::Engine;
+    let a = TypedArray::<u8>::from_value(bytes).ok();
+    let b = a.as_ref().and_then(|a| a.as_bytes()).ok_or_else(|| Exception::throw_type(&ctx, "__host_base64_encode: a Uint8Array"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(b))
+}
+
+/// `__host_base64_decode(text: string): Uint8Array`.
+fn base64_decode<'js>(ctx: Ctx<'js>, text: String) -> rquickjs::Result<TypedArray<'js, u8>> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(text.as_bytes()).map_err(|e| Exception::throw_type(&ctx, &format!("__host_base64_decode: {e}")))?;
+    TypedArray::new(ctx, bytes)
+}
+
+/// The type of a message's JSON text, read without building the rest of it.
+fn post_type(text: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Typed {
+        t: String,
+    }
+    serde_json::from_str::<Typed>(text).ok().map(|m| m.t)
+}
 
 /// The most engine time one entry into the script (a frame, an event, setup) is lent, µs: past it the time the engine
 /// spends in voxel calls counts against the script's budget again. 250 ms: the largest single edit measured on the
@@ -206,6 +263,7 @@ pub struct ScriptHost {
     pub voxels: Rc<RefCell<crate::voxel::VoxelWorld>>,
     /// The physics world (`__engine.physics`; renderer/src/physics.rs): None until scene code makes a physics call.
     pub physics: Rc<RefCell<Option<crate::physics::PhysicsWorld>>>,
+    rendering: crate::live::RenderingControl,
     /// What the game posted for the app (`host.post`: JSON texts), until `take_posts`.
     posts: Rc<RefCell<Vec<String>>>,
     /// The promises rejected with no handler in the entry running now (`Rejected`); empty between entries.
@@ -275,9 +333,19 @@ fn thrown(ctx: &Ctx, e: crate::api::Error) -> rquickjs::Error {
 
 /// The engine API (`globalThis.__engine`), see packages/scene/src/engine.ts: each call's arguments out of QuickJS,
 /// then what the call does (api.rs: the same code a browser's exports run, renderer/web).
-fn install_engine<'js>(ctx: &Ctx<'js>, world: &Rc<RefCell<World>>, voxels: &Rc<RefCell<crate::voxel::VoxelWorld>>, physics: &Rc<RefCell<Option<crate::physics::PhysicsWorld>>>, budget: &Arc<Budget>) -> rquickjs::Result<()> {
+fn install_engine<'js>(ctx: &Ctx<'js>, world: &Rc<RefCell<World>>, voxels: &Rc<RefCell<crate::voxel::VoxelWorld>>, physics: &Rc<RefCell<Option<crate::physics::PhysicsWorld>>>, budget: &Arc<Budget>, rendering: &crate::live::RenderingControl) -> rquickjs::Result<()> {
     use crate::api;
     let e = Object::new(ctx.clone())?;
+    // Rendering settings (live/rendering.rs): a request as JSON, applied from the next frame; the last frame's status.
+    let control = rendering.clone();
+    e.set("setRendering", Function::new(ctx.clone(), move |ctx: Ctx, json: String| -> rquickjs::Result<()> {
+        let r = serde_json::from_str(&json).map_err(anyhow::Error::from).and_then(|v| crate::live::RenderingRequest::from_json(&v))
+            .map_err(|e| Exception::throw_type(&ctx, &format!("{e:#}")))?;
+        control.request(r);
+        Ok(())
+    })?)?;
+    let control = rendering.clone();
+    e.set("renderingStatus", Function::new(ctx.clone(), move || control.status().to_string())?)?;
     // Physics (renderer/src/physics.rs): one call, `physics(op, args)`, answering in JSON. The world is made by the
     // first call; the engine steps it, scene code cannot.
     let (p, w) = (physics.clone(), world.clone());
@@ -321,6 +389,12 @@ fn install_engine<'js>(ctx: &Ctx<'js>, world: &Rc<RefCell<World>>, voxels: &Rc<R
     e.set("voxelDebris", Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<TypedArray<'js, f32>> { TypedArray::new(ctx, v.borrow_mut().take_debris()) })?)?;
     let (v, w, d) = (voxels.clone(), world.clone(), budget.clone());
     e.set("voxelFrame", Function::new(ctx.clone(), move |ctx: Ctx, dt: f64| -> rquickjs::Result<String> { let _lent = Lent::new(&ctx, &d)?; api::voxel_frame(&mut v.borrow_mut(), &mut w.borrow_mut(), dt).map_err(|e| thrown(&ctx, e)) })?)?;
+    // readAsset(path, offset?, length?): the file, or `length` bytes of it from `offset`
+    e.set("readAsset", Function::new(ctx.clone(), move |ctx: Ctx<'js>, path: String, offset: rquickjs::function::Opt<f64>, length: rquickjs::function::Opt<f64>| -> rquickjs::Result<rquickjs::ArrayBuffer<'js>> {
+        let range = offset.0.zip(length.0).map(|(o, l)| (o as u64, l as usize));
+        let bytes = read_asset(&path, range).map_err(|e| fail(&ctx, e))?;
+        rquickjs::ArrayBuffer::new(ctx, bytes)
+    })?)?;
     let w = world.clone();
     // (…, groups?, colors?): the optional arguments as the rest (rquickjs takes seven parameters at most).
     e.set("geometry", Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: u32, p: TypedArray<f32>, n: TypedArray<f32>, uv: TypedArray<f32>, idx: TypedArray<u32>, rest: rquickjs::function::Rest<Value<'js>>| -> rquickjs::Result<()> {
@@ -438,7 +512,15 @@ impl ScriptHost {
 
     fn load(code: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()>) -> Result<ScriptHost> {
         let rt = Runtime::new()?;
-        rt.set_memory_limit(1 << 30);
+        // 1 GiB, or THREERT_SCRIPT_MB (a game that streams a city keeps its resident tiles' arrays)
+        let mb = std::env::var("THREERT_SCRIPT_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+        rt.set_memory_limit(mb << 20);
+        // QuickJS collects cycles first at 256 KB of heap, then whenever the heap is half as large again as at the last
+        // collection; a collection walks every object (a streamed city: ~0.5 M of them, ~45 ms). The scene package
+        // makes no cycles of its own (its objects are freed as they go), so the first collection waits for 256 MB, or
+        // THREERT_SCRIPT_GC_MB; after it, QuickJS's own rule.
+        let gc_mb = std::env::var("THREERT_SCRIPT_GC_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+        rt.set_gc_threshold(gc_mb << 20);
         rt.set_max_stack_size(4 << 20);
         let epoch = Instant::now();
         let budget = Arc::new(Budget { epoch, deadline: AtomicU64::new(0), lent: AtomicU64::new(0) });
@@ -462,7 +544,7 @@ impl ScriptHost {
         let ctx = Context::full(&rt)?;
         let world = Rc::new(RefCell::new(World::default()));
         let voxels = Rc::new(RefCell::new(crate::voxel::VoxelWorld::default()));
-        let mut h = ScriptHost { rt, ctx, budget, epoch, info: serde_json::Value::Null, world, voxels, physics: Default::default(), posts: Default::default(), rejected };
+        let mut h = ScriptHost { rt, ctx, budget, epoch, info: serde_json::Value::Null, world, voxels, physics: Default::default(), rendering: Default::default(), posts: Default::default(), rejected };
         let (w, v, ph, d2, posts) = (h.world.clone(), h.voxels.clone(), h.physics.clone(), h.budget.clone(), h.posts.clone());
         let (info, rejections) = h.enter(SETUP_MS, |ctx| {
             let g = ctx.globals();
@@ -471,17 +553,22 @@ impl ScriptHost {
             // The host channel, script to app: a message's JSON text onto the queue the app drains. False when the
             // queue is full (nobody drains it); a message past the size bound is the script's error.
             g.set("__host_post", Function::new(ctx.clone(), move |ctx: Ctx, text: String| -> rquickjs::Result<bool> {
-                if text.len() > MAX_POST_BYTES {
-                    return Err(Exception::throw_range(&ctx, &format!("host.post: a message of {} bytes (at most {MAX_POST_BYTES})", text.len())));
+                if text.len() > MAX_POST_BYTES && (text.len() > MAX_STORE_WRITE_BYTES || post_type(&text).as_deref() != Some("store.write")) {
+                    let most = if text.len() > MAX_STORE_WRITE_BYTES { MAX_STORE_WRITE_BYTES } else { MAX_POST_BYTES };
+                    return Err(Exception::throw_range(&ctx, &format!("host.post: a message of {} bytes (at most {most}; a store.write {MAX_STORE_WRITE_BYTES})", text.len())));
                 }
                 let mut q = posts.borrow_mut();
-                let room = q.len() < MAX_POSTS;
+                let room = q.len() < MAX_POSTS && q.iter().map(String::len).sum::<usize>() + text.len() <= MAX_QUEUE_BYTES;
                 if room {
                     q.push(text);
                 }
                 Ok(room)
             })?)?;
-            install_engine(ctx, &w, &v, &ph, &d2)?;
+            // Bytes as base64 and back, natively: what the host channel carries a file as (docs/RUNTIME.md "Files"),
+            // tens of megabytes that the script would take seconds over. packages/gameplay/src/files.ts uses them.
+            g.set("__host_base64_encode", Function::new(ctx.clone(), base64_encode)?)?;
+            g.set("__host_base64_decode", Function::new(ctx.clone(), base64_decode)?)?;
+            install_engine(ctx, &w, &v, &ph, &d2, &h.rendering)?;
             ctx.eval::<(), _>(PRELUDE)?;
             code(ctx)?;
             host(ctx)?.get::<_, Function>("describe")?.call::<_, String>(())
@@ -503,6 +590,10 @@ impl ScriptHost {
             game_log("error", line);
         }
         r
+    }
+
+    pub fn attach_rendering(&self, core: &mut crate::live::LiveCore) {
+        core.attach_rendering_control(self.rendering.clone());
     }
 
     /// One entry into the script: `f` under a time budget, then the promise jobs the entry left (`run_jobs`), within
@@ -683,9 +774,11 @@ impl ScriptHost {
     /// Sets the frame script's clock to `t` (s) and shows the scene settled at that moment (an offline render at a scene
     /// time; frames from there advance it as before).
     /// Bundles built before `seek` existed have none: nothing to do then.
+    /// Under setup's budget, not a frame's: it is no frame anyone waits on, and its entry also syncs all that setup
+    /// made (a streamed city's hundred cells at the radii an offline render asks for take more than a frame's 50 ms).
     pub fn seek(&self, t: f32) -> Result<()> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
-        self.call(FRAME_MS, |ctx| match host(ctx)?.get::<_, Option<Function>>("seek")? {
+        self.call(SETUP_MS, |ctx| match host(ctx)?.get::<_, Option<Function>>("seek")? {
             Some(f) => f.call((t as f64, now)),
             None => Ok(()),
         })
@@ -726,7 +819,7 @@ impl ScriptHost {
 
 /// A game running on this node with its live view: the scene built in the embedded runtime, events (local authority)
 /// and the frame script committed to the renderer. Shared by the native window (`play`), the headless runner and the
-/// playground.
+/// native clients.
 pub struct GameSession {
     pub host: ScriptHost,
     pub seq: i64,
@@ -755,8 +848,8 @@ fn click_log() -> bool {
 }
 
 /// The frame script's clock: the gameplay FrameRunner adds each frame's dt clamped to [0, 0.1] s, in f64. While a
-/// frame script runs, the scene time is this clock, whatever advanced the scene between its frames (the playground
-/// animates the scene while editing, and runs the frame script only in Play).
+/// frame script runs, the scene time is this clock, whatever advanced the scene between its frames (an editor
+/// may animate the scene while editing, and run the frame script only in Play).
 #[derive(Default)]
 struct GameClock(f64);
 
@@ -808,7 +901,8 @@ impl GameSession {
     /// Opens the first live view of a loaded session (`load_code`).
     pub fn start_loaded(self, assets: &std::path::Path, g: crate::gpu::Gpu, presets: &std::path::Path, w: u32, h: u32) -> Result<(GameSession, crate::live::LiveCore)> {
         self.realize_voxels(assets)?;
-        let core = crate::live::LiveCore::new(g, &self.host.world.borrow(), assets, presets, w, h)?;
+        let mut core = crate::live::LiveCore::new(g, &self.host.world.borrow(), assets, presets, w, h)?;
+        self.host.attach_rendering(&mut core);
         Ok((self, core))
     }
 
@@ -816,6 +910,7 @@ impl GameSession {
     pub fn open_loaded(self, assets: &std::path::Path, core: &mut crate::live::LiveCore) -> Result<GameSession> {
         self.realize_voxels(assets)?;
         core.open(&self.host.world.borrow(), assets)?;
+        self.host.attach_rendering(core);
         core.seq = 0;
         Ok(self)
     }
@@ -1267,6 +1362,43 @@ mod tests {
         let old = ScriptHost::new(GAME).unwrap();
         old.host_messages(&[serde_json::json!({ "t": "launch", "params": {} })]).unwrap();
         assert!(old.take_posts().is_empty());
+    }
+
+    /// Files on the channel (docs/RUNTIME.md "Files"): base64 both ways, natively; a `store.write` may carry a file of
+    /// 64 MiB where other messages stop at 1 MiB; and the largest file `files.read` answers with reaches the game and
+    /// is decoded within an entry's budget.
+    #[test]
+    fn files_cross_the_host_channel_as_base64() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let game = GAME.replace(
+            "frame: (dt) => { frames++; },",
+            "frame: (dt) => { frames++; }, hostMessages: (list, ts) => { for (const m of JSON.parse(list)) if (m.t === 'files.data') { const b = __host_base64_decode(m.data); __host_post(JSON.stringify({ t: 'got', n: b.length, first: b[0], last: b[b.length - 1] })); } },",
+        );
+        let h = ScriptHost::new(&game).unwrap();
+        let text: String = h.call(1000, |ctx| ctx.eval("__host_base64_encode(new Uint8Array([9, 0, 1, 2, 255]).subarray(1))")).unwrap();
+        assert_eq!(text, "AAEC/w==", "a view's own bytes");
+        let back: Vec<u8> = h.call(1000, |ctx| ctx.eval::<TypedArray<u8>, _>("__host_base64_decode('AAEC/w==')").map(|a| a.as_bytes().unwrap().to_vec())).unwrap();
+        assert_eq!(back, [0, 1, 2, 255]);
+        assert!(h.call(1000, |ctx| ctx.eval::<(), _>("__host_base64_decode('**')")).is_err());
+        assert!(h.call(1000, |ctx| ctx.eval::<(), _>("__host_base64_encode([1, 2])")).is_err());
+        // A file of 64 MiB the game stores: one post (its text, 85 MiB) where any other message stops at 1 MiB.
+        let t0 = Instant::now();
+        let ok: bool = h.call(EVENT_MS, |ctx| ctx.eval("const big = new Uint8Array(64 << 20); big[0] = 7; __host_post(JSON.stringify({ t: 'store.write', id: 1, path: 'maps/a.glb', data: __host_base64_encode(big) }))")).unwrap();
+        assert!(ok);
+        let posts = h.take_posts();
+        assert_eq!((posts[0]["t"].as_str(), b64.decode(posts[0]["data"].as_str().unwrap()).unwrap().len()), (Some("store.write"), 64 << 20));
+        eprintln!("a 64 MiB store.write posted and taken in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        assert!(h.call(1000, |ctx| ctx.eval::<bool, _>("__host_post(JSON.stringify({ t: 'net.send', id: 'a', data: 'x'.repeat(2 << 20) }))")).is_err());
+        assert!(h.call(1000, |ctx| ctx.eval::<bool, _>("__host_post(JSON.stringify({ t: 'store.write', id: 2, path: 'a', data: 'x'.repeat(100 << 20) }))")).is_err());
+        // The largest file the app reads for the game, delivered in one batch and decoded under an event's budget.
+        let mut file = vec![0u8; 64 << 20];
+        (file[0], file[(64 << 20) - 1]) = (3, 5);
+        let m = serde_json::json!({ "t": "files.data", "id": "r", "ok": true, "data": b64.encode(&file), "size": file.len() });
+        let t0 = Instant::now();
+        h.host_messages(&[m]).unwrap();
+        eprintln!("a 64 MiB files.data delivered and decoded in {:.0} ms (an entry's budget: {EVENT_MS} ms)", t0.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(h.take_posts(), vec![serde_json::json!({ "t": "got", "n": 64 << 20, "first": 3, "last": 5 })]);
     }
 
     // The game above with what a game written with promises leaves behind in each entry: a `.then` chain and an
