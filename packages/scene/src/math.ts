@@ -1465,6 +1465,61 @@ export class Box3 {
   distanceToPoint(point: Vector3): number {
     return this.clampPoint(point).distanceTo(point);
   }
+  /** The box of every item of a 3-component attribute (three.js). */
+  setFromBufferAttribute(attribute: { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number }): this {
+    this.makeEmpty();
+    const p = new Vector3();
+    for (let i = 0; i < attribute.count; i++) this.expandByPoint(p.set(attribute.getX(i), attribute.getY(i), attribute.getZ(i)));
+    return this;
+  }
+  setFromCenterAndSize(center: Vector3, size: Vector3): this {
+    const hx = size.x * 0.5, hy = size.y * 0.5, hz = size.z * 0.5;
+    this.min.set(center.x - hx, center.y - hy, center.z - hz);
+    this.max.set(center.x + hx, center.y + hy, center.z + hz);
+    return this;
+  }
+  /** Grows each side by `vector`'s component on that axis (three.js). */
+  expandByVector(vector: Vector3): this {
+    this.min.sub(vector);
+    this.max.add(vector);
+    return this;
+  }
+  expandByScalar(scalar: number): this {
+    this.min.addScalar(-scalar);
+    this.max.addScalar(scalar);
+    return this;
+  }
+  /** Where `point` sits in the box, 0 at min and 1 at max on each axis (three.js; a flat axis divides by zero). */
+  getParameter(point: Vector3, target = new Vector3()): Vector3 {
+    return target.set(
+      (point.x - this.min.x) / (this.max.x - this.min.x),
+      (point.y - this.min.y) / (this.max.y - this.min.y),
+      (point.z - this.min.z) / (this.max.z - this.min.z),
+    );
+  }
+  /** Whether `plane` passes through the box (three.js). */
+  intersectsPlane(plane: Plane): boolean {
+    const n = plane.normal;
+    let min = 0, max = 0;
+    for (const k of ["x", "y", "z"] as const) {
+      if (n[k] > 0) {
+        min += n[k] * this.min[k];
+        max += n[k] * this.max[k];
+      } else {
+        min += n[k] * this.max[k];
+        max += n[k] * this.min[k];
+      }
+    }
+    return min <= -plane.constant && max >= -plane.constant;
+  }
+  translate(offset: Vector3): this {
+    this.min.add(offset);
+    this.max.add(offset);
+    return this;
+  }
+  equals(box: Box3): boolean {
+    return box.min.equals(this.min) && box.max.equals(this.max);
+  }
   /** Whether `sphere` touches this box (three.js). */
   intersectsSphere(sphere: Sphere): boolean {
     const c = this.clampPoint(sphere.center);
