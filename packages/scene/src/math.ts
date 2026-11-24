@@ -552,6 +552,7 @@ export class Matrix4 {
 
 /** Colors are stored in linear sRGB (Rec.709 primaries), like three.js with ColorManagement enabled. */
 export class Color {
+  readonly isColor = true;
   r = 1;
   g = 1;
   b = 1;
@@ -594,6 +595,19 @@ export class Color {
   multiplyScalar(s: number): this {
     this.r *= s; this.g *= s; this.b *= s;
     return this;
+  }
+  /** All three linear components to `scalar`. */
+  setScalar(scalar: number): this {
+    return this.setRGB(scalar, scalar, scalar);
+  }
+  /** Linear components from a vector's x, y, z. */
+  setFromVector3(v: { x: number; y: number; z: number }): this {
+    return this.setRGB(v.x, v.y, v.z);
+  }
+  /** Multiplies the linear components by a column-major 3x3 matrix, as three.js. */
+  applyMatrix3(m: { elements: ArrayLike<number> }): this {
+    const { r, g, b } = this, e = m.elements;
+    return this.setRGB(e[0] * r + e[3] * g + e[6] * b, e[1] * r + e[4] * g + e[7] * b, e[2] * r + e[5] * g + e[8] * b);
   }
   clone(): Color {
     return new Color().setRGB(this.r, this.g, this.b);
@@ -642,6 +656,17 @@ export class Color {
   multiply(c: Color): this {
     return this.setRGB(this.r * c.r, this.g * c.g, this.b * c.b);
   }
+  /** Sets this color to `color1 + color2`. */
+  addColors(color1: Color, color2: Color): this {
+    return this.setRGB(color1.r + color2.r, color1.g + color2.g, color1.b + color2.b);
+  }
+  addScalar(s: number): this {
+    return this.setRGB(this.r + s, this.g + s, this.b + s);
+  }
+  /** Subtracts `c`, clamping each component at 0, as three.js. */
+  sub(c: Color): this {
+    return this.setRGB(Math.max(0, this.r - c.r), Math.max(0, this.g - c.g), Math.max(0, this.b - c.b));
+  }
   /** A CSS colour string, as three.js. */
   getStyle(): string {
     return `#${this.getHex().toString(16).padStart(6, "0")}`;
@@ -653,6 +678,28 @@ export class Color {
   getHex(): number {
     const k = (v: number) => Math.round(Math.min(Math.max(linearToSrgb(v), 0), 1) * 255);
     return (k(this.r) << 16) | (k(this.g) << 8) | k(this.b);
+  }
+  /** `getHex` as six lowercase hex digits, without `#`. */
+  getHexString(): string {
+    return this.getHex().toString(16).padStart(6, "0");
+  }
+  /** The linear components, into `target`. */
+  getRGB<T extends { r: number; g: number; b: number }>(target: T): T {
+    target.r = this.r; target.g = this.g; target.b = this.b;
+    return target;
+  }
+  /** Linear components from item `index` of a 3-component attribute. */
+  fromBufferAttribute(attribute: { getX(i: number): number; getY(i: number): number; getZ(i: number): number }, index: number): this {
+    return this.setRGB(attribute.getX(index), attribute.getY(index), attribute.getZ(index));
+  }
+  /** The sRGB hex, as three.js serializes a color. */
+  toJSON(): number {
+    return this.getHex();
+  }
+  *[Symbol.iterator](): Generator<number, void, undefined> {
+    yield this.r;
+    yield this.g;
+    yield this.b;
   }
   fromArray(a: ArrayLike<number>, offset = 0): this {
     return this.setRGB(a[offset], a[offset + 1], a[offset + 2]);
