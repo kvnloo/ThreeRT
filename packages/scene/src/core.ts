@@ -333,10 +333,49 @@ export interface SwayDesc {
   phase?: number;
 }
 
+/**
+ * three.js's layers: which of 32 layers an object is on (a bit mask; layer 0 alone to begin with). `Raycaster.layers`
+ * picks by them; the renderer draws every object whatever its layers (a camera's layers select nothing yet).
+ */
+export class Layers {
+  mask = 1 | 0;
+  /** On `layer` alone. */
+  set(layer: number): void {
+    this.mask = ((1 << layer) | 0) >>> 0;
+  }
+  enable(layer: number): void {
+    this.mask |= (1 << layer) | 0;
+  }
+  enableAll(): void {
+    this.mask = 0xffffffff | 0;
+  }
+  toggle(layer: number): void {
+    this.mask ^= (1 << layer) | 0;
+  }
+  disable(layer: number): void {
+    this.mask &= ~((1 << layer) | 0);
+  }
+  disableAll(): void {
+    this.mask = 0;
+  }
+  /** Whether the two share a layer. */
+  test(layers: Layers): boolean {
+    return (this.mask & layers.mask) !== 0;
+  }
+  isEnabled(layer: number): boolean {
+    return (this.mask & ((1 << layer) | 0)) !== 0;
+  }
+}
+
+/** @internal Whether `o` is on one of `layers`, without making its `Layers` (most objects never have one). */
+export function onLayers(o: Object3D, layers: Layers): boolean {
+  return (((o as unknown as { _layers?: Layers })._layers?.mask ?? 1) & layers.mask) !== 0;
+}
+
 let objectIds = 0;
 
 /** What `Object3D.copy` does not take over as it is (transforms are copied by value, children cloned). */
-const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners", "_ref", "_up", "_matrix", "_matrixWorld", "_userData", "_tags", "_custom", "_children"]);
+const COPY_SKIP = new Set(["parent", "children", "position", "quaternion", "rotation", "scale", "up", "matrix", "matrixWorld", "userData", "tags", "_id", "_autoId", "uuid", "_body", "_listeners", "_ref", "_up", "_matrix", "_matrixWorld", "_userData", "_tags", "_custom", "_children", "_layers"]);
 const NO_CHILDREN = Object.freeze([]) as unknown as Object3D[];
 const NO_CUSTOM: readonly [number, number, number, number] = Object.freeze([0, 0, 0, 0] as [number, number, number, number]);
 /** An object's rotation changed: its quaternion follows (the object through the rotation's weak owner). */
@@ -390,6 +429,14 @@ export class Object3D {
   private _movable = false;
   receiveShadow = true;
   declare private _tags: string[] | undefined;
+  declare private _layers: Layers | undefined;
+  /** The layers the object is on (`Layers`), made when first asked for. */
+  get layers(): Layers {
+    return (this._layers ??= new Layers());
+  }
+  set layers(v: Layers) {
+    this._layers = v;
+  }
   declare private _userData: Record<string, unknown> | undefined;
   get tags(): string[] {
     return (this._tags ??= []);
@@ -713,6 +760,8 @@ export class Object3D {
     this.matrixWorld.copy(source.matrixWorld);
     this.userData = JSON.parse(JSON.stringify(source.userData));
     this.tags = [...source.tags];
+    // The mask by value, as three.js (an object never asked for its layers is on layer 0).
+    if (source._layers || this._layers) this.layers.mask = source._layers?.mask ?? 1;
     if (recursive) for (const c of source.children) this.add(c.clone());
     touched(this);
     return this;
