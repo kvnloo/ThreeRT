@@ -331,25 +331,110 @@ export class Euler {
     this._onChange();
     return this;
   }
-  setFromQuaternion(q: Quaternion, notify = true): this {
-    const m = new Matrix4().makeRotationFromQuaternion(q);
+  copy(euler: Euler): this {
+    return this.set(euler._x, euler._y, euler._z, euler._order);
+  }
+  clone(): Euler {
+    return new Euler(this._x, this._y, this._z, this._order);
+  }
+  equals(euler: Euler): boolean {
+    return euler._x === this._x && euler._y === this._y && euler._z === this._z && euler._order === this._order;
+  }
+  /** `[x, y, z, order?]`; a missing order keeps the current one, as three.js does. */
+  fromArray(array: ArrayLike<number | EulerOrder>): this {
+    const order = array[3] === undefined ? this._order : (array[3] as EulerOrder);
+    return this.set(array[0] as number, array[1] as number, array[2] as number, order);
+  }
+  toArray(array: Array<number | EulerOrder> = [], offset = 0): Array<number | EulerOrder> {
+    array[offset] = this._x;
+    array[offset + 1] = this._y;
+    array[offset + 2] = this._z;
+    array[offset + 3] = this._order;
+    return array;
+  }
+  setFromVector3(v: Vector3, order: EulerOrder = this._order): this {
+    return this.set(v.x, v.y, v.z, order);
+  }
+  /** The angles of the (unscaled) rotation in `m`, in any of the six orders (three.js r187). */
+  setFromRotationMatrix(m: Matrix4, order: EulerOrder = this._order, update = true): this {
     const te = m.elements;
     const clamp = (v: number) => Math.min(1, Math.max(-1, v));
     const m11 = te[0], m12 = te[4], m13 = te[8];
-    const m22 = te[5], m23 = te[9];
-    const m32 = te[6], m33 = te[10];
-    // Only XYZ is needed for the rotation<->quaternion sync; other orders go through Quaternion.setFromEuler.
-    this._y = Math.asin(clamp(m13));
-    if (Math.abs(m13) < 0.9999999) {
-      this._x = Math.atan2(-m23, m33);
-      this._z = Math.atan2(-m12, m11);
-    } else {
-      this._x = Math.atan2(m32, m22);
-      this._z = 0;
+    const m21 = te[1], m22 = te[5], m23 = te[9];
+    const m31 = te[2], m32 = te[6], m33 = te[10];
+    switch (order) {
+      case "XYZ":
+        this._y = Math.asin(clamp(m13));
+        if (Math.abs(m13) < 0.9999999) {
+          this._x = Math.atan2(-m23, m33);
+          this._z = Math.atan2(-m12, m11);
+        } else {
+          this._x = Math.atan2(m32, m22);
+          this._z = 0;
+        }
+        break;
+      case "YXZ":
+        this._x = Math.asin(-clamp(m23));
+        if (Math.abs(m23) < 0.9999999) {
+          this._y = Math.atan2(m13, m33);
+          this._z = Math.atan2(m21, m22);
+        } else {
+          this._y = Math.atan2(-m31, m11);
+          this._z = 0;
+        }
+        break;
+      case "ZXY":
+        this._x = Math.asin(clamp(m32));
+        if (Math.abs(m32) < 0.9999999) {
+          this._y = Math.atan2(-m31, m33);
+          this._z = Math.atan2(-m12, m22);
+        } else {
+          this._y = 0;
+          this._z = Math.atan2(m21, m11);
+        }
+        break;
+      case "ZYX":
+        this._y = Math.asin(-clamp(m31));
+        if (Math.abs(m31) < 0.9999999) {
+          this._x = Math.atan2(m32, m33);
+          this._z = Math.atan2(m21, m11);
+        } else {
+          this._x = 0;
+          this._z = Math.atan2(-m12, m22);
+        }
+        break;
+      case "YZX":
+        this._z = Math.asin(clamp(m21));
+        if (Math.abs(m21) < 0.9999999) {
+          this._x = Math.atan2(-m23, m22);
+          this._y = Math.atan2(-m31, m11);
+        } else {
+          this._x = 0;
+          this._y = Math.atan2(m13, m33);
+        }
+        break;
+      case "XZY":
+        this._z = Math.asin(-clamp(m12));
+        if (Math.abs(m12) < 0.9999999) {
+          this._x = Math.atan2(m32, m22);
+          this._y = Math.atan2(m13, m11);
+        } else {
+          this._x = Math.atan2(-m23, m33);
+          this._y = 0;
+        }
+        break;
     }
-    this._order = "XYZ";
-    if (notify) this._onChange();
+    this._order = order;
+    if (update) this._onChange();
     return this;
+  }
+  /** The angles of `q` in `order` (default: this Euler's own order, which an object's rotation keeps). */
+  setFromQuaternion(q: Quaternion, order: EulerOrder = this._order, update = true): this {
+    return this.setFromRotationMatrix(new Matrix4().makeRotationFromQuaternion(q), order, update);
+  }
+  /** The same rotation, expressed in `newOrder` (three.js; may flip to an equivalent solution). */
+  reorder(newOrder: EulerOrder): this {
+    return this.setFromQuaternion(new Quaternion().setFromEuler(this), newOrder);
   }
 }
 
