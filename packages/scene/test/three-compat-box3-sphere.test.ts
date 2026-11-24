@@ -10,7 +10,7 @@ test("Box3.clampPoint and distanceToPoint measure to the nearest point of the bo
   const target = new THREE.Vector3();
   assert.strictEqual(b.clampPoint(new THREE.Vector3(5, -2, 4), target), target);
   assert.deepEqual(target.toArray(), [3, 0, 4]);
-  assert.deepEqual(b.clampPoint(new THREE.Vector3(0, 1, 3)).toArray(), [0, 1, 3]);
+  assert.deepEqual(b.clampPoint(new THREE.Vector3(0, 1, 3), new THREE.Vector3()).toArray(), [0, 1, 3]);
   assert.equal(b.distanceToPoint(new THREE.Vector3(0, 1, 3)), 0);
   assert.equal(b.distanceToPoint(new THREE.Vector3(6, 8, 4)), 5);
   assert.equal(new THREE.Box3().distanceToPoint(new THREE.Vector3()), Infinity);
