@@ -86,7 +86,7 @@ pub struct Prepared {
     pub light_tree: Option<ltree::LightTree>,
     /// Material -> runs of its flattened static triangles (first, end in the traversal order, object): a material
     /// that starts emitting gets emitter entries in place from its runs (live/edits.rs `add_material_emitters`).
-    /// `moving_mats`: the materials of dynamic world-space triangles (`Tables::moving_mats`).
+    /// `moving_mats`: the materials of dynamic world-space triangles and of particle systems (`Tables::moving_mats`).
     pub mat_runs: std::collections::HashMap<u32, Vec<[u32; 3]>>,
     pub moving_mats: std::collections::HashSet<u32>,
     /// The flattened triangles' build indices in traversal order (`Scene::tris` order: positions for new entries).
@@ -107,14 +107,13 @@ pub fn emitter_tri(k: usize, tri_verts: &[[f32; 4]], a: &scene::GpuTriAttr, mate
     }
     let v = |j: usize| Vec3::new(tri_verts[k * 3 + j][0], tri_verts[k * 3 + j][1], tri_verts[k * 3 + j][2]);
     let (e1, e2) = (v(1), v(2));
-    let nominal = a.x[2] > 0.0;
-    let area = if nominal { a.x[2] } else { 0.5 * e1.cross(e2).length() };
+    let area = 0.5 * e1.cross(e2).length();
     if !(area * lum > 0.0) {
         return None;
     }
     let c = v(0) + (e1 + e2) / 3.0;
     let moves = tri_verts[k * 3][3].to_bits() & scene::TRI_DYNAMIC != 0;
-    Some(EmitterTri { tri: k as u32, mat, obj: a.x[1].to_bits(), area, c: c.to_array(), moves, nominal, in_tree: false, inst: NO_INST, part: 0 })
+    Some(EmitterTri { tri: k as u32, mat, obj: a.x[1].to_bits(), area, c: c.to_array(), moves, nominal: false, in_tree: false, inst: NO_INST, part: 0, card: is_card(m) })
 }
 
 /// An emissive triangle of the emitter CDF: triangle (traversal order), material, object, area.
@@ -139,6 +138,12 @@ pub struct EmitterTri {
     /// Its section of that instance's mesh (0 without one): a mesh's triangle does not say which section it is of,
     /// so a light sample is told here, as a ray is by its hit.
     pub part: u32,
+    /// A rect light's card (its material: `scene::MAT_EMITTER_CARD`): it lights its front side alone.
+    pub card: bool,
+}
+
+fn is_card(m: &scene::GpuMaterial) -> bool {
+    m.tex1[2] == scene::MAT_EMITTER_CARD
 }
 
 /// No instance (pathtrace.wgsl `NO_INST`).
@@ -146,13 +151,15 @@ pub const NO_INST: u32 = u32::MAX;
 
 /// `GpuEmitterTri::code`: the emitter moves (`EmitterTri::moves`). Path codes are below it.
 pub const EMITTER_MOVES: u32 = 1 << 31;
+/// `GpuEmitterTri::flags`: a rect light's card (`EmitterTri::card`).
+pub const EMITTER_CARD: u32 = 1;
 const _: () = assert!((ltree::PATH_BITS + 2) << ltree::PATH_BITS <= EMITTER_MOVES);
 
 /// An emitter's triangle as the kernel's light sampling reads it (pathtrace.wgsl `EmitterTri`; `Table::EmitterTris`,
 /// entry i for `emitter_tris[i]`): in world space, the light list's own copy, so a sample reads no placement. v0, e1,
 /// e2 in world space; its triangle in the triangles' table (attributes); the instance that places it (`NO_INST`: the
 /// triangle is in world space there too); where its weight is (`emitter_codes`) with `EMITTER_MOVES`; its section of
-/// that instance's mesh. 64 bytes.
+/// that instance's mesh; `EMITTER_CARD`. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuEmitterTri {
@@ -163,7 +170,8 @@ pub struct GpuEmitterTri {
     pub e2: [f32; 3],
     pub code: u32,
     pub part: u32,
-    pub spare: [u32; 3],
+    pub flags: u32,
+    pub spare: [u32; 2],
 }
 
 impl GpuEmitterTri {
@@ -172,7 +180,7 @@ impl GpuEmitterTri {
         let v = |r: usize| [rows[r][0], rows[r][1], rows[r][2]];
         // (As a hit has it: with an instance its section, without one its row, which is its triangle's.)
         let part = if e.inst == NO_INST { e.tri } else { e.part };
-        GpuEmitterTri { v0: v(0), tri: e.tri, e1: v(1), inst: e.inst, e2: v(2), code: code | if e.moves { EMITTER_MOVES } else { 0 }, part, spare: [0; 3] }
+        GpuEmitterTri { v0: v(0), tri: e.tri, e1: v(1), inst: e.inst, e2: v(2), code: code | if e.moves { EMITTER_MOVES } else { 0 }, part, flags: if e.card { EMITTER_CARD } else { 0 }, spare: [0; 2] }
     }
 
     /// As `new`, from its vertices.
@@ -192,16 +200,19 @@ impl GpuEmitterTri {
 /// `InstMesh::emitters`): one a numbered
 /// triangle, in the numbers' order, each with its triangle as the instance places it. `tris`: the mesh's, in model
 /// space; `first`: its first triangle in the triangles' table; `numbered(k)`: triangle k's number, material and
-/// section, if it emits; `record`: the instance's. A triangle of no area: no weight (area 0). A hidden instance's (an instanced
+/// section, if it emits; `record`: the instance's; `nominal`: the area a triangle is weighed by where the mesh is a
+/// particle system's (`scene::ParticleSystem::emitter_area`, half of it: the pass places the triangle, of whatever
+/// size). A triangle of no area: no weight (area 0). A hidden instance's (an instanced
 /// object's copy not shown) keep their mesh's own area: its object has no power, so they weigh nothing, and the light
 /// tree has them (`switchable_power`) for when the copy is shown.
-pub fn instance_emitters(inst: &scene::Instance, record: u32, tris: &[[glam::Vec3A; 3]], first: u32, numbered: &dyn Fn(usize) -> Option<(usize, u32, u32)>, count: usize, materials: &[scene::GpuMaterial], moves: bool) -> Vec<(EmitterTri, [glam::Vec3A; 3])> {
-    let dead = EmitterTri { tri: first, mat: 0, obj: inst.object, area: 0.0, c: [0.0; 3], moves, nominal: false, in_tree: false, inst: record, part: 0 };
+pub fn instance_emitters(inst: &scene::Instance, record: u32, tris: &[[glam::Vec3A; 3]], first: u32, numbered: &dyn Fn(usize) -> Option<(usize, u32, u32)>, count: usize, materials: &[scene::GpuMaterial], moves: bool, nominal: Option<f32>) -> Vec<(EmitterTri, [glam::Vec3A; 3])> {
+    let dead = EmitterTri { tri: first, mat: 0, obj: inst.object, area: 0.0, c: [0.0; 3], moves, nominal: false, in_tree: false, inst: record, part: 0, card: false };
     let mut out = vec![(dead, [glam::Vec3A::ZERO; 3]); count];
     for (k, t) in tris.iter().enumerate() {
         let Some((slot, mat, part)) = numbered(k) else { continue };
         let (area, c, w) = placed_emitter(inst, t, mat, materials);
-        out[slot] = (EmitterTri { tri: first + k as u32, mat, area, c, part, ..dead }, w);
+        // (A particle system's: weighed by its nominal area, whatever size its pass gives it.)
+        out[slot] = (EmitterTri { tri: first + k as u32, mat, area: nominal.unwrap_or(area), c, part, nominal: nominal.is_some(), card: materials.get(mat as usize).is_some_and(is_card), ..dead }, w);
     }
     out
 }
@@ -390,15 +401,12 @@ pub fn light_order(lights: &[scene::GpuLight]) -> Vec<usize> {
 /// The light groups' table: per group of LIGHT_GROUP local lights (counted from the first local one) the sphere
 /// (centre, radius) holding every point its lights reach. Black lights (off, or hidden: `scene::gpu_light_shown`)
 /// reach nothing and are in no sphere; a group of them alone has radius -1 (no point is in it).
-/// THREERT_LIGHT_GROUPS=0: unbounded spheres, every light tested (A/B).
 pub fn light_groups(lights: &[scene::GpuLight]) -> Vec<[f32; 4]> {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let off = *OFF.get_or_init(|| std::env::var("THREERT_LIGHT_GROUPS").is_ok_and(|v| v == "0"));
     let nd = lights.iter().take_while(|l| l.pos[3] == 0.0).count();
     let mut out = vec![];
     for g in lights[nd..].chunks(LIGHT_GROUP) {
         let lit = |l: &&scene::GpuLight| l.color[..3].iter().any(|c| *c > 0.0);
-        if !off && !g.iter().any(|l| lit(&l)) {
+        if !g.iter().any(|l| lit(&l)) {
             out.push([0.0, 0.0, 0.0, -1.0]);
             continue;
         }
@@ -412,9 +420,6 @@ pub fn light_groups(lights: &[scene::GpuLight]) -> Vec<[f32; 4]> {
         for l in g.iter().filter(lit) {
             let reach = light_reach(l);
             r = if reach == f32::MAX { f32::MAX } else { r.max(c.distance(Vec3::from_slice(&l.pos[..3])) + reach) };
-        }
-        if off {
-            r = f32::MAX;
         }
         // Margin for rounding in the kernel's distance (positions up to a few km).
         if r < f32::MAX {
@@ -668,21 +673,8 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
     let layout = scene::proc_layout(&sc.procs, !hwrt);
     sc.proc_records = sc.procs.iter().zip(&layout.headers).map(|(p, &h)| p.gpu(h)).collect();
     sc.proc_layout = (!sc.procs.is_empty()).then_some(layout);
-    // Translucent particles (hardware RT): after the pool, in no group (only the translucency pass traces them).
-    sc.trans_first = (tri_verts.len() / 3) as u32;
-    if hwrt {
-        for (t, a) in sc.trans_tris.iter().zip(&sc.trans_attrs) {
-            let [a0, b, c] = *t;
-            let (e1, e2): (Vec3A, Vec3A) = (b - a0, c - a0);
-            tri_verts.push([a0.x, a0.y, a0.z, f32::from_bits(0)]);
-            tri_verts.push([e1.x, e1.y, e1.z, 0.0]);
-            tri_verts.push([e2.x, e2.y, e2.z, 0.0]);
-            attrs.push(*a);
-        }
-    }
     sc.attrs = attrs;
-    // Vertex colours (scene.rs `tri_colors`), with the triangles: the flattened ones in traversal order, the pool, the
-    // translucent particles (white).
+    // Vertex colours (scene.rs `tri_colors`), with the triangles: the flattened ones in traversal order, the pool.
     sc.gpu_vcolors = if sc.vcolors.is_empty() && sc.pool_vcolors.is_empty() {
         vec![]
     } else {
@@ -694,24 +686,12 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         v
     };
     // Posed models: where each of their triangles landed (they are re-skinned in place, hardware RT only).
-    if hwrt && (sc.retained.dynamics_mut().next().is_some() || !sc.particles.is_empty() || !sc.gpu_particles.is_empty()) {
+    if hwrt && sc.retained.dynamics_mut().next().is_some() {
         let first_dynamic: usize = groups[..4].iter().sum();
         let finals: std::collections::HashMap<u32, u32> = bvh.order[first_dynamic..].iter().enumerate().map(|(k, &i)| (i, (first_dynamic + k) as u32)).collect();
         for d in sc.retained.dynamics_mut() {
             d.finals = (0..d.mats.len() as u32).map(|j| finals[&(d.first + j)]).collect();
         }
-        // A particle system's triangles stay together (one group, the order within a group is the build order).
-        for ps in sc.particles.iter_mut().filter(|p| !p.translucent) {
-            ps.final_first = finals[&ps.first];
-            debug_assert!((0..ps.count * 2).all(|j| finals[&(ps.first + j)] == ps.final_first + j));
-        }
-        for ps in sc.gpu_particles.iter_mut() {
-            ps.final_first = finals[&ps.first];
-            debug_assert!((0..ps.capacity * 2).all(|j| finals[&(ps.first + j)] == ps.final_first + j));
-        }
-    }
-    for ps in sc.particles.iter_mut().filter(|p| p.translucent) {
-        ps.final_first = sc.trans_first + ps.first;
     }
     timings.push(("bvh_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
 
@@ -730,6 +710,8 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
     // (And the instances hidden at the build, `Instance::masked`: where they stand when they are shown is theirs to
     // bound then, in the light tree's moving subtree.)
     let moving = sc.retained.moving_records();
+    // (The particle systems the lights are sampled by: half a quad's nominal area a triangle.)
+    let nominal: std::collections::HashMap<u32, f32> = sc.particles.iter().map(|p| (p.mesh, p.emitter_area)).chain(sc.gpu_particles.iter().map(|p| (p.mesh, p.emitter_area))).filter(|(_, a)| *a > 0.0).map(|(m, a)| (m, a * 0.5)).collect();
     for r in 0..sc.instances.len() {
         let m = sc.meshes[sc.instances[r].mesh as usize];
         // (With sections: the emitters of its sections whose material emits, a section after another; each one's row
@@ -743,13 +725,14 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         }
         let first = emitter_tris.len() as u32;
         sc.instances[r].first_emitter = first;
+        let area = nominal.get(&sc.instances[r].mesh).copied();
         for (k, start) in starts.iter().enumerate() {
             sc.rows[at + k][2] = start.map_or(scene::NO_EMITTER, |s| first + s);
         }
         let (a, b) = (m.first as usize, (m.first + m.count) as usize);
         let attrs = &sc.attrs[pool_first + a..pool_first + b];
         let numbered = |k: usize| scene::section_slot(&attrs[k], &rows, &starts);
-        for (e, w) in instance_emitters(&sc.instances[r], r as u32, &sc.pool_tris[a..b], (pool_first + a) as u32, &numbered, count as usize, &sc.materials, moving.contains(&(r as u32)) || sc.instances[r].masked) {
+        for (e, w) in instance_emitters(&sc.instances[r], r as u32, &sc.pool_tris[a..b], (pool_first + a) as u32, &numbered, count as usize, &sc.materials, moving.contains(&(r as u32)) || sc.instances[r].masked || area.is_some(), area) {
             gpu_emitter_tris.push(GpuEmitterTri::of(&e, w, 0));
             emitter_tris.push(e);
         }
@@ -772,6 +755,11 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
             Some(r) if r[1] == k as u32 && r[2] == obj => r[1] += 1,
             _ => runs.push([k as u32, k as u32 + 1, obj]),
         }
+    }
+    // (Nor a particle system's material: its triangles are its pass's.)
+    // (Not a translucent system's, which has no emitter and no class: its material's function changes in place.)
+    for i in sc.instances.iter().filter(|i| i.bits & scene::INST_PARTICLES != 0 && !i.hidden) {
+        moving_mats.insert(scene::row_material(&sc.rows[i.rows as usize]));
     }
     let tri_order = bvh.order[..pool_first.min(bvh.order.len())].to_vec();
     // Many static emitters: a light tree samples them by importance at the shading point (`ltree`); each one's path
@@ -860,7 +848,7 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         fog_color: [0.0; 4],
         vol: [0.0; 4],
         vol2: [0.0; 4],
-        raster: [0.0; 4],
+        jitter: [0.0; 4],
         cache: [0.0; 4],
         // (z, w: software traversal's units: the top tree's root and their count, as bits; trace_units.wgsl. y is
         // `render --signals`'.)
@@ -929,8 +917,6 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
         sc.gpu_instances[r].n[2][3] = f32::from_bits(i.prev);
     }
     params.word_first[1][2] = sc.indexed.dynamic.0;
-    // (Hardware traversal: the translucent particles' rows follow the world-space triangles'.)
-    params.word_first[1][3] = sc.indexed.pool_first;
     Prepared { tri_verts, groups, nodes, emitters, gpu_emitter_tris, emitter_runs, env, env_cdf, params, energy, emitter_tris, light_tree, env_nee_floor, mat_runs, moving_mats, tri_order }
 }
 
@@ -953,6 +939,8 @@ fn index_geometry(sc: &scene::Scene, order: &[u32], tri_verts: &[[f32; 4]], grou
     let source_of: std::collections::HashMap<u32, u32> = sc.retained.skinned.iter().filter(|k| k.mesh != u32::MAX).map(|k| (k.mesh, k.source)).collect();
     let mut meshes: Vec<usize> = (0..sc.meshes.len()).filter(|&m| sc.meshes[m].count > 0).collect();
     meshes.sort_by_key(|&m| sc.meshes[m].first);
+    // (A particle system's mesh: quads the pass writes.)
+    let quads: std::collections::HashSet<u32> = sc.particles.iter().map(|p| p.mesh).chain(sc.gpu_particles.iter().map(|p| p.mesh)).collect();
     // (A skinned mesh with its source: the model's vertices are found with its first mesh.)
     let scopes: Vec<(indexed::Scope, Option<u32>)> = meshes
         .par_iter()
@@ -962,6 +950,7 @@ fn index_geometry(sc: &scene::Scene, order: &[u32], tri_verts: &[[f32; 4]], grou
             let (tris, attrs) = (&sc.pool_tris[r.clone()], &sc.attrs[pool_first + r.start..pool_first + r.end]);
             match source_of.get(&(m as u32)).copied().filter(|&s| im.deforms && sc.skin_sources[s as usize].len() == tris.len()) {
                 Some(s) => (indexed::shared_skinned(&sc.skin_sources[s as usize], tris, attrs), Some(s)),
+                None if quads.contains(&(m as u32)) => (indexed::quads(tris, attrs), None),
                 None => (indexed::shared(tris, attrs), None),
             }
         })
@@ -985,13 +974,6 @@ fn index_geometry(sc: &scene::Scene, order: &[u32], tri_verts: &[[f32; 4]], grou
     // The triangle of a still tree over nothing: without area.
     if no_still {
         out.indices.push([0; 3]);
-    }
-    // The translucent particles' (what `tri_verts` has after the pool: under hardware traversal).
-    if out.indices.len() < sc.attrs.len() {
-        let first = out.indices.len();
-        out.translucent = out.vertices.len() as u32;
-        out.translucent_tris = (first as u32, sc.trans_tris.len() as u32);
-        out.push(indexed::apart(&sc.trans_tris, &sc.attrs[first..]), out.translucent);
     }
     assert_eq!((out.indices.len(), tri_verts.len()), (sc.attrs.len(), sc.attrs.len() * 3), "a row of indices a triangle");
     // A row a triangle. One no instance places: its material, its object, its flags, its emitter + 1. A mesh's: its
@@ -1252,45 +1234,167 @@ pub fn sky_sampled(brightest: f32, floor: f32, has_env: bool) -> bool {
     brightest >= floor && (!has_env || env_nee_on())
 }
 
-/// UE GGXEnergyLookup equivalent: E.x = integral of D*Vis*NoL (F = 1), E.y = same weighted by (1-VoH)^5.
-pub fn energy_lut() -> Vec<[f32; 4]> {
-    let n = 32usize;
-    let mut vals = vec![[0f32; 2]; n * n];
-    for ry in 0..n {
-        let roughness = (ry as f32 / (n - 1) as f32).max(0.02);
-        let a = roughness * roughness;
-        let a2 = a * a;
-        for vx in 0..n {
-            let nov = (vx as f32 / (n - 1) as f32).max(1e-3);
-            let v = Vec3::new((1.0 - nov * nov).sqrt(), 0.0, nov);
-            let (mut ex, mut ey) = (0.0f64, 0.0f64);
-            let samples = 1024;
-            for i in 0..samples {
-                // Hammersley + GGX NDF sampling of H.
-                let u1 = (i as f32 + 0.5) / samples as f32;
-                let u2 = (i as u32).reverse_bits() as f32 / 4294967296.0;
-                let phi = 2.0 * std::f32::consts::PI * u2;
-                let cos_t = ((1.0 - u1) / (1.0 + (a2 - 1.0) * u1)).sqrt();
-                let sin_t = (1.0 - cos_t * cos_t).sqrt();
-                let hv = Vec3::new(sin_t * phi.cos(), sin_t * phi.sin(), cos_t);
-                let l = 2.0 * v.dot(hv) * hv - v;
-                let (nol, noh, voh) = (l.z, hv.z, v.dot(hv));
-                if nol > 0.0 && voh > 0.0 {
-                    let av = a;
-                    let vis_v = nol * (nov * (1.0 - av) + av);
-                    let vis_l = nov * (nol * (1.0 - av) + av);
-                    let vis = 0.5 / (vis_v + vis_l);
-                    // pdf_L = D * NoH / (4 VoH)  =>  D*Vis*NoL / pdf = Vis * NoL * 4 VoH / NoH
-                    let est = (vis * nol * 4.0 * voh / noh) as f64;
-                    let fc = (1.0 - voh).powi(5) as f64;
-                    ex += est;
-                    ey += est * fc;
-                }
+/// The energy table's nodes (pathtrace.wgsl `ENERGY_N`): along a row sqrt(cos(view)) from 0 to 1 (the albedo changes
+/// fastest at grazing views, where a table over the cosine itself is 20 times further off), over the rows the
+/// roughness from 0 to 1.
+pub const ENERGY_N: usize = 32;
+
+/// The specular lobe's directional albedo toward a view at cosine `mu`, for `alpha` = roughness^2, as the two terms of
+/// Karis's split sum ("Real Shading in Unreal Engine 4", SIGGRAPH 2013 course notes, "Environment BRDF"): with
+/// Schlick's Fresnel F = f0 + (f90 - f0) (1 - v.h)^5 the lobe reflects f0 x `.0` + f90 x `.1` of a uniform white
+/// surround, and `.0 + .1` at F = 1 (E(mu) of Kulla & Conty 2017). The lobe is the kernel's, single scattering: GGX D
+/// (Walter et al. 2007) with the square-root-free height-correlated Smith visibility (`vis_smith_joint_approx`:
+/// Hammon 2017).
+/// The integral is taken over visible normals (Heitz, "Sampling the GGX Distribution of Visible Normals", JCGT 2018):
+/// a light direction mirrored off a visible normal has density G1(v) D / (4 n.v), so the lobe's value x cosine over
+/// it is F x (V 4 n.v n.l) / G1(v), bounded. Midpoint rule over the unit disk the normals are drawn from, `nr` rings
+/// x 2 `nphi` angles (half of them computed: the lobe is symmetric about the plane of incidence). The rings crowd
+/// toward the rim (u = 1 - (1 - t)^2), where the normals tilt far and the reflected ray nears the horizon: the
+/// approximate visibility falls to 0 there over a range of n.l about alpha wide, which even rings miss (48 x 16
+/// points: 1.6e-4 from the converged value; 24 x 24 even ones: 9e-3).
+pub fn specular_albedo(mu: f64, alpha: f64, nr: usize, nphi: usize) -> (f64, f64) {
+    let mu = mu.clamp(1e-4, 1.0);
+    if alpha < 1e-6 {
+        // A mirror: the half vector is the normal.
+        let fc = (1.0 - mu).powi(5);
+        return (1.0 - fc, fc);
+    }
+    // The view direction (in the x-z plane, n = +z) in the space where the visible normals' hemisphere is a half ball
+    // (Heitz 2018, section 3); the basis around it is t1 = +y, t2 = (-vh.z, 0, vh.x).
+    let (vx, vz) = ((1.0 - mu * mu).max(0.0).sqrt(), mu);
+    let k = (alpha * alpha * vx * vx + vz * vz).sqrt();
+    let (hx, hz) = (alpha * vx / k, vz / k);
+    let s = 0.5 * (1.0 + hz);
+    // 1 / G1(v) = 1 + Lambda(v) (Heitz 2014, "Understanding the Masking-Shadowing Function", GGX's Lambda).
+    let inv_g1 = 0.5 * (1.0 + (1.0 + alpha * alpha * (1.0 - mu * mu) / (mu * mu)).sqrt());
+    let (mut a, mut b) = (0.0, 0.0);
+    for i in 0..nr {
+        let t = (i as f64 + 0.5) / nr as f64;
+        let (r, w) = ((1.0 - (1.0 - t) * (1.0 - t)).sqrt(), 2.0 * (1.0 - t));
+        for j in 0..nphi {
+            let phi = std::f64::consts::PI * ((j as f64 + 0.5) / nphi as f64 - 0.5);
+            let p1 = r * phi.cos();
+            let p2 = (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt() + s * r * phi.sin();
+            let pz = (1.0 - p1 * p1 - p2 * p2).max(0.0).sqrt();
+            // The visible normal, stretched back.
+            let m = [alpha * (pz * hx - p2 * hz), alpha * p1, (p2 * hx + pz * hz).max(0.0)];
+            let len = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+            let voh = (vx * m[0] + vz * m[2]) / len;
+            let nol = 2.0 * voh * m[2] / len - vz;
+            if nol <= 0.0 || voh <= 0.0 {
+                continue;
             }
-            vals[ry * n + vx] = [(ex / samples as f64).min(1.0) as f32, (ey / samples as f64) as f32];
+            // V x 4 n.v n.l, V = 0.5 / (n.l (n.v (1 - alpha) + alpha) + n.v (n.l (1 - alpha) + alpha)): the kernel's
+            // 0.5 / mix(2 n.l n.v, n.l + n.v, alpha).
+            let g2 = 2.0 * mu * nol / (nol * (mu * (1.0 - alpha) + alpha) + mu * (nol * (1.0 - alpha) + alpha));
+            let fc = (1.0 - voh).powi(5);
+            a += w * (1.0 - fc) * g2;
+            b += w * fc * g2;
         }
     }
-    vals.chunks(2).map(|c| [c[0][0], c[0][1], c[1][0], c[1][1]]).collect()
+    let k = inv_g1 / (nr * nphi) as f64;
+    (a * k, b * k)
+}
+
+/// The table pathtrace.wgsl's `energy_lookup` reads (`heap::Table::Energy`): `specular_albedo` at `ENERGY_N` x
+/// `ENERGY_N` nodes, node (ix, iy) at cos(view) (ix / 31)^2 and roughness iy / 31, row after row, two nodes (four
+/// numbers) a vec4. Computed once a process (about 10 ms).
+pub fn energy_lut() -> Vec<[f32; 4]> {
+    static LUT: std::sync::OnceLock<Vec<[f32; 4]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let n = ENERGY_N;
+        let mut vals = Vec::with_capacity(2 * n * n);
+        for iy in 0..n {
+            let r = iy as f64 / (n - 1) as f64;
+            for ix in 0..n {
+                let x = ix as f64 / (n - 1) as f64;
+                let (a, b) = specular_albedo(x * x, r * r, 48, 8);
+                vals.extend([a as f32, b as f32]);
+            }
+        }
+        vals.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    })
+    .clone()
+}
+
+#[cfg(test)]
+mod energy_tests {
+    use super::*;
+
+    /// The kernel's `energy_lookup`: the table between its nodes.
+    fn lookup(lut: &[[f32; 4]], roughness: f64, mu: f64) -> (f64, f64) {
+        let n = ENERGY_N;
+        let node = |i: usize| (lut[i / 2][2 * (i % 2)] as f64, lut[i / 2][2 * (i % 2) + 1] as f64);
+        let (x, y) = (mu.clamp(0.0, 1.0).sqrt() * (n - 1) as f64, roughness.clamp(0.0, 1.0) * (n - 1) as f64);
+        let (x0, y0) = ((x as usize).min(n - 2), (y as usize).min(n - 2));
+        let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+        let mix = |p: (f64, f64), q: (f64, f64), t: f64| (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t);
+        let i = y0 * n + x0;
+        mix(mix(node(i), node(i + 1), fx), mix(node(i + n), node(i + n + 1), fx), fy)
+    }
+
+    /// The lobe's value x cosine integrated over the hemisphere of light directions at F = 1 (`n` x 2 `n` points,
+    /// midpoint rule over theta and half the azimuth): what the kernel's light samples sum. The table's estimator is
+    /// its sampling.
+    fn quadrature(mu: f64, alpha: f64, n: usize) -> f64 {
+        let a2 = alpha * alpha;
+        let v = [(1.0 - mu * mu).sqrt(), mu];
+        let mut sum = 0.0;
+        for i in 0..n {
+            let (st, c) = (std::f64::consts::FRAC_PI_2 * (i as f64 + 0.5) / n as f64).sin_cos();
+            for j in 0..2 * n {
+                let phi = std::f64::consts::PI * (j as f64 + 0.5) / (2 * n) as f64;
+                let (x, z) = (st * phi.cos(), st * phi.sin());
+                let h = [v[0] + x, v[1] + c, z];
+                let noh = h[1] / (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
+                let d = (noh * a2 - noh) * noh + 1.0;
+                let vis = 0.5 / (c * (mu * (1.0 - alpha) + alpha) + mu * (c * (1.0 - alpha) + alpha));
+                sum += a2 / (std::f64::consts::PI * d * d) * vis * c * st;
+            }
+        }
+        sum * std::f64::consts::PI * std::f64::consts::PI / (2 * n * n) as f64
+    }
+
+    #[test]
+    fn the_albedo_is_the_lobes_integral() {
+        for (r, mu) in [(0.3, 0.9), (0.5, 0.7071), (0.5, 0.2), (0.8, 0.5), (1.0, 1.0), (1.0, 0.1), (0.25, 0.4)] {
+            let ((a, b), q) = (specular_albedo(mu, r * r, 48, 8), quadrature(mu, r * r, 800));
+            eprintln!("roughness {r}, cos {mu}: {a:.4} + {b:.4} = {:.4}; quadrature {q:.4}", a + b);
+            assert!((a + b - q).abs() < 1e-3, "roughness {r}, cos {mu}: {:.4} for {q:.4}", a + b);
+        }
+        // A mirror reflects everything, by Fresnel at the view's angle; a smooth lobe nearly so.
+        let (a, b) = specular_albedo(0.5, 0.0, 48, 8);
+        assert!((a + b - 1.0).abs() < 1e-12 && (b - 0.5f64.powi(5)).abs() < 1e-12);
+        let (a, b) = specular_albedo(0.5, 0.02 * 0.02, 48, 8);
+        assert!((a + b - 1.0).abs() < 2e-3 && (b - 0.5f64.powi(5)).abs() < 2e-3, "{a} {b}");
+    }
+
+    #[test]
+    fn the_table_follows_the_albedo_between_its_nodes() {
+        let t = std::time::Instant::now();
+        let lut = energy_lut();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(lut.len(), 512);
+        assert!(lut.iter().flatten().all(|e| (0.0..=1.0 + 1e-4).contains(e)));
+        // Between the nodes, at the kernel's roughnesses (0.02 and up) and all but the last half degree of grazing
+        // views (below it a smooth lobe's albedo falls from 1 to a half within a cosine of alpha: no table follows).
+        let (mut worst, mut at, mut sum) = (0.0f64, (0.0, 0.0), 0.0);
+        for iy in 0..48 {
+            let r = 0.02 + 0.98 * (iy as f64 + 0.37) / 48.0;
+            for ix in 0..48 {
+                let mu = 0.01 + 0.99 * (ix as f64 + 0.61) / 48.0;
+                let ((a, b), (ta, tb)) = (specular_albedo(mu, r * r, 96, 12), lookup(&lut, r, mu));
+                let e = (ta - a).abs().max((tb - b).abs()).max((ta + tb - a - b).abs() / (a + b));
+                sum += e / (48.0 * 48.0);
+                if e > worst {
+                    (worst, at) = (e, (r, mu));
+                }
+            }
+        }
+        eprintln!("energy table: {ms:.1} ms; error between nodes: mean {sum:.5}, worst {worst:.5} at roughness {:.3}, cos {:.3}", at.0, at.1);
+        assert!(worst < 0.02 && sum < 0.002, "{worst} at {at:?}, mean {sum}");
+        assert!(cfg!(debug_assertions) || ms < 50.0, "{ms} ms");
+    }
 }
 
 /// The glass energy table's nodes (pathtrace.wgsl GLASS_E_MU, _ROUGH, _IOR): cos(view) as its square root, roughness,
@@ -1543,7 +1647,7 @@ mod light_lod_tests {
         // the one a load with all of them on builds: the plain build's, its powers summed bottom-up.
         let mats = [scene::GpuMaterial { emissive: [1.0, 1.0, 1.0, 0.0], ..Default::default() }];
         let tris: Vec<EmitterTri> = (0..600u32)
-            .map(|i| EmitterTri { tri: i, mat: 0, obj: (i % 6 != 0) as u32, area: 0.5, c: [2.0 * i as f32 + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: NO_INST, part: 0 })
+            .map(|i| EmitterTri { tri: i, mat: 0, obj: (i % 6 != 0) as u32, area: 0.5, c: [2.0 * i as f32 + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: NO_INST, part: 0, card: false })
             .collect();
         let verts: Vec<[f32; 4]> = (0..600).flat_map(|i| [[2.0 * i as f32, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]).collect();
         let (off, on) = ([[0.0, 0.0, 0.0, 1.0], [0.0; 4]], [[0.0, 0.0, 0.0, 1.0]; 2]);
@@ -1576,7 +1680,7 @@ mod light_lod_tests {
         let mut unit = || (rnd() >> 8) as f32 / (1 << 24) as f32;
         let mats: Vec<scene::GpuMaterial> = (0..4).map(|k| scene::GpuMaterial { emissive: [k as f32 * 3.0, k as f32, 0.5 * k as f32, 0.0], ..Default::default() }).collect();
         let tris: Vec<EmitterTri> = (0..3000)
-            .map(|i| EmitterTri { tri: i, mat: if i % 9 == 0 { 0 } else { 1 + i % 3 }, obj: 0, area: 10f32.powf(-6.0 * unit()), c: [300.0 * unit(), 5.0, 100.0 * unit()], moves: i % 50 == 0, nominal: false, in_tree: false, inst: NO_INST, part: 0 })
+            .map(|i| EmitterTri { tri: i, mat: if i % 9 == 0 { 0 } else { 1 + i % 3 }, obj: 0, area: 10f32.powf(-6.0 * unit()), c: [300.0 * unit(), 5.0, 100.0 * unit()], moves: i % 50 == 0, nominal: false, in_tree: false, inst: NO_INST, part: 0, card: false })
             .collect();
         let (t, total, _) = emitter_cdf(&tris, &emitter_order(&tris, None), &mats, &[], 3, [20.0, 0.0, 30.0, 10.0], EmitterCull::default());
         let n = tris.len() as u32;
@@ -1697,9 +1801,9 @@ mod units_tests {
     use crate::world::{Geometry, Kind, World};
     use glam::{Mat4, Quat};
 
-    /// A world with a ground and a light's card (the card's two triangles are the only still ones: a mesh is a unit
-    /// under software traversal), meshes turned and scaled, one that casts no shadow, one hidden, and an instanced mesh
-    /// of five instances of which four are drawn.
+    /// A world with a ground and a light's card (an instance each, as every mesh: units under software traversal, and
+    /// no still triangle), meshes turned and scaled, one that casts no shadow, one hidden, and an instanced mesh of
+    /// five instances of which four are drawn.
     fn world(ground: bool) -> World {
         let mut w = World::default();
         w.set_material(1, serde_json::from_value(serde_json::json!({ "name": "m", "color": [0.5, 0.5, 0.5], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true })).unwrap());
@@ -1781,13 +1885,18 @@ mod units_tests {
             let x = &sc.indexed;
             assert_eq!((x.indices.len(), x.rows.len()), (sc.attrs.len(), sc.attrs.len()), "{what}");
             // (A pool triangle's mesh: its vertices count from the mesh's first.)
-            let pool_first = sc.attrs.len() - sc.pool_tris.len() - sc.trans_tris.len() * usize::from(hwrt) - usize::from(sc.units.is_some() && sc.tris.is_empty());
+            let pool_first = sc.attrs.len() - sc.pool_tris.len() - usize::from(sc.units.is_some() && sc.tris.is_empty());
             let base = |k: usize| sc.meshes.iter().zip(&x.meshes).find(|(m, _)| m.count > 0 && (pool_first + m.first as usize..pool_first + (m.first + m.count) as usize).contains(&k)).map_or(0, |(_, v)| v.0);
             let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
             for (k, a) in sc.attrs.iter().enumerate() {
                 let (q, n, uv, tangent) = x.triangle(k, base(k));
                 let v = |r: usize| [p.tri_verts[k * 3 + r][0], p.tri_verts[k * 3 + r][1], p.tri_verts[k * 3 + r][2]];
                 let edge = |c: usize| [q[c][0] - q[0][0], q[c][1] - q[0][1], q[c][2] - q[0][2]];
+                // (The triangle of a still tree over nothing, after the pool: without area either way.)
+                if sc.units.is_some() && sc.tris.is_empty() && k + 1 == sc.attrs.len() {
+                    assert_eq!((edge(1), edge(2), v(1), v(2)), ([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]), "{what}: the still tree's own triangle has no area");
+                    continue;
+                }
                 assert_eq!((bits(&q[0]), bits(&edge(1)), bits(&edge(2))), (bits(&v(0)), bits(&v(1)), bits(&v(2))), "{what}: triangle {k}'s first corner and its edges");
                 let skinned_without_normals = n.iter().flatten().all(|c| *c == 0.0);
                 if !skinned_without_normals {
@@ -1822,6 +1931,93 @@ mod units_tests {
             let corners = sc.meshes.iter().find(|m| m.deforms).unwrap().count * 3;
             assert!(skinned[0].1 == skinned[1].1 && skinned[0].1 < corners && skinned[0].1 >= corners / 6, "{what}: {} vertices for {corners} corners", skinned[0].1);
             assert_eq!((x.dynamic.0, x.dynamic.1), (skinned[0].0.min(skinned[1].0), skinned[0].1 * 2), "{what}: the vertices that move are the skinned meshes'");
+        }
+    }
+
+    /// An opaque particle system is a mesh of its own and one instance of it: two triangles and four vertices a
+    /// particle (a quad's corners once each, in the order the pass writes them), among the vertices that move; the
+    /// instance places nothing and has the system's first object. One the lights are not sampled by has a row that
+    /// keeps its material's emission out of the light list; one they are sampled by has an emitter a triangle, its
+    /// instance's, weighed by half the particle's nominal area. Stateless and stateful systems alike. A translucent
+    /// system's instance is hidden from the scene's acceleration structure (the translucency pass has it). An
+    /// opaque particle system's material is not one whose emitters an edit makes in place. Under software traversal (the passes do
+    /// not run there) no kernel asks for a particle's object. No GPU.
+    #[test]
+    fn a_particle_system_is_a_mesh_of_quads_and_an_instance() {
+        let mut w = world(true);
+        w.set_material(7, serde_json::from_value(serde_json::json!({ "name": "spark", "color": [0, 0, 0], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [1, 0.5, 0.2], "emissiveIntensity": 20, "doubleSided": true })).unwrap());
+        w.set_particle_fn("rise", "fn pf_rise(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(i.pivot + vec3<f32>(f32(i.index), i.time, 0.0), vec3<f32>(0.1, 0.0, 0.0), vec3<f32>(0.0, 0.1, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+        for (id, count, emitter_area) in [(40, 3, 0.0), (41, 2, 0.09)] {
+            w.set_object(id, format!("sparks{id}"), None, Kind::Particles { count, emitter: "rise".into(), params: vec![], material: 7, emitter_area }, true, false).unwrap();
+            w.set_transform(id, Vec3::new(0.3, 0.2, 1.0), Quat::IDENTITY, Vec3::ONE).unwrap();
+        }
+        // (A translucent system, of a transparent material.)
+        w.set_material(8, serde_json::from_value(serde_json::json!({ "name": "smoke", "color": [0.5, 0.5, 0.5], "opacity": 0.5, "transparent": true, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true })).unwrap());
+        w.set_object(44, "smoke".into(), None, Kind::Particles { count: 2, emitter: "rise".into(), params: vec![], material: 8, emitter_area: 0.0 }, true, false).unwrap();
+        // (Stateful systems too: one of each kind.)
+        w.set_particle_program("puff", "fn pe_puff(i: EIn, p: array<vec4<f32>, 8>) -> PState { return PState(i.pivot, vec3<f32>(0.0), 0.0, 1.0, vec4<f32>(1.0), 0.1); }".into(), "fn pu_puff(s: PState, i: UIn, p: array<vec4<f32>, 8>) -> PState { return s; }".into(), String::new());
+        for (id, capacity, emitter_area) in [(42, 5, 0.0), (43, 1, 0.04)] {
+            w.set_object(id, format!("puffs{id}"), None, Kind::GpuParticles { capacity, program: "puff".into(), params: vec![], material: 7, emitter_area, rate: 1.0, collide: Default::default() }, true, false).unwrap();
+        }
+        for (what, hwrt, units) in [("units", false, true), ("hardware traversal", true, false)] {
+            let mut sc = scene::build(&w, std::path::Path::new(".."), &default_presets_dir(), None).unwrap();
+            let p = prepare_as(hwrt, units, &mut sc, &mut vec![]);
+            let (own, sampled) = (&sc.particles[0], &sc.particles[1]);
+            let (stateful, stateful_sampled) = (&sc.gpu_particles[0], &sc.gpu_particles[1]);
+            assert_eq!((stateful.capacity, stateful_sampled.capacity), (5, 1), "{what}: the stateful systems, as the stateless");
+            assert!(sc.instances.iter().filter(|i| i.bits & scene::INST_PARTICLES != 0).count() == 5 && sc.tri_flags.iter().all(|f| f & scene::TRI_DYNAMIC == 0), "{what}: five systems, an instance each, none a world-space triangle");
+            assert!(p.moving_mats.contains(&sc.retained.materials[&7]), "{what}: the particles' material is its passes'");
+            assert_eq!((own.count, sampled.count), (3, 2));
+            let part = gpu::instance_features(&sc) & gpu::F_PART;
+            if !hwrt {
+                assert_eq!(part, 0, "{what}: no kernel asks for a particle's object");
+                continue;
+            }
+            assert_ne!(part, 0, "{what}: the kernel asks for a particle's object");
+            let (m, v) = (sc.meshes[own.mesh as usize], sc.indexed.meshes[own.mesh as usize]);
+            assert_eq!((m.count, m.deforms, m.sect_count, v.1), (6, true, 1, 12), "{what}: two triangles and four vertices a particle");
+            let pool_first = sc.attrs.len() - sc.pool_tris.len();
+            let tris = &sc.indexed.indices[pool_first + m.first as usize..][..6];
+            assert_eq!(tris, [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11]], "{what}: a quad's corners once each");
+            let uv = |k: u32| [sc.indexed.vertices[(v.0 + k) as usize][0][3], sc.indexed.vertices[(v.0 + k) as usize][1][3]];
+            assert_eq!([uv(4), uv(5), uv(6), uv(7)], [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]], "{what}: in the order the pass writes them");
+            assert!(v.0 >= sc.indexed.dynamic.0 && v.0 + v.1 <= sc.indexed.dynamic.0 + sc.indexed.dynamic.1, "{what}: among the vertices that move");
+            let of: Vec<&scene::Instance> = sc.instances.iter().filter(|i| i.mesh == own.mesh).collect();
+            assert_eq!(of.len(), 1, "{what}: one instance");
+            let i = of[0];
+            assert_eq!((i.world, i.object, i.bits & scene::INST_PARTICLES, i.prev), (glam::Mat4::IDENTITY, own.object, scene::INST_PARTICLES, v.0 - sc.indexed.dynamic.0), "{what}: it places nothing; the first particle's object; where its previous positions are");
+            let row = sc.rows[i.rows as usize];
+            assert_eq!((row[2], row[3]), (scene::NO_EMITTER, scene::ROW_UNSAMPLED), "{what}: its emission is not in the light list");
+            assert!(p.emitter_tris.iter().all(|e| e.inst == NO_INST || sc.instances[e.inst as usize].mesh != own.mesh), "{what}: no emitter of it");
+            // The stateful system: a mesh of five quads after the first's, its own instance and objects.
+            let (m2, v2) = (sc.meshes[stateful.mesh as usize], sc.indexed.meshes[stateful.mesh as usize]);
+            assert_eq!((m2.count, m2.deforms, v2.1), (10, true, 20), "{what}: the stateful system's quads");
+            let i2 = sc.instances.iter().find(|i| i.mesh == stateful.mesh).expect("its instance");
+            assert_eq!((i2.object, i2.bits & scene::INST_PARTICLES), (stateful.object, scene::INST_PARTICLES), "{what}: its first particle's object");
+            assert!(stateful.object >= own.object + 3 || own.object >= stateful.object + 5, "{what}: the systems' objects apart");
+            // The ones the lights are sampled by: an emitter a triangle, the instance's, from its row's first on, in
+            // the triangles' order, weighed by half the particle's nominal area.
+            for (mesh, count, area) in [(sampled.mesh, 2u32, 0.045f32), (stateful_sampled.mesh, 1, 0.02)] {
+                let r = sc.instances.iter().position(|i| i.mesh == mesh).expect("its instance");
+                let (i, m) = (&sc.instances[r], sc.meshes[mesh as usize]);
+                let row = sc.rows[i.rows as usize];
+                assert_eq!((row[2], row[3], i.bits & scene::INST_PARTICLES), (i.first_emitter, 0, scene::INST_PARTICLES), "{what}: its row has its first emitter");
+                let mine = &p.emitter_tris[row[2] as usize..][..(count * 2) as usize];
+                for (k, e) in mine.iter().enumerate() {
+                    assert_eq!((e.inst, e.part, e.tri, e.nominal, e.moves, e.area, e.obj), (r as u32, 0, (pool_first as u32 + m.first) + k as u32, true, true, area, i.object), "{what}: emitter {k} of the system");
+                }
+                assert_eq!(p.emitter_runs.particles.iter().filter(|run| run[0] <= row[2] && row[2] + count * 2 <= run[0] + run[1]).count(), 1, "{what}: its emitters are taken again from its vertices every frame");
+            }
+            assert_eq!(p.emitter_tris.iter().filter(|e| e.nominal).count(), 6, "{what}: no other emitter by a nominal area");
+            // The translucent system: a mesh and an instance too, the instance out of the scene's acceleration
+            // structure (the translucency pass has it); no world-space translucent triangle; its material is the
+            // translucency pass's, and one an edit may change in place.
+            let smoke = &sc.particles[2];
+            let i3 = sc.instances.iter().find(|i| i.mesh == smoke.mesh).expect("its instance");
+            assert!(smoke.translucent && i3.hidden && i3.bits & scene::INST_PARTICLES != 0 && sc.rows[i3.rows as usize][3] == scene::ROW_UNSAMPLED, "{what}: the translucent system's instance");
+            assert_eq!((sc.meshes[smoke.mesh as usize].count, i3.object), (4, smoke.object), "{what}: its quads are its mesh's");
+            assert_eq!((sc.translucent_mats(), p.moving_mats.contains(&sc.retained.materials[&8])), (vec![sc.retained.materials[&8]], false), "{what}: its material");
+            assert!(sc.instances.iter().filter(|i| i.bits & scene::INST_PARTICLES != 0 && i.mesh != smoke.mesh).all(|i| !i.hidden), "{what}: the opaque systems' instances are the scene's");
         }
     }
 
@@ -1875,12 +2071,13 @@ mod units_tests {
         };
         let (su, pu) = build(true);
         let (sf, pf) = build(false);
-        let ground = usize::from(w.objects.contains_key(&10));
-        assert_eq!(su.tris.len(), 2 * ground, "still triangles: the card's only");
+        // (The ground and the light's card come together: `world`.)
+        let ground = 2 * usize::from(w.objects.contains_key(&10));
+        assert_eq!(su.tris.len(), 0, "no still triangle: the card is an instance too");
         let u = su.units.as_ref().expect("the scene has units");
         assert!(sf.units.is_none() && sf.instances.is_empty(), "flattened: no instance is left");
-        // Ten instances and the ground: four meshes shown, one hidden (an instance no ray sees), five of the instanced
-        // mesh of which one is hidden: eight units in the top tree, and the ground.
+        // Ten instances, the ground and the card: four meshes shown, one hidden (an instance no ray sees), five of the
+        // instanced mesh of which one is hidden: eight units in the top tree, the ground and the card.
         assert_eq!((su.instances.len(), u.count as usize), (10 + ground, 8 + ground), "{:?}", su.instances.iter().map(|i| (i.name.clone(), i.hidden)).collect::<Vec<_>>());
         assert!(gpu::instance_features(&su) & gpu::F_UNITS != 0 && gpu::instance_features(&sf) & gpu::F_UNITS == 0);
         assert_eq!((pu.params.motion[2].to_bits(), pu.params.motion[3].to_bits() as usize), (u.layout.top_first, 8 + ground));

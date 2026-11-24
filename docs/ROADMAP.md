@@ -1,5 +1,11 @@
 # Roadmap
 
+> **Provenance note (2026-11-24).** This file is a log. Entries before that date describe earlier implementations of the
+> post chain, the specular temporal pass, the diffuse history rules, the BSDF's energy terms, the atmosphere and the fog
+> volume, which have since been replaced by implementations written from public sources
+> ([PROVENANCE.md](PROVENANCE.md)). Where an entry names another engine's or SDK's internals, it records how that
+> earlier code came about, not how the present code works; do not implement from such entries.
+
 ## Goal
 
 ThreeRT's goal is AAA real-time game rendering: on consumer GPUs (Apple M series first), dynamic, open-world-scale game
@@ -10,6 +16,14 @@ Every new scene or feature maps to a capability in this goal that has not been p
 No demos that repeat what is already proven.
 
 ## Direction
+
+Direction of 2026-11-25 (the user's, relayed by the supervisor, who rewrites the roadmap by it): the look comes
+first, judged by eye. A day flight recorded after 6a–6c showed no visible gain: the work had been held to "no
+regression" (ΔE / SSIM, frame time), so it added correct but small detail (streaks 3 mm off a wall, hoods seen at
+ΔE 0.07) that the live view's resolution and denoiser erase. The user wants the street level close to a photograph's
+quality soon. So a look item is done only when the Golden Gai pose, as the live view shows it, reads clearly better
+before / after, beside photographs of the place; order: shopfront windows and glass, Golden Gai's mass, the ground,
+the city's edge, then Shibuya. Tone mapping and exposure are left alone for now (the user's call).
 
 Direction of 2026-11-24 (the user's, relayed by the supervisor, who rewrites the roadmap by it): § 0's order changes.
 The streamed city lives in its own repository, [threert/TokyoRT](https://github.com/threert/TokyoRT) (this engine as
@@ -542,10 +556,30 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
     - (3) popping between levels (step 2's "streaming invisible"): first the levels agree (colour, material and outline
         of the same building far, mid and near: the far level's dark Tochō against the mid level's light curtain wall),
         then a dithered transition for the ~140 m swap; ΔE across a swap at fixed poses;
-    - (4) step 6a–6d below, in that order;
+        - the dithered transition is deferred (2026-11-24, the supervisor's call on the data): the 140 m swap shows no
+          flicker. Fixed poses offline ΔE 0.00; live, frame by frame through a swap, worst 0.50 / 0.55 against a single
+          frame's noise of 0.44 / 0.47; the tour in lockstep with and without the swap (L0 to 280 m), every 15th frame,
+          at most 0.39 against two runs of the same build's 0.14–0.26 (TokyoRT `tools/quality.ts --swap`). Taken up
+          again if a recording shows a 140 m flicker (replayed in lockstep frame by frame first). The pop seen was the
+          480 m switch (TokyoRT #11).
+        - the 480 m switch after TokyoRT #11 (the far level in the dress's colours): towers SSIM 0.983, within the bar;
+          the skyline 0.967, not. Each far building's own window module (bays, layout, fractions, as the dress draws
+          them) moved it to 0.968 for 8 % more far triangles, so it was not kept: what is left is structure all over
+          (roof rims, rooftop plant, the windows' tone by kind of building, trees), each a little. A far level the dress
+          makes itself (an L2 bake: walls, roofs and flat window quads, ~5–10 M triangles for the area, in place of the
+          source mesher's buildings) would agree by construction; it is a later item. § 0's order goes on to (4).
+    - (4) step 6a–6d below, in that order (6a–6c landed 2026-11-24 as TokyoRT #12, #14–#16; see step 6 for what
+        changed on 2026-11-25);
     - (5) the rest of step 2: Shibuya stitched in (~20 km²), the drive, expressway and flight paths, resident memory,
         the first frame;
     - (6) then 3 → 4 → 5 → 7. Step 1b (weather) waits: its place is the user's to set.
+  Order since 2026-11-25 (the user's, after a day flight showed no visible gain from 6a–6c), replacing (4) above; (1)–(3)
+  stand as recorded:
+    - (4a) 6d, windows and glass, shopfronts first;
+    - (4b) Golden Gai's mass (6e below), the Golden Gai half of 6b folded in;
+    - (4c) the ground again (6f), visible at eye height;
+    - (4d) the city's edge (6g);
+    - (5) and (6) as above. Tone mapping and exposure wait (the user's call).
   2. **Streaming.** Tiles resident by distance:
      - geometry, textures and BLASes per tile, in a bounded pool;
      - the far field as proxies (merged, simplified tile meshes; roofs and facades as photo-textured blocks);
@@ -558,6 +592,44 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
          height: frame start p95 ≤ 16.7 ms, p99 ≤ 25 ms, no frame over 50 ms;
        - streaming invisible: 5 poses against everything resident at full detail ΔE ≤ 1.0, SSIM ≥ 0.98 (§ 5 item 5's
          bar); popping in motion within the bench-ghosting limits.
+     - Status, part 1 (2026-11-23 → 24, threert/TokyoRT #1–#10; engine #200, #202, #203, #205, #206): one area
+       (Shinjuku, 3.4 × 2.8 km) streamed by level around a flying camera; none of the acceptance is met yet. Step 6's
+       street level was done ahead of it (generated finishes, street models, trees, curtain-wall towers: TokyoRT #1,
+       #5, #6), and step 1b (weather) skipped, both the user's call.
+       - The levels: far (the compiled 256 m tiles, always resident, a quadrant hidden where a nearer level shows it),
+         L1 within 480 m and L0 within 140 m (598 baked 128 m cells: 166 M triangles of their own at L0, 63 M at L1);
+         what repeats is a kit of 8,350 pieces placed as instances (1.7 M copies at L0, 0.45 M at L1; 15 GB of cells
+         where drawing each window out was 23 GB). A cell arrives in place, a frame budget at a time.
+       - Engine: the TLAS built from the instances that changed, as slot ranges (vendored wgpu 30, #200, #203: commit
+         18.9 → 4.9 ms with 470 k instances); the first BLAS build in batches of ≤ 4 M triangles (#202); a scene object
+         8 script objects, none a cycle, so the script's GC no longer pauses (#205: frames with > 30 ms of script in
+         a tour 3 → 0); an offline render's seek under setup's budget (#206).
+       - The tour (`tools/tour.ts`, 90 s of fast flight, M3 Max, MetalFX's denoiser, after the first 20 s): frame
+         interval p50 / p95 / p99 by day 17.4 / 31.9 / 40.6 ms, by night 17.0 / 47.7 / 60.7 ms. Not the bar
+         (p95 16.7, p99 25, none over 50 ms): the slow frames left are commits and acceleration-structure builds.
+         First frame 10–20 s.
+       - Quality (`tools/quality.ts`, `threert-render compare`, ΔE76 / p99 / SSIM, day, 1280 × 720; offline renders
+         at 128 spp, deterministic, so their floor is 0):
+
+         | pose | L0 ↔ L1 at 140 m | L1 ↔ far at 480 m | as streamed vs 2 × radii | live vs offline |
+         |---|---|---|---|---|
+         | Golden Gai alley | 0.00 / 0.0 / 1.000 | 0.00 / 0.0 / 1.000 | 0.04 / 0.8 / 1.000 | 1.47 / 11.5 / 0.935 |
+         | street | 0.00 / 0.0 / 1.000 | 0.01 / 0.4 / 1.000 | 0.04 / 0.7 / 1.000 | 2.07 / 20.7 / 0.951 |
+         | block, 60 m up | 0.00 / 0.0 / 1.000 | 0.11 / 0.8 / 0.996 | 0.12 / 1.0 / 0.996 | 1.69 / 15.8 / 0.953 |
+         | west avenue | 0.00 / 0.0 / 1.000 | 0.08 / 0.9 / 1.000 | 0.08 / 0.9 / 0.999 | 4.94 / 23.7 / 0.860 |
+         | towers, 170 m up | 0.00 / 0.0 / 1.000 | 0.43 / 14.8 / 0.971 | 1.18 / 32.9 / 0.965 | 3.37 / 21.0 / 0.900 |
+         | skyline, 240 m up | 0.01 / 0.4 / 1.000 | 0.85 / 24.2 / 0.965 | 2.79 / 34.5 / 0.876 | 2.77 / 18.8 / 0.899 |
+
+         - The 140 m switch does not show. The 480 m one does: the far level colours buildings from the source app's
+           palette pulled to a cool aerial grey, the dressing in warm, light finishes. That is order item (3)'s first
+           part.
+         - "2 × radii" (L0 to 280 m, L1 to 960 m) stands for everything at full detail: L0 to 300 m is past the
+           renderer's 4 GB vertex buffer.
+         - Streaming in flight, the live frame held at a tour second against the same pose settled (the live view's
+           own noise beside it): 20 s 0.42 / 0.994 (noise 0.39 / 0.995), 45 s while climbing 0.74 / 0.979 (0.48 /
+           0.992), 70 s 0.70 / 0.987 (0.63 / 0.989).
+         - Live against offline is over the bar at every pose: the live path's own distance (denoiser, the sun's
+           glints in glass), the same kind as step 1's table, not streaming.
   3. **The city's lights.** Lit windows that switch on and off, signs, LED screens, street lamps and headlights as
      emitters, 10^5–10^6 across the loaded tiles, in the light tree. Switching an emitter on or off costs no rebuild.
      If the voxel line's "dynamic emission" contract (§ 6 step 3) lands first, use it rather than duplicate it.
@@ -593,6 +665,19 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
          mop bucket at a bar's back door; the A-board, planters and umbrella stand at its front.
        - 6d. **Windows and glass.** Shopfronts first: rooms with depth behind the glass (interior mapping), the street
          reflected in it, things standing behind it, dirt on it. Upper windows after. Placeholder posters replaced.
+     - Acceptance for every look item from 2026-11-25 (the user's): a clear, at-a-glance gain at the Golden Gai pose
+       (`tools/quality.ts` pose `goldengai`) as the live view shows it (1280 × 720, its resolution scale, denoised),
+       before / after side by side and beside photographs of the place (references only: no photograph enters the
+       repository or a texture). A gain seen only in an offline zoom does not count. Frame time A/B as before; ΔE /
+       SSIM still reported, no longer the test of a look item. The aim is the street level close to a photograph.
+       - 6d as above, first.
+       - 6e. **Golden Gai's mass.** Above the ground floor: stacked signs, outside stairs, balconies, bundled pipes and
+         cables, clutter, so the outline stops reading as a box. Replaces 6b for Golden Gai's small buildings (6b, #15,
+         dressed only the mid-size ones).
+       - 6f. **The ground, at eye height.** Drain covers along the walls, dark patches, water and grime stains, seams,
+         with contrast enough to read from 1.7 m (6a's ground marks did not).
+       - 6g. **The city's edge.** Above ~140 m the land beyond Shinjuku is a flat grey plain and the city stops ~1 km
+         out: carry it on (far city, haze) so the world does not end in view.
   7. **Milestone 2, the open city.** Shinjuku and Shibuya at night, and by day:
      - a montage per view: our offline render | ThreeRT live | the source three.js app, each tile with its frame rate
        and ΔE / SSIM;
@@ -1545,7 +1630,7 @@ pipeline. The real-time pipeline moves toward Lumen's structure — split signal
     plus a cosine-sampled ray each, ending in the cache again, so it carries every bounce. Pixels that find their voxel
     cold trace one vertex and use that meanwhile. Per voxel the history is capped at 256 samples and 32 frames (4 for
     45 frames after a lighting edit); voxels unused for 120 frames are freed. 2^18 entries, 13.6 MB, resolve 0.14 ms.
-    `THREERT_CACHE=0` turns it off; `THREERT_CACHE_FLAGS` switches its parts for cost attribution.
+    `THREERT_CACHE=0` turns it off.
   - Diffuse history holds irradiance (lighting / albedo, smooth), remodulated by albedo. Albedo and emission history
     is resampled with Catmull-Rom and clamped into this frame's 3 × 3 range (TAA: both are noise-free). It is held to
     4 frames while the view moves and 16 when still, so texture and sign detail no longer blur through repeated
@@ -1813,12 +1898,7 @@ Measured on the M5 Pro (`out/liveq/gpu-runs-std.md`; single runs unless said):
   set again from this build's readings with the margins the old ones had (tools/bench-ghosting.ts); the trails'
   limits and the other shots' stand.
 
-**History lengths (2026-11-12, after it).** The whole frame's history was cut by what happened in the scene: held to
-48 frames while the camera moved, every pixel cut to 16 at a lighting edit and to 4 at a geometry edit, 24 for good in
-a scene with spark lights. Now one bound while the scene's lighting changes (32 frames, a real-time denoiser's: NRD's
-default is 30; `HISTORY_LIVE`), the long history once it has settled, and within it each pixel's own: 48 where it
-moves a pixel a frame, and an anti-lag that cuts the irradiance history by how far its fast mean left the slow one
-beyond their noise (ReBLUR's form; it was on / off). No edit cuts anything.
+**History lengths (2026-11-12, after it).** [Removed 2026-11-24: this passage described an earlier implementation that has been replaced; docs/PROVENANCE.md. The measurements below are that implementation's.]
 
 | dE against the offline render or the converged frame | main | this |
 |---|---|---|
@@ -1875,15 +1955,7 @@ hid two faults of the live path's own:
 - Not done: live GI, reflection and shadow rays still see no media (the stand-in light stays), and a medium has no
   motion vector (smoke that drifts is reactive, not followed). (Overlapping media: below.)
 
-**The specular history per pixel (2026-11-13, after it).** `stemporal` still set every pixel's history by what the
-camera did: 2 .. 12 frames by roughness whenever it moved or turned at all, 4 for the 8 frames after it translated
-(§ 2c's fix). Now each pixel's own, from two things it knows (output pixels a frame): its speed (a resampled history
-blurs: 48 frames at a pixel a frame, as the diffuse) and its reflection's parallax, how far what it reflects moved
-against the surface: the history may be no longer than keeps its trail (frames × parallax) within 2 px (`SPEC_TRAIL`),
-2 frames at least on a mirror, 4 from roughness 0.05. The parallax is the reflected point's where this frame's sample
-has one, the farthest possible point's where it has none, and a moving reflector's own speed. A turn has no parallax
-and keeps its history; a translation shortens it where the reflection slides, by how fast. NRD's ReBLUR bounds the
-specular history per pixel by parallax too (its source, `REBLUR_TemporalAccumulation`).
+**The specular history per pixel (2026-11-13, after it).** [Removed 2026-11-24: this passage described an earlier implementation that has been replaced; docs/PROVENANCE.md. The measurements below are that implementation's.]
 
 | bench-ghosting --quick, excess over the settled frame / trail px (turn-mid, strafe-mid ground; the two returns + 0.5 s; stop + 0.1 s) | main | this |
 |---|---|---|
@@ -1891,7 +1963,7 @@ specular history per pixel by parallax too (its source, `REBLUR_TemporalAccumula
 | Bistro | 1.08 / 5, 1.76 / 6, 1.25 / 12, 1.34 / 12, 1.50 / 5 | 0.84 / 7, 1.60 / 6, 1.17 / 12, 1.26 / 11, 1.34 / 5 |
 
 - What was tried and left out, each measured (`out/liveq/gpu-runs-std.md`, S1–S20):
-  - the parallax weighed against the reflection's own blur, as ReBLUR weighs it against the lobe's angle (the
+  - the parallax weighed against the reflection's own blur, the lobe's angle (the
     history may trail K lobe footprints behind): a wet street's lobe is 27–245 px wide here, the history ran through
     a forward move, and the stop dragged a 65–112 px trail (limit 35);
   - two thresholds instead of one budget (2 .. 12 frames from 0.25 px of parallax, 4 from 2 px): passes, a little
@@ -1906,7 +1978,7 @@ specular history per pixel by parallax too (its source, `REBLUR_TemporalAccumula
   main's own runs across two days (move40 3.88–4.07). Stated as it is: the ghosting bench counts frames and repeats
   to 0.02, this one does not.
 - Not changed, measured: what makes the scene's lighting "live" for the whole frame. Anything that moves or is edited
-  does, for 45 frames, so a scene with a walker in it is always at the 32-frame bound (NRD's own: 30), and the rule
+  does, for 45 frames, so a scene with a walker in it is always at the 32-frame bound, and the rule
   for spark lights adds nothing there (the Bistro slice reads the same without it). The radiance cache's history is
   cut to 4 frames by the same switch: at 32 the slice reads 2.66 for 2.82 at rest and 5.80 for 6.03 at its
   explosion, and all of test-render passes; what the 4 frames buy is how fast indirect light follows an edit, which
@@ -1959,7 +2031,7 @@ A rect light's card and the sun still rebuild (geometry; the sky's bake).
   as before.
 - Seen on the way, not this change's: 2 s after a 5,000 cd light is hidden beside a 1,000 cd one the plane under
   them still reads 6 % high. 45 frames after a lighting edit the long history comes back, and what is left of the
-  old light then averages out as 1 / n (NRD's fixed 30 frames would decay it for good). And 0.3 s after a fireball
+  old light then averages out as 1 / n. And 0.3 s after a fireball
   is hidden a faint ring stays where its edge was (the upscaler's history: nothing says a medium went).
 - Not done: `Explosions` still parks (the voxel line's to change); a mesh hidden by its own `visible` still rebuilds.
 
@@ -1997,12 +2069,7 @@ converged frame of the state after, beside the frame k frames after a history re
   later (lamp off: 2.24 for 1.66 at 32 frames, 1.38 for 1.12 at 128; lamp on: 0.50 for 0.72, 0.79 for 0.93). The 4
   frames buy what they were said to and stay; the 0.16 ΔE they cost a scene at rest is the price.
 
-**The fast-history clamp (2026-11-13, after it).** ReBLUR's way of following a lighting change, in `dtemporal`: every
-frame, while the scene's lighting is live, the slow means around the pixel (3 × 3 on its surface) are held, a channel
-each, to the band of the fast means there (a quarter of each new sample; their mean ± 3 standard errors, from the fast
-luminances' spread), and the pixel's history is changed by the same ratios and counts for as many frames less. The
-fast mean in colour is kept in the buffer that was the `judge` pass's unread ping-pong partner: no new memory. The
-cut by luminance stays beside it. `bench-temporal --shot edit`, ΔE against the converged frame of the state after:
+**The fast-history clamp (2026-11-13, after it).** [Removed 2026-11-24: this passage described an earlier implementation that has been replaced; docs/PROVENANCE.md. The measurements below are that implementation's.]
 
 | edit, region | 8 frames: before → now | 32 frames | 128 frames | a view with no memory, 32 |
 |---|---|---|---|---|
@@ -2841,6 +2908,64 @@ Mutations: 26. 25 failed a test there was; one, a texture put on a shelf too low
 Found by review: a translucent particle's material given another function kept the kernel's old dispatch for the
 translucency pass, which has its particles' functions alone; the kernel is made again where those are others.
 
+**A light's card, a coincident pair and a model without size are instances (2026-11-25, after it).** Three of the
+things the build still flattened into world-space triangles:
+- A visible rect light's card is an instance of one card mesh, a unit quad: its size is its transform's, its
+  material its row's, and it moves as its instance, under software traversal too. An emitter's entry in the light
+  list says whether it is a card's (it lights one side), where the kernel read the triangle's material. A card
+  of another size is the build's: it was taken in place, and only its material changed.
+- A triangle on exactly another's vertices (a cutout on an emitter, glass on what is under it) alone leaves its
+  mesh, for the model's second mesh, with an instance beside the first: a BLAS apart, as the flattened pair was.
+  A posed rigid model with such a part is hidden and removed in place now. A movable still model with one moves
+  by a rebuild (it was re-transformed on the CPU).
+- A model placed without size is an instance no ray sees, as a mesh is.
+
+Flattened still: a posed skinned model with triangles that emit, and a scene under `THREERT_INSTANCING=0`; under
+software traversal, what has no unit. Which of a pair is drawn is as it was: a scene with the pair near and far
+renders to main's picture, byte for byte, under both traversals.
+
+**Five A/B switches and the uniform tables are removed (2026-11-25).** Switches whose question was answered, or
+that nothing set: `THREERT_EDIT_BLAS` (an edit mesh's BLAS is built fast), `THREERT_LIGHT_GROUPS` (measured:
++4.6 ms of trace without the groups), `THREERT_RIGID_NODES` (measured: 4 to 10 % of GPU time with every node
+apart), `THREERT_CACHE_FLAGS` (the radiance cache's four experiment bits, read at four places in the kernel) and
+`THREERT_TL_HIDE` (a diagnostic of the translucency pass). And the uniform tables, Android's first way round a
+driver that misread four of the kernel's tables (docs/RUNTIME.md "Android"): since the device reads the tables
+whole (2026-11-16) no platform had them by default. Their kernel blocks, the per-frame copies, the bounds and
+their three tests are gone, with `GpuOptions::uniform_tables` and `THREERT_UNIFORM_TABLES`. The records that
+name these switches are of their time. Kept: `THREERT_LTREE` and `THREERT_LT_RIS` (the light
+sampler's kind and its candidate count), `THREERT_TABLE_VIEWS`.
+
+**The raster experiment is removed (2026-11-24, after it).** Primary visibility by rasterization (§ 1's decision
+experiment, `THREERT_RASTER=1`) stayed in the code after its verdict: a render pass of the world-space triangles,
+a texture in the kernel's second bind group, a parameter and a branch at every path's first hit. It drew nothing
+in a scene with a mesh since meshes became instances. All of it is gone; § 1 keeps the experiment's record and
+figures. The kernel's parameter has the frame's jitter and the "rays off" switch still (`jitter`).
+Tests: the "rays off" switch had none and has one (`rays_off_is_another_picture_and_on_again_the_first`: what was
+in shadow is lit, on again the picture is the first); three mutations of the parameter's places, one of which the
+test's first form let through. A live keyframe of a heavy interior reads as before, with and without the loop
+guard.
+
+**A particle system is a mesh and an instance (2026-11-24).** Particles were world-space triangles of their own
+kind: two a particle among the scene's dynamic triangles (the translucent ones after everything else, in a BLAS of
+their own), a row a triangle, their emitters by a nominal area in the triangles' attributes, every size fixed when
+the scene was uploaded. Now a system is what any geometry that deforms is: a mesh of the pool (a quad a particle,
+four vertices), one instance, a BLAS of its own built again after the particle passes. Stateless and stateful
+systems, those the lights are sampled by (their triangles are the instance's emitters) and translucent ones (an
+instance of the translucency pass's TLAS each) alike; a particle keeps its own object, which a hit finds from its
+instance's and its triangle. The world-space form is gone from the build, the layout, the passes and the kernel.
+The cost is a BLAS build and a TLAS instance a system, where all systems shared four BLASes at most. A frame's GPU
+time on Bistro with opaque particles added (1280 x 720, an M5 Pro; runs alternated): 16 systems of 1024
+particles, 21.25 to 21.48 ms for 21.15 to 21.63 (no difference); 256 systems of 64, 21.44 to 21.55 ms for 21.07 to
+21.11 (+0.41 ms, 1.9 %: 0.16 ms of it in the trace).
+Not changed: a system that comes or goes, a particle function or program, still rebuild the scene.
+Tests: the build's five kinds of system (`a_particle_system_is_a_mesh_of_quads_and_an_instance`); a particle's
+previous positions and the motion at its pixels beside another system; `translucent/systems` (two translucent
+systems, their order reversed between the image's sides).
+Mutations: 28 (the build and the layout, the passes' previous positions, the kernel's object of a particle, the
+builds after the passes, the translucency pass). One had no test, a pass's first frame taking the build's
+positions for its previous ones, and has its assertion now, for both passes; the others failed a test there was,
+one of them by the renderer stopping.
+
 **Volumes and density grids come in place (2026-11-23, after it).** A volume that came, went or was set again
 while a game ran, a still volume's first move, a volume function, a new density grid and a grid program each had
 the scene built again. On Bistro (as above), the frame the edit landed in:
@@ -3256,14 +3381,7 @@ Targets (2026-11-08): bench-temporal, bench-ghosting and their UE MRQ references
 Kabukichō shots below are history.
 
 ### 2a. Reflection temporal parameters at UE 5.8 defaults
-Reference: `Engine/Shaders/Private/Lumen/LumenReflectionDenoiserTemporal.usf`, `LumenReflections.cpp:153-162`,
-`LumenReflectionDenoiserSpatial.usf:92`.
-- Neighbourhood clamp always on (not only in motion), in YCoCg, 1σ (`NeighborhoodClampScale` = 1).
-- At most 12 accumulated frames (`MaxFramesAccumulated`); at full resolution, specular with roughness < 0.05 drops to 2
-  frames (residual noise left to TSR).
-- Virtual-image (mirror reprojection) and surface histories are clamped separately; keep the one closer to the
-  neighbourhood (`...Temporal.usf` ~l.495).
-- Spatial filter radius × saturate(roughness × 8).
+[Removed 2026-11-24: this passage described an earlier implementation that has been replaced; docs/PROVENANCE.md.]
 - Today `live.wgsl` clamps only in motion, at 2–3σ in RGB, with 8–48 frames of history.
 - Also: at long history the live image is the raw accumulated average (all à-trous stages gated off by history length
   since round 3: Cornell box at 256 frames SSIM 0.912 vs the UE Path Tracer, 0.98 on Nov 4). Gate on the remaining
@@ -3416,7 +3534,7 @@ dynamic-resolution floor, 60 Hz camera input.
         - The option left: a second emitter sample at near-mirror camera hits in the same pass. It needs the camera
           hit's surface (a primary ray and a material evaluation), an estimated +0.6–1.0 ms more, so Kabukichō
           moving would be ~16.6–17.0 ms.
-      - UE 5.8's own temporal rules for reflections (`LumenReflectionDenoiserTemporal.usf`), applied while the view
+      - UE 5.8's temporal rules for reflections, as an earlier implementation had them (docs/PROVENANCE.md), applied while the view
         moves (2026-11-07):
         - What changed: no hold after translating; 12 frames; a clamp at 1 σ, doubled for samples reconstructed
           from neighbours (all of ours below 100 %), also tried at 4 and 8 σ; the reflection-hit history only for
@@ -3874,9 +3992,9 @@ dynamic-resolution floor, 60 Hz camera input.
      - Velocity: the temporal pass computes each pixel's motion from the camera and the motion vectors.
      - Reconstruction: a gather after McGuire et al. 2012 on the HDR image before bloom. A moving object smears over
        a static background; a static foreground stays sharp.
-     - Length, as UE's (PostProcessMotionBlur.cpp, UpdateMotionBlurTimeScale): ± amount / 2 × the frame's motion ×
-       (1 / target FPS) / frame time. At 60 fps that is one frame of motion in total, capped at 5 % of the width.
-     - Camera cuts (a jump of 2 m or 30° in one frame) don't blur (UE: bCameraCut). Without that check, Kabukichō's
+     - Length: from the amount, the frame's motion and the target frame rate (docs/RUNTIME.md, "The post chain"). At 60 fps
+       that is one frame of motion in total, capped at 5 % of the width.
+     - Camera cuts (a jump of 2 m or 30° in one frame) don't blur. Without that check, Kabukichō's
        viewpoint switch smeared the whole frame (horizontal gradient energy 102 vs 363).
      - Cost at the 0.5 floor, Kabukichō:
        - 0.44 ms while anything moves: 15.78 ms total vs 15.36 with it off.
@@ -3886,7 +4004,7 @@ dynamic-resolution floor, 60 Hz camera input.
        - Within budget either way.
      - UE reference: bench-temporal `--motion-blur` against UE renders with the same settings (`MB=1
        ue5/temporal.ts`). Movie Render Queue replaces the amount with its shutter fraction (0.5) and the target FPS with
-       the output rate (60) (MoviePipelineImagePassBase.cpp), which is half the real-time blur. Ours at UE's real-time
+       the output rate (60), which is half the real-time blur. Ours at UE's real-time
        defaults read about twice UE's blur against those frames. Ours at what MRQ rendered (`THREERT_MOTION_BLUR=0.5,5,60`):
        - excess over UE move20 / move40 / move59 / stopped 1.23 / 1.51 / 1.60 / 2.01 (unblurred 1.43 / 1.75 / 1.75 /
          2.01);
@@ -3895,10 +4013,7 @@ dynamic-resolution floor, 60 Hz camera input.
    - Depth of field at UE's defaults: done (2026-11-06).
      - UE's default is off: no focus distance on the camera. A camera's `dof` (focus distance, f-stop, sensor width;
        UE's defaults f/4, 24.576 mm) switches it on.
-     - CoC: UE's physical model (DiaphragmDOFUtils.cpp, FPhysicalCocModel):
-       - focal length from the sensor height (width / aspect) and the vertical FOV;
-       - CoC of infinity f² / (N (focus − f));
-       - per pixel (z − focus) / z of that, capped at 2.5 % of the width (r.DOF.Kernel.Max{Fore,Back}groundRadius).
+     - CoC: a thin lens (docs/RUNTIME.md, "The post chain"), capped at 2.5 % of the width.
      - Live: a gather on the composed HDR image, before motion blur as in UE.
        - The CoC is computed in the compose pass.
        - A 16 × 16 tile maximum bounds each pixel's search.
@@ -4412,10 +4527,8 @@ dynamic-resolution floor, 60 Hz camera input.
             instead of four (kept, −0.03 ms); no media in the surface cache's training shadows (−0.08 ms with a bias:
             dropped).
         - Next (part 3): UE references and the motion metric; cheaper media shadow rays to fit rain + smoke.
-      - Status, part 3a: UE references, and `FogVolume` is UE's Local Fog Volume.
-        - `FogVolume` takes UE 5.8's Local Fog Volume density as UE voxelizes it into volumetric fog
-          (VolumetricFog.usf), with UE's settings and defaults (docs/MATERIAL_FUNCTIONS.md, "Volume functions").
-          `volume/local-fog` (new): 0.2823 against the numerically integrated 0.2863.
+      - Status, part 3a: UE references.
+        - [Removed 2026-11-24: this passage described an earlier implementation that has been replaced; docs/PROVENANCE.md.]
         - UE references, `bun ue5/volumes.ts`: `tools/volume-scene.ts` in a scratch project, path-tracer and Lumen stills
           as linear EXR.
           - Every preset is a Heterogeneous Volume: a Volume-domain material whose Custom nodes are our volume
@@ -6066,7 +6179,7 @@ benchmark level. The order follows the dependencies; a step that meets a further
 - Auto exposure (fixed 2026-11-06): the presets' histogram range was UE's legacy -8 .. 4 (log2 luminance), which
   daylight saturates (a 3000-nit sky pinned the exposure at EV 6.5, the image washed out). UE 5 projects enable
   r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange (every template), giving EV100 -10 .. 20, the same log2
-  luminance at the default lens attenuation (Scene.cpp, PostProcessEyeAdaptation.cpp EV100ToLog2). The presets use
+  luminance at the default lens attenuation. The presets use
   it now; Kabukichō keeps the legacy range explicitly, as its UE project does. Atomic tests `exposure/auto-daylight`
   (offline and live; 14.00 vs 14.03 expected) and `exposure/auto-night`. Still different: UE's default exposure
   compensation is +1 EV (r.DefaultFeature.AutoExposure.Bias = 1.0); our camera's default is 0.
