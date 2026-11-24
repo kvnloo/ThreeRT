@@ -14,7 +14,7 @@ test("CapsuleGeometry takes three.js r187's parameters, heightSegments included"
 
 test("CapsuleGeometry rows run pole to pole with v by arc length, as three.js r187 has them", () => {
   const g = new THREE.CapsuleGeometry(1, 2, 2, 4);
-  const p = g.getAttribute("position"), n = g.getAttribute("normal"), uv = g.getAttribute("uv");
+  const p = g.getAttribute("position")!, n = g.getAttribute("normal")!, uv = g.getAttribute("uv")!;
   const close = (a: number, b: number) => assert.ok(Math.abs(a - b) < 1e-6, `${a} vs ${b}`);
   close(p.getY(0), -2); close(p.getY(p.count - 1), 2); // poles at ±(height/2 + radius)
   close(n.getY(0), -1); close(n.getY(p.count - 1), 1);
