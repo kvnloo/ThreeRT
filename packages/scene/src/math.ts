@@ -831,11 +831,60 @@ export class Box3 {
 
 /** A sphere (three.js Sphere): bounds. */
 export class Sphere {
+  readonly isSphere = true;
   center: Vector3;
   radius: number;
   constructor(center = new Vector3(), radius = -1) {
     this.center = center;
     this.radius = radius;
+  }
+  set(center: Vector3, radius: number): this {
+    this.center.copy(center);
+    this.radius = radius;
+    return this;
+  }
+  copy(sphere: Sphere): this {
+    return this.set(sphere.center, sphere.radius);
+  }
+  /** A negative radius is empty; a zero radius is a point (three.js). */
+  isEmpty(): boolean {
+    return this.radius < 0;
+  }
+  makeEmpty(): this {
+    this.center.set(0, 0, 0);
+    this.radius = -1;
+    return this;
+  }
+  containsPoint(point: Vector3): boolean {
+    const dx = point.x - this.center.x, dy = point.y - this.center.y, dz = point.z - this.center.z;
+    return dx * dx + dy * dy + dz * dz <= this.radius * this.radius;
+  }
+  /** Signed: negative inside the sphere (three.js). */
+  distanceToPoint(point: Vector3): number {
+    return point.distanceTo(this.center) - this.radius;
+  }
+  intersectsSphere(sphere: Sphere): boolean {
+    const r = this.radius + sphere.radius;
+    const dx = sphere.center.x - this.center.x, dy = sphere.center.y - this.center.y, dz = sphere.center.z - this.center.z;
+    return dx * dx + dy * dy + dz * dz <= r * r;
+  }
+  /** The centre transformed by `m`, the radius scaled by its largest axis scale (three.js). */
+  applyMatrix4(m: Matrix4): this {
+    const e = m.elements;
+    const sx = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+    const sy = e[4] * e[4] + e[5] * e[5] + e[6] * e[6];
+    const sz = e[8] * e[8] + e[9] * e[9] + e[10] * e[10];
+    this.center.applyMatrix4(m);
+    this.radius *= Math.sqrt(Math.max(sx, sy, sz));
+    return this;
+  }
+  translate(offset: Vector3): this {
+    this.center.add(offset);
+    return this;
+  }
+  equals(sphere: Sphere): boolean {
+    const a = this.center, b = sphere.center;
+    return a.x === b.x && a.y === b.y && a.z === b.z && sphere.radius === this.radius;
   }
   setFromArray(a: ArrayLike<number>): this {
     const b = new Box3().setFromArray(a);
