@@ -568,6 +568,63 @@ export class Matrix4 {
     te[2] = x.z; te[6] = y.z; te[10] = z.z;
     return this;
   }
+  /** Determinant of the upper 3x3 (rotation and scale) part. */
+  determinantAffine(): number {
+    const te = this.elements;
+    return te[0] * (te[5] * te[10] - te[9] * te[6])
+      - te[4] * (te[1] * te[10] - te[9] * te[2])
+      + te[8] * (te[1] * te[6] - te[5] * te[2]);
+  }
+  /** Sets the rotation part from three basis vectors and clears the translation, as three.js does. */
+  makeBasis(xAxis: Vector3, yAxis: Vector3, zAxis: Vector3): this {
+    return this.set(
+      xAxis.x, yAxis.x, zAxis.x, 0,
+      xAxis.y, yAxis.y, zAxis.y, 0,
+      xAxis.z, yAxis.z, zAxis.z, 0,
+      0, 0, 0, 1,
+    );
+  }
+  /** The first three columns; the unit axes for a singular matrix, as three.js r187. */
+  extractBasis(xAxis: Vector3, yAxis: Vector3, zAxis: Vector3): this {
+    if (this.determinantAffine() === 0) {
+      xAxis.set(1, 0, 0);
+      yAxis.set(0, 1, 0);
+      zAxis.set(0, 0, 1);
+      return this;
+    }
+    const te = this.elements;
+    xAxis.set(te[0], te[1], te[2]);
+    yAxis.set(te[4], te[5], te[6]);
+    zAxis.set(te[8], te[9], te[10]);
+    return this;
+  }
+  /** `m`'s rotation with scale and translation removed; identity for a singular `m`, as three.js r187. */
+  extractRotation(m: Matrix4): this {
+    if (m.determinantAffine() === 0) return this.identity();
+    const me = m.elements;
+    const scaleX = 1 / Math.hypot(me[0], me[1], me[2]);
+    const scaleY = 1 / Math.hypot(me[4], me[5], me[6]);
+    const scaleZ = 1 / Math.hypot(me[8], me[9], me[10]);
+    this.elements = [
+      me[0] * scaleX, me[1] * scaleX, me[2] * scaleX, 0,
+      me[4] * scaleY, me[5] * scaleY, me[6] * scaleY, 0,
+      me[8] * scaleZ, me[9] * scaleZ, me[10] * scaleZ, 0,
+      0, 0, 0, 1,
+    ];
+    return this;
+  }
+  /** Rotation of `angle` radians about the unit vector `axis`. */
+  makeRotationAxis(axis: Vector3, angle: number): this {
+    const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+    const x = axis.x, y = axis.y, z = axis.z;
+    const tx = t * x, ty = t * y;
+    return this.set(
+      tx * x + c, tx * y - s * z, tx * z + s * y, 0,
+      tx * y + s * z, ty * y + c, ty * z - s * x, 0,
+      tx * z - s * y, ty * z + s * x, t * z * z + c, 0,
+      0, 0, 0, 1,
+    );
+  }
   decompose(p: Vector3, q: Quaternion, s: Vector3): this {
     const te = this.elements;
     p.set(te[12], te[13], te[14]);
