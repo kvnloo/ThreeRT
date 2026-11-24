@@ -115,6 +115,28 @@ Along the camera move (6 s from 0 s, 60 poses): ThreeRT live GPU p50 / p95 15.74
 ![Zero Day montage](images/milestone1-zero-day.jpg) · the motion clip (≤ 5 MB, not committed): `out/milestone1/zero-day/move.webp`
 <!-- /milestone1:zero-day -->
 
+## ΔE / SSIM against the offline render (`tools/compare/delta-e.ts`)
+
+The number every PR reports from 2026-11-24 (ROADMAP § 0): a render against our offline render of the same pose, or the
+streamed city against everything resident at full detail. Node only: no renderer build, no GPU.
+
+```
+node tools/compare/delta-e.ts truth.png live.png --region street=0,0.6,1,1 --bar step2
+node tools/compare/delta-e.ts --manifest poses.json --bar step2   # fixed poses -> out/delta-e/summary.json
+```
+
+- **Numbers**, overall and per region (a 3 × 3 grid by default, `--grid`, plus named `--region`s): mean / p95 / p99
+  CIEDE2000, mean / p95 ΔE76, SSIM, the luminance ratio and the share of pixels over ΔE2000 5. ΔE76 and SSIM are the
+  renderer's `compare` (same Lab, same 11 × 11 Gaussian SSIM on luma), so they stay comparable with the tables above;
+  CIEDE2000 is checked against Sharma, Wu and Dalal's 34 published pairs.
+- **Files** in `--out` (default `out/delta-e`): `<name>.json`, `<name>-heat.png` (ΔE2000, white at `--scale`, default
+  10; region outlines, the worst in magenta) and `<name>-sheet.png` (reference | test | heat). A manifest adds
+  `summary.json`: mean and worst over the poses.
+- **Bars:** `--bar step2` is step 2's "streaming invisible" (ΔE ≤ 1.0 as ΔE2000, SSIM ≥ 0.98), or set
+  `--max-de2000`, `--max-de76`, `--min-ssim`; any pose that misses exits 1. `--align` takes the exposure out first.
+- A manifest: `{ "regions": [{ "name": "street", "rect": [0, 0.6, 1, 1] }], "poses": [{ "name": "golden-gai",
+  "reference": "truth.png", "test": "live.png" }] }`, paths relative to the manifest.
+
 ## Rules of the comparison
 
 - **Same content.** Part 1 runs the very same scene files (`scenes/*.ts`) through
