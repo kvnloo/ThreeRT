@@ -1427,6 +1427,31 @@ export class Box3 {
   intersectsBox(b: Box3): boolean {
     return b.max.x >= this.min.x && b.min.x <= this.max.x && b.max.y >= this.min.y && b.min.y <= this.max.y && b.max.z >= this.min.z && b.min.z <= this.max.z;
   }
+  /** Separating-axis test against a triangle (`{ a, b, c }`, such as a Triangle), as three.js does. */
+  intersectsTriangle(triangle: { a: Vector3; b: Vector3; c: Vector3 }): boolean {
+    if (this.isEmpty()) return false;
+    const center = this.getCenter(new Vector3());
+    const extents = new Vector3().subVectors(this.max, center);
+    const v0 = new Vector3().subVectors(triangle.a, center);
+    const v1 = new Vector3().subVectors(triangle.b, center);
+    const v2 = new Vector3().subVectors(triangle.c, center);
+    const f0 = new Vector3().subVectors(v1, v0), f1 = new Vector3().subVectors(v2, v1), f2 = new Vector3().subVectors(v0, v2);
+    const sat = (axes: number[]): boolean => {
+      const axis = new Vector3();
+      for (let i = 0; i <= axes.length - 3; i += 3) {
+        axis.fromArray(axes, i);
+        const r = extents.x * Math.abs(axis.x) + extents.y * Math.abs(axis.y) + extents.z * Math.abs(axis.z);
+        const p0 = v0.dot(axis), p1 = v1.dot(axis), p2 = v2.dot(axis);
+        if (Math.max(-Math.max(p0, p1, p2), Math.min(p0, p1, p2)) > r) return false;
+      }
+      return true;
+    };
+    // The nine cross products of the box's axes with the triangle's edges, the box's face normals, the triangle's normal.
+    if (!sat([0, -f0.z, f0.y, 0, -f1.z, f1.y, 0, -f2.z, f2.y, f0.z, 0, -f0.x, f1.z, 0, -f1.x, f2.z, 0, -f2.x, -f0.y, f0.x, 0, -f1.y, f1.x, 0, -f2.y, f2.x, 0])) return false;
+    if (!sat([1, 0, 0, 0, 1, 0, 0, 0, 1])) return false;
+    const n = new Vector3().crossVectors(f0, f1);
+    return sat([n.x, n.y, n.z]);
+  }
   copy(b: Box3): this {
     return this.set(b.min, b.max);
   }
