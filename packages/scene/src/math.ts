@@ -119,6 +119,58 @@ export class Vector3 {
   fromArray(a: ArrayLike<number>, o = 0): this {
     return this.set(a[o], a[o + 1], a[o + 2]);
   }
+  /** The point at `s` (three.js: phi from +y, theta about y from +z). */
+  setFromSpherical(s: Spherical): this {
+    return this.setFromSphericalCoords(s.radius, s.phi, s.theta);
+  }
+  setFromSphericalCoords(radius: number, phi: number, theta: number): this {
+    const r = Math.sin(phi) * radius;
+    return this.set(r * Math.sin(theta), Math.cos(phi) * radius, r * Math.cos(theta));
+  }
+}
+
+/** Spherical coordinates (three.js's Spherical): `phi` the polar angle from +y, `theta` the azimuth about y from +z. */
+export class Spherical {
+  radius: number;
+  phi: number;
+  theta: number;
+  constructor(radius = 1, phi = 0, theta = 0) {
+    this.radius = radius;
+    this.phi = phi;
+    this.theta = theta;
+  }
+  set(radius: number, phi: number, theta: number): this {
+    this.radius = radius;
+    this.phi = phi;
+    this.theta = theta;
+    return this;
+  }
+  copy(s: Spherical): this {
+    return this.set(s.radius, s.phi, s.theta);
+  }
+  clone(): Spherical {
+    return new Spherical().copy(this);
+  }
+  /** Keeps phi within (0, PI) by a hair, away from the poles where theta is undefined. */
+  makeSafe(): this {
+    const EPS = 0.000001;
+    this.phi = Math.max(EPS, Math.min(Math.PI - EPS, this.phi));
+    return this;
+  }
+  setFromVector3(v: Vector3): this {
+    return this.setFromCartesianCoords(v.x, v.y, v.z);
+  }
+  setFromCartesianCoords(x: number, y: number, z: number): this {
+    this.radius = Math.sqrt(x * x + y * y + z * z);
+    if (this.radius === 0) {
+      this.theta = 0;
+      this.phi = 0;
+    } else {
+      this.theta = Math.atan2(x, z);
+      this.phi = Math.acos(Math.min(1, Math.max(-1, y / this.radius)));
+    }
+    return this;
+  }
 }
 
 export class Quaternion {
