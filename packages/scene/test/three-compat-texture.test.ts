@@ -76,20 +76,3 @@ test("three.js's tiling lines reach the engine as its texture's repeat, offset a
   assert.deepEqual(desc.offset, [0.5, 0]);
   assert.equal(desc.wrap, false);
 });
-
-test("three.js's tiling idiom reaches the engine's texture", () => {
-  const scene = new THREE.Scene();
-  const map = new THREE.Texture("texture.png");
-  map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
-  map.repeat.set(8, 8);
-  map.offset.set(0.5, 0.25);
-  scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ map })));
-  const cam = new THREE.PerspectiveCamera();
-  scene.add(cam);
-  const engine = new THREE.RecordingEngine();
-  new THREE.SceneBinding(engine, scene, cam).sync();
-  const desc = engine.take().find((c) => c[0] === "texture")![2] as { wrap: boolean; repeat: number[]; offset: number[] };
-  assert.equal(desc.wrap, false);
-  assert.deepEqual(desc.repeat, [8, 8]);
-  assert.deepEqual(desc.offset, [0.5, 0.25]);
-});
