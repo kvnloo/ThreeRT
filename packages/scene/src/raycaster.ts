@@ -137,6 +137,13 @@ export class Raycaster {
 
   private visit(o: Object3D, recursive: boolean, out: Intersection[]): void {
     o.updateWorldMatrix(true, false);
+    // (As three.js: each object answers with its own `raycast`, false keeping the ray from its children.)
+    if (o.raycast(this, out) === false) return;
+    if (recursive) for (const c of o.children) this.visit(c, true, out);
+  }
+
+  /** @internal What a mesh, an instanced mesh or a procedural mesh's `raycast` adds: its hits of the ray. */
+  _raycastOwn(o: Object3D, out: Intersection[]): void {
     if (o instanceof InstancedMesh) {
       if (!(o.geometry instanceof ProceduralGeometry)) {
         const m = new Matrix4();
@@ -152,7 +159,6 @@ export class Raycaster {
     } else if (o instanceof ProceduralMesh) {
       this.boxes(o, o.geometry.boxes, o.matrixWorld, out);
     }
-    if (recursive) for (const c of o.children) this.visit(c, true, out);
   }
 
   private local(world: Matrix4): Ray {
