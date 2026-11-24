@@ -218,11 +218,22 @@ export class Vector3 {
       Math.hypot(e[8], e[9], e[10]),
     );
   }
-  toArray(): [number, number, number] {
-    return [this.x, this.y, this.z];
+  /** A new `[x, y, z]`, or written into `array` at `offset` (three.js). */
+  toArray(): [number, number, number];
+  toArray<T extends { [i: number]: number }>(array: T, offset?: number): T;
+  toArray(array?: { [i: number]: number }, offset = 0): { [i: number]: number } {
+    if (array === undefined) return [this.x, this.y, this.z];
+    array[offset] = this.x;
+    array[offset + 1] = this.y;
+    array[offset + 2] = this.z;
+    return array;
   }
   fromArray(a: ArrayLike<number>, o = 0): this {
     return this.set(a[o], a[o + 1], a[o + 2]);
+  }
+  /** Vertex `index` of a BufferAttribute (three.js). */
+  fromBufferAttribute(attribute: { getX(i: number): number; getY(i: number): number; getZ(i: number): number }, index: number): this {
+    return this.set(attribute.getX(index), attribute.getY(index), attribute.getZ(index));
   }
 }
 
@@ -1321,11 +1332,21 @@ export class Vector2 {
   equals(v: Vector2): boolean {
     return v.x === this.x && v.y === this.y;
   }
-  toArray(): [number, number] {
-    return [this.x, this.y];
+  /** A new `[x, y]`, or written into `array` at `offset` (three.js). */
+  toArray(): [number, number];
+  toArray<T extends { [i: number]: number }>(array: T, offset?: number): T;
+  toArray(array?: { [i: number]: number }, offset = 0): { [i: number]: number } {
+    if (array === undefined) return [this.x, this.y];
+    array[offset] = this.x;
+    array[offset + 1] = this.y;
+    return array;
   }
   fromArray(a: ArrayLike<number>, o = 0): this {
     return this.set(a[o], a[o + 1]);
+  }
+  /** Vertex `index` of a BufferAttribute (three.js). */
+  fromBufferAttribute(attribute: { getX(i: number): number; getY(i: number): number }, index: number): this {
+    return this.set(attribute.getX(index), attribute.getY(index));
   }
 }
 
