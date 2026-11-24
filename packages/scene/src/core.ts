@@ -248,7 +248,7 @@ export function bindBody(o: Object3D, b: BoundBody): void {
       if (b.epoch !== physicsEpoch) pullPose(b, p, q);
       if (b.euler) {
         b.euler = false;
-        r.setFromQuaternion(q, false);
+        r.setFromQuaternion(q, undefined, false);
       }
       return r;
     },
@@ -350,7 +350,7 @@ function rotationChanged(this: Euler): void {
 function quaternionChanged(this: Quaternion): void {
   const o = this._owner?.deref() as Object3D | undefined;
   if (!o) return;
-  o.rotation.setFromQuaternion(this, false);
+  o.rotation.setFromQuaternion(this, undefined, false);
   touched(o);
 }
 
