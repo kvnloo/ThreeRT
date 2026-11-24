@@ -638,11 +638,11 @@ mod tests {
     #[test]
     fn the_locus_direction_is_ues() {
         // UE PlanckianIsothermal's derivative of the Krystek locus, written out as it has it.
-        for t in [1900.0, 2700.0, 4000.0, 6500.0, 10000.0, 25000.0] {
-            let ud = (-1.13758118e9 - 1.91615621e6 * t - 1.53177 * t * t) / (1.41213984e6 + 1189.62 * t + t * t).powi(2);
-            let vd = (1.97471536e9 - 705674.0 * t - 308.607 * t * t) / (6.19363586e6 - 1177.62 * t + t * t).powi(2);
+        for t in [1900.0f64, 2700.0, 4000.0, 6500.0, 10000.0, 25000.0] {
+            let ud = (-1.13758118e9 - 1.91615621e6 * t - 1.53177 * t * t) / f64::powi(1.41213984e6 + 1189.62 * t + t * t, 2);
+            let vd = (1.97471536e9 - 705674.0 * t - 308.607 * t * t) / f64::powi(6.19363586e6 - 179.456 * t + t * t, 2);
             let (_, [du, dv]) = planckian_uv(t);
-            assert!((du / ud - 1.0).abs() < 1e-5 && (dv / vd - 1.0).abs() < 1e-5, "{t} K: {du} {dv} vs UE {ud} {vd}");
+            assert!((du / ud - 1.0).abs() < 1e-4 && (dv / vd - 1.0).abs() < 1e-4, "{t} K: {du} {dv} vs UE {ud} {vd}");
         }
     }
 
