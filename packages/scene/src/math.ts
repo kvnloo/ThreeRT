@@ -716,6 +716,110 @@ export class Vector2 {
   multiplyScalar(s: number): this {
     return this.set(this.x * s, this.y * s);
   }
+  // Component-wise arithmetic and plane geometry, as three.js r187 has them.
+  setX(x: number): this {
+    return this.set(x, this.y);
+  }
+  setY(y: number): this {
+    return this.set(this.x, y);
+  }
+  setComponent(index: number, value: number): this {
+    if (index === 0) this.x = value;
+    else if (index === 1) this.y = value;
+    else throw new RangeError(`index is out of range: ${index}`);
+    return this;
+  }
+  getComponent(index: number): number {
+    if (index === 0) return this.x;
+    if (index === 1) return this.y;
+    throw new RangeError(`index is out of range: ${index}`);
+  }
+  addScalar(s: number): this {
+    return this.set(this.x + s, this.y + s);
+  }
+  addVectors(a: Vector2, b: Vector2): this {
+    return this.set(a.x + b.x, a.y + b.y);
+  }
+  addScaledVector(v: Vector2, s: number): this {
+    return this.set(this.x + v.x * s, this.y + v.y * s);
+  }
+  subScalar(s: number): this {
+    return this.set(this.x - s, this.y - s);
+  }
+  subVectors(a: Vector2, b: Vector2): this {
+    return this.set(a.x - b.x, a.y - b.y);
+  }
+  multiply(v: Vector2): this {
+    return this.set(this.x * v.x, this.y * v.y);
+  }
+  divide(v: Vector2): this {
+    return this.set(this.x / v.x, this.y / v.y);
+  }
+  divideScalar(s: number): this {
+    return this.multiplyScalar(1 / s);
+  }
+  min(v: Vector2): this {
+    return this.set(Math.min(this.x, v.x), Math.min(this.y, v.y));
+  }
+  max(v: Vector2): this {
+    return this.set(Math.max(this.x, v.x), Math.max(this.y, v.y));
+  }
+  /** Assumes min <= max component-wise, as three.js does. */
+  clamp(min: Vector2, max: Vector2): this {
+    return this.set(Math.max(min.x, Math.min(max.x, this.x)), Math.max(min.y, Math.min(max.y, this.y)));
+  }
+  clampScalar(minVal: number, maxVal: number): this {
+    return this.set(Math.max(minVal, Math.min(maxVal, this.x)), Math.max(minVal, Math.min(maxVal, this.y)));
+  }
+  clampLength(min: number, max: number): this {
+    const l = this.length();
+    return this.divideScalar(l || 1).multiplyScalar(Math.max(min, Math.min(max, l)));
+  }
+  floor(): this {
+    return this.set(Math.floor(this.x), Math.floor(this.y));
+  }
+  ceil(): this {
+    return this.set(Math.ceil(this.x), Math.ceil(this.y));
+  }
+  round(): this {
+    return this.set(Math.round(this.x), Math.round(this.y));
+  }
+  negate(): this {
+    return this.set(-this.x, -this.y);
+  }
+  lengthSq(): number {
+    return this.x * this.x + this.y * this.y;
+  }
+  manhattanLength(): number {
+    return Math.abs(this.x) + Math.abs(this.y);
+  }
+  setLength(length: number): this {
+    return this.normalize().multiplyScalar(length);
+  }
+  /** The angle from the +x axis, in [0, 2π). */
+  angle(): number {
+    return Math.atan2(-this.y, -this.x) + Math.PI;
+  }
+  angleTo(v: Vector2): number {
+    const denominator = Math.sqrt(this.lengthSq() * v.lengthSq());
+    if (denominator === 0) return Math.PI / 2;
+    return Math.acos(Math.max(-1, Math.min(1, this.dot(v) / denominator)));
+  }
+  distanceToSquared(v: Vector2): number {
+    const dx = this.x - v.x, dy = this.y - v.y;
+    return dx * dx + dy * dy;
+  }
+  manhattanDistanceTo(v: Vector2): number {
+    return Math.abs(this.x - v.x) + Math.abs(this.y - v.y);
+  }
+  lerpVectors(v1: Vector2, v2: Vector2, alpha: number): this {
+    return this.set(v1.x + (v2.x - v1.x) * alpha, v1.y + (v2.y - v1.y) * alpha);
+  }
+  rotateAround(center: Vector2, angle: number): this {
+    const c = Math.cos(angle), s = Math.sin(angle);
+    const x = this.x - center.x, y = this.y - center.y;
+    return this.set(x * c - y * s + center.x, x * s + y * c + center.y);
+  }
   roundToZero(): this {
     return this.set(Math.trunc(this.x), Math.trunc(this.y));
   }
@@ -729,8 +833,8 @@ export class Vector2 {
     return Math.hypot(this.x, this.y);
   }
   normalize(): this {
-    const l = this.length() || 1;
-    return this.set(this.x / l, this.y / l);
+    // Through divideScalar (a multiply by 1 / length), as three.js does, so normalize and setLength round alike.
+    return this.divideScalar(this.length() || 1);
   }
   distanceTo(v: Vector2): number {
     return Math.hypot(this.x - v.x, this.y - v.y);
