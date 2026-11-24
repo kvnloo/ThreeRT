@@ -1,6 +1,7 @@
 // three.js-compatible geometry generators. Vertex layout and winding match three (CCW front faces).
 
 import { Box3, Matrix4, type Quaternion, Sphere, Vector3 } from "./math.ts";
+import type { InterleavedBufferAttribute } from "./interleaved.ts";
 
 let geometryIds = 0;
 
@@ -212,7 +213,9 @@ export class BufferGeometry {
     this.needsUpdate = true;
     this.version++;
   }
-  setAttribute(name: string, attribute: BufferAttribute): this {
+  /** An `InterleavedBufferAttribute` is taken de-interleaved (its `clone()`): set it again after editing its buffer. */
+  setAttribute(name: string, attribute: BufferAttribute | InterleavedBufferAttribute): this {
+    if (!(attribute instanceof BufferAttribute)) attribute = attribute.clone();
     const a = name === "position" || name === "normal" || name === "uv" ? asFloat32(attribute) : attribute;
     a._geometry = this;
     this.attributes[name] = a;
