@@ -420,6 +420,10 @@ export class Quaternion {
   slerpQuaternions(qa: Quaternion, qb: Quaternion, t: number): this {
     return this.copy(qa).slerp(qb, t);
   }
+  /** x, y, z, w from item `index` of a 4-component attribute (three.js). */
+  fromBufferAttribute(attribute: { getX(i: number): number; getY(i: number): number; getZ(i: number): number; getW(i: number): number }, index: number): this {
+    return this.set(attribute.getX(index), attribute.getY(index), attribute.getZ(index), attribute.getW(index));
+  }
   equals(q: Quaternion): boolean {
     return q._x === this._x && q._y === this._y && q._z === this._z && q._w === this._w;
   }
