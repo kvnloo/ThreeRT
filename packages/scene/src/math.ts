@@ -101,6 +101,21 @@ export class Vector3 {
     const tz = 2 * (qx * vy - qy * vx);
     return this.set(vx + qw * tx + qy * tz - qz * ty, vy + qw * ty + qz * tx - qx * tz, vz + qw * tz + qx * ty - qy * tx);
   }
+  setFromSpherical(s: Spherical): this {
+    return this.setFromSphericalCoords(s.radius, s.phi, s.theta);
+  }
+  /** The point at `radius`, polar angle `phi` from +Y and azimuth `theta` around Y from +Z (three.js). */
+  setFromSphericalCoords(radius: number, phi: number, theta: number): this {
+    const sinPhiRadius = Math.sin(phi) * radius;
+    return this.set(sinPhiRadius * Math.sin(theta), Math.cos(phi) * radius, sinPhiRadius * Math.cos(theta));
+  }
+  setFromCylindrical(c: Cylindrical): this {
+    return this.setFromCylindricalCoords(c.radius, c.theta, c.y);
+  }
+  /** The point at `radius` from the Y axis, azimuth `theta` from +Z, height `y` (three.js). */
+  setFromCylindricalCoords(radius: number, theta: number, y: number): this {
+    return this.set(radius * Math.sin(theta), y, radius * Math.cos(theta));
+  }
   setFromMatrixPosition(m: Matrix4): this {
     return this.set(m.elements[12], m.elements[13], m.elements[14]);
   }
@@ -971,3 +986,80 @@ export const MathUtils = {
   euclideanModulo: (n: number, m: number) => ((n % m) + m) % m,
   lerp: (a: number, b: number, t: number) => a + (b - a) * t,
 };
+
+/** Spherical coordinates: `phi` is the polar angle from +Y, `theta` the azimuth around Y from +Z (three.js r187). */
+export class Spherical {
+  radius: number;
+  phi: number;
+  theta: number;
+  constructor(radius = 1, phi = 0, theta = 0) {
+    this.radius = radius;
+    this.phi = phi;
+    this.theta = theta;
+  }
+  set(radius: number, phi: number, theta: number): this {
+    this.radius = radius;
+    this.phi = phi;
+    this.theta = theta;
+    return this;
+  }
+  copy(other: Spherical): this {
+    return this.set(other.radius, other.phi, other.theta);
+  }
+  clone(): Spherical {
+    return new Spherical(this.radius, this.phi, this.theta);
+  }
+  /** Keep `phi` off the poles, where `theta` is undefined (three.js's 1e-6). */
+  makeSafe(): this {
+    const EPS = 0.000001;
+    this.phi = Math.max(EPS, Math.min(Math.PI - EPS, this.phi));
+    return this;
+  }
+  setFromVector3(v: Vector3): this {
+    return this.setFromCartesianCoords(v.x, v.y, v.z);
+  }
+  setFromCartesianCoords(x: number, y: number, z: number): this {
+    this.radius = Math.sqrt(x * x + y * y + z * z);
+    if (this.radius === 0) {
+      this.theta = 0;
+      this.phi = 0;
+    } else {
+      this.theta = Math.atan2(x, z);
+      this.phi = Math.acos(Math.max(-1, Math.min(1, y / this.radius)));
+    }
+    return this;
+  }
+}
+
+/** Cylindrical coordinates around the Y axis: `theta` is the azimuth from +Z (three.js r187). */
+export class Cylindrical {
+  radius: number;
+  theta: number;
+  y: number;
+  constructor(radius = 1, theta = 0, y = 0) {
+    this.radius = radius;
+    this.theta = theta;
+    this.y = y;
+  }
+  set(radius: number, theta: number, y: number): this {
+    this.radius = radius;
+    this.theta = theta;
+    this.y = y;
+    return this;
+  }
+  copy(other: Cylindrical): this {
+    return this.set(other.radius, other.theta, other.y);
+  }
+  clone(): Cylindrical {
+    return new Cylindrical(this.radius, this.theta, this.y);
+  }
+  setFromVector3(v: Vector3): this {
+    return this.setFromCartesianCoords(v.x, v.y, v.z);
+  }
+  setFromCartesianCoords(x: number, y: number, z: number): this {
+    this.radius = Math.sqrt(x * x + z * z);
+    this.theta = Math.atan2(x, z);
+    this.y = y;
+    return this;
+  }
+}
