@@ -1201,6 +1201,8 @@ export interface MeshPhysicalMaterialParameters extends MeshStandardMaterialPara
   /** Scales `transmission` by its red channel (three.js / glTF transmissionTexture). */
   transmissionMap?: Texture | null;
   ior?: number;
+  /** Sets `ior` (three.js): 0..1, 0.5 = ior 1.5. */
+  reflectivity?: number;
   specularIntensity?: number;
 }
 
@@ -1249,6 +1251,13 @@ export class MeshPhysicalMaterial extends MeshStandardMaterial {
   transmissionMap: Texture | null = null;
   ior = 1.5;
   specularIntensity = 1;
+  /** The dielectric's reflectance as three.js has it: `ior` mapped to 0..1 (0.5 = ior 1.5); setting it sets `ior`. */
+  get reflectivity(): number {
+    return Math.min(Math.max((2.5 * (this.ior - 1)) / (this.ior + 1), 0), 1);
+  }
+  set reflectivity(reflectivity: number) {
+    this.ior = (1 + 0.4 * reflectivity) / (1 - 0.4 * reflectivity);
+  }
   constructor(params: MeshPhysicalMaterialParameters = {}) {
     super();
     this.setValues(params);
