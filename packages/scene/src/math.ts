@@ -1593,6 +1593,115 @@ export class Ray {
   at(t: number, target = new Vector3()): Vector3 {
     return target.set(this.origin.x + this.direction.x * t, this.origin.y + this.direction.y * t, this.origin.z + this.direction.z * t);
   }
+  copy(ray: Ray): this {
+    return this.set(ray.origin, ray.direction);
+  }
+  clone(): Ray {
+    return new Ray().copy(this);
+  }
+  equals(ray: Ray): boolean {
+    return ray.origin.equals(this.origin) && ray.direction.equals(this.direction);
+  }
+  /** Points the ray from its origin toward `v` (three.js). */
+  lookAt(v: Vector3): this {
+    this.direction.copy(v).sub(this.origin).normalize();
+    return this;
+  }
+  /** Moves the origin `t` along the ray (three.js). */
+  recast(t: number): this {
+    this.origin.copy(this.at(t, new Vector3()));
+    return this;
+  }
+  /** The point of the ray nearest `point`: the origin when `point` lies behind it (three.js). */
+  closestPointToPoint(point: Vector3, target = new Vector3()): Vector3 {
+    const t = target.subVectors(point, this.origin).dot(this.direction);
+    return t < 0 ? target.copy(this.origin) : target.copy(this.origin).addScaledVector(this.direction, t);
+  }
+  distanceToPoint(point: Vector3): number {
+    return Math.sqrt(this.distanceSqToPoint(point));
+  }
+  distanceSqToPoint(point: Vector3): number {
+    return this.closestPointToPoint(point).distanceToSquared(point);
+  }
+  /** The squared distance from the ray to the segment `v0`–`v1`, and optionally the nearest points on each
+   *  (three.js, after Eberly's DistRaySegment). */
+  distanceSqToSegment(v0: Vector3, v1: Vector3, optionalPointOnRay?: Vector3, optionalPointOnSegment?: Vector3): number {
+    const segCenter = new Vector3().addVectors(v0, v1).multiplyScalar(0.5);
+    const segDir = new Vector3().subVectors(v1, v0).normalize();
+    const diff = new Vector3().subVectors(this.origin, segCenter);
+    const segExtent = v0.distanceTo(v1) * 0.5;
+    const a01 = -this.direction.dot(segDir);
+    const b0 = diff.dot(this.direction);
+    const b1 = -diff.dot(segDir);
+    const c = diff.lengthSq();
+    const det = Math.abs(1 - a01 * a01);
+    let s0: number, s1: number, sqrDist: number;
+    if (det > 0) {
+      // The ray and segment are not parallel.
+      s0 = a01 * b1 - b0;
+      s1 = a01 * b0 - b1;
+      const extDet = segExtent * det;
+      if (s0 >= 0) {
+        if (s1 >= -extDet) {
+          if (s1 <= extDet) {
+            // The minimum is at interior points of both.
+            const invDet = 1 / det;
+            s0 *= invDet;
+            s1 *= invDet;
+            sqrDist = s0 * (s0 + a01 * s1 + 2 * b0) + s1 * (a01 * s0 + s1 + 2 * b1) + c;
+          } else {
+            s1 = segExtent;
+            s0 = Math.max(0, -(a01 * s1 + b0));
+            sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+          }
+        } else {
+          s1 = -segExtent;
+          s0 = Math.max(0, -(a01 * s1 + b0));
+          sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+        }
+      } else if (s1 <= -extDet) {
+        s0 = Math.max(0, -(-a01 * segExtent + b0));
+        s1 = s0 > 0 ? -segExtent : Math.min(Math.max(-segExtent, -b1), segExtent);
+        sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+      } else if (s1 <= extDet) {
+        s0 = 0;
+        s1 = Math.min(Math.max(-segExtent, -b1), segExtent);
+        sqrDist = s1 * (s1 + 2 * b1) + c;
+      } else {
+        s0 = Math.max(0, -(a01 * segExtent + b0));
+        s1 = s0 > 0 ? segExtent : Math.min(Math.max(-segExtent, -b1), segExtent);
+        sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+      }
+    } else {
+      // Parallel: the nearest end of the segment.
+      s1 = a01 > 0 ? -segExtent : segExtent;
+      s0 = Math.max(0, -(a01 * s1 + b0));
+      sqrDist = -s0 * s0 + s1 * (s1 + 2 * b1) + c;
+    }
+    optionalPointOnRay?.copy(this.origin).addScaledVector(this.direction, s0);
+    optionalPointOnSegment?.copy(segCenter).addScaledVector(segDir, s1);
+    return sqrDist;
+  }
+  /** Where the ray first meets `sphere` (its exit if the origin is inside), or null; an empty sphere is never met (three.js). */
+  intersectSphere(sphere: Sphere, target = new Vector3()): Vector3 | null {
+    if (sphere.radius < 0) return null;
+    const v = new Vector3().subVectors(sphere.center, this.origin);
+    const tca = v.dot(this.direction);
+    const d2 = v.dot(v) - tca * tca;
+    const radius2 = sphere.radius * sphere.radius;
+    if (d2 > radius2) return null;
+    const thc = Math.sqrt(radius2 - d2);
+    const t0 = tca - thc, t1 = tca + thc;
+    if (t1 < 0) return null;
+    return this.at(t0 < 0 ? t1 : t0, target);
+  }
+  intersectsSphere(sphere: Sphere): boolean {
+    if (sphere.radius < 0) return false;
+    return this.distanceSqToPoint(sphere.center) <= sphere.radius * sphere.radius;
+  }
+  intersectsBox(box: Box3): boolean {
+    return this.intersectBox(box) !== null;
+  }
   applyMatrix4(m: Matrix4): this {
     this.origin.applyMatrix4(m);
     this.direction.transformDirection(m);
