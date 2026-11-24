@@ -296,6 +296,28 @@ test("Raycaster: a mesh hit has barycoord, the interpolated normal facing the ra
   assert.equal(new THREE.Raycaster(new THREE.Vector3(1.5, 0.4, 5), new THREE.Vector3(0, 0, -1)).intersectObject(mesh)[0].uv1, undefined);
 });
 
+test("Raycaster: each object answers with its own raycast, which can be replaced and stop the descent, as three.js does", () => {
+  const box = () => new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+  const parent = box(), child = box();
+  child.position.z = -3;
+  parent.add(child);
+  const rc = new THREE.Raycaster(new THREE.Vector3(0.1, 0.2, 5), new THREE.Vector3(0, 0, -1));
+  const hit = () => rc.intersectObject(parent).map((h) => h.object === parent ? "parent" : "child");
+  assert.deepEqual(hit(), ["parent", "child"]);
+  parent.raycast = () => {};
+  assert.deepEqual(hit(), ["child"], "an object that never answers: its children still do");
+  parent.raycast = () => false;
+  assert.deepEqual(hit(), [], "false: the ray does not go on to its children");
+  parent.raycast = function (this: THREE.Mesh, raycaster, intersects) {
+    THREE.Mesh.prototype.raycast.call(this, raycaster, intersects);
+  };
+  assert.deepEqual(hit(), ["parent", "child"], "Mesh.prototype.raycast, called from a replacement");
+  const group = new THREE.Group();
+  group.add(box());
+  group.raycast = () => false;
+  assert.equal(rc.intersectObject(group).length, 0);
+});
+
 test("Object3D.remove: notifies the child and then its old parent after unparenting, as three.js does", () => {
   const [a, b, x, y, z] = ["a", "b", "x", "y", "z"].map((name) => Object.assign(new THREE.Object3D(), { name }));
   const log: string[] = [];
