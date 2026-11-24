@@ -663,6 +663,30 @@ export class Matrix4 {
       n44 * (-n13 * n22 * n31 - n11 * n23 * n32 + n11 * n22 * n33 + n13 * n21 * n32 - n12 * n21 * n33 + n12 * n23 * n31)
     );
   }
+  /** Multiplies every element by `s`, as three.js does. */
+  multiplyScalar(s: number): this {
+    const te = this.elements;
+    for (let k = 0; k < 16; k++) te[k] *= s;
+    return this;
+  }
+  /** Scales the first three columns by `v`, as three.js does. */
+  scale(v: Vector3): this {
+    const te = this.elements;
+    const x = v.x, y = v.y, z = v.z;
+    te[0] *= x; te[4] *= y; te[8] *= z;
+    te[1] *= x; te[5] *= y; te[9] *= z;
+    te[2] *= x; te[6] *= y; te[10] *= z;
+    te[3] *= x; te[7] *= y; te[11] *= z;
+    return this;
+  }
+  /** The largest of the three basis-column lengths. */
+  getMaxScaleOnAxis(): number {
+    const te = this.elements;
+    const scaleXSq = te[0] * te[0] + te[1] * te[1] + te[2] * te[2];
+    const scaleYSq = te[4] * te[4] + te[5] * te[5] + te[6] * te[6];
+    const scaleZSq = te[8] * te[8] + te[9] * te[9] + te[10] * te[10];
+    return Math.sqrt(Math.max(scaleXSq, scaleYSq, scaleZSq));
+  }
   /** Transpose in place, as three.js does. */
   transpose(): this {
     const te = this.elements;
