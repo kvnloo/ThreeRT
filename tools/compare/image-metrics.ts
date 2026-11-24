@@ -28,9 +28,10 @@ export interface Stats {
   de2000: number;
   de2000_p95: number;
   de2000_p99: number;
-  /** Mean / p95 CIE76 (the renderer's `compare` mean_delta_e). */
+  /** Mean / p95 / p99 CIE76: the renderer's `compare` mean_delta_e / p95_delta_e / p99_delta_e. */
   de76: number;
   de76_p95: number;
+  de76_p99: number;
   /** Mean SSIM over the region's pixels (each pixel's SSIM from its 11 x 11 window over the whole image). */
   ssim: number;
   /** Mean linear luminance of the test over the reference's. */
@@ -303,6 +304,7 @@ export function measure(reference: Rgb8, test: Rgb8, o: MeasureOptions = {}): { 
       de2000_p99: round(quantile(d2, 0.99), 2),
       de76: round(s7 / m, 3),
       de76_p95: round(quantile(d7, 0.95), 2),
+      de76_p99: round(quantile(d7, 0.99), 2),
       ssim: round(ss / m, 4),
       luminance_ratio: round(sb / Math.max(sa, 1e-9), 3),
       over5: round(over / m, 4),

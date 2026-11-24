@@ -1,5 +1,7 @@
-// ΔE (CIEDE2000, and CIE76 as the renderer's `compare`) / SSIM of renders against our offline render: overall and per
-// region, as JSON, a heat map and a reference | test | heat sheet. Needs only Node (no renderer build, no GPU).
+// A companion to the renderer's `threert-render compare`: where in the frame the error is. The headline columns are
+// compare's (ΔE76 mean / p99, SSIM, the same numbers to the second decimal); on top of them, CIEDE2000, a table per
+// region (a grid and named rects, the worst named), a heat map with the regions drawn on it, and bars that exit 1.
+// Needs only Node (no renderer build, no GPU), so it also runs on captures from another machine.
 //
 //   node tools/compare/delta-e.ts <reference> <test> [options]
 //   node tools/compare/delta-e.ts --manifest poses.json [options]
@@ -11,7 +13,8 @@
 //   --region name=u0,v0,u1,v1  a named region (0..1, v down), repeatable: "street=0,0.6,1,1"
 //   --align                  take the exposure out first: one gain on the test's linear RGB to the reference's luminance
 //   --max-de2000 <v> --max-de76 <v> --min-ssim <v>   bars on the overall numbers; a miss exits 1
-//   --bar step2              the streamed city's bar (ROADMAP § 0 step 2: ΔE ≤ 1.0, SSIM ≥ 0.98; ΔE as ΔE2000)
+//   --bar step2              the streamed city's bar (ROADMAP § 0 step 2: ΔE ≤ 1.0, SSIM ≥ 0.98), ΔE read as ΔE76
+//                            mean, the number `compare` reports; add --max-de2000 for a CIEDE2000 bar
 //   --scale <v>              ΔE2000 at the heat map's full scale (default 10)
 //
 // A manifest measures several poses in one run (the streamed city's fixed poses, live against offline or streamed
@@ -100,7 +103,8 @@ export function summarize(reports: PoseReport[], bars?: Bars): Summary {
 
 const fmt = (r: PoseReport) => {
   const regions = r.regions.length ? `  worst region ${r.worst} (ΔE2000 ${r.regions.find((g) => g.name === r.worst)!.de2000})` : "";
-  return `${r.name}: ΔE2000 ${r.overall.de2000} (p95 ${r.overall.de2000_p95})  ΔE76 ${r.overall.de76}  SSIM ${r.overall.ssim}  luminance ${r.overall.luminance_ratio}${regions}${r.pass === false ? `  FAIL: ${r.failed!.join(", ")}` : r.pass ? "  pass" : ""}`;
+  const o = r.overall;
+  return `${r.name}: ΔE76 / p99 / SSIM ${o.de76.toFixed(2)} / ${o.de76_p99.toFixed(1)} / ${o.ssim.toFixed(3)}  ΔE2000 ${o.de2000} (p95 ${o.de2000_p95})  luminance ${o.luminance_ratio}${regions}${r.pass === false ? `  FAIL: ${r.failed!.join(", ")}` : r.pass ? "  pass" : ""}`;
 };
 
 /** The command line; returns the exit code. Logs go to stderr, the JSON (one pair's report or the manifest's) to stdout. */
@@ -133,7 +137,7 @@ export async function main(argv: string[]): Promise<number> {
     else if (a === "--bar") {
       const b = val();
       if (b !== "step2") throw new Error(`--bar ${b}: only step2 is known`);
-      bars.de2000 = 1.0;
+      bars.de76 = 1.0;
       bars.ssim = 0.98;
     } else if (a === "--scale") scale = num();
     else if (a.startsWith("--")) throw new Error(`unknown option ${a}`);
@@ -167,7 +171,7 @@ export async function main(argv: string[]): Promise<number> {
   const summary = summarize(reports, o.bars);
   const all = { summary, poses: reports };
   writeFileSync(join(out, "summary.json"), JSON.stringify(all, null, 2) + "\n");
-  console.error(`${summary.poses} poses: mean ΔE2000 ${summary.mean.de2000}  SSIM ${summary.mean.ssim}; worst ΔE2000 ${summary.worst.de2000.value} (${summary.worst.de2000.pose}), worst SSIM ${summary.worst.ssim.value} (${summary.worst.ssim.pose})${summary.pass === false ? "  FAIL" : summary.pass ? "  pass" : ""}`);
+  console.error(`${summary.poses} poses: mean ΔE76 ${summary.mean.de76}  ΔE2000 ${summary.mean.de2000}  SSIM ${summary.mean.ssim}; worst ΔE2000 ${summary.worst.de2000.value} (${summary.worst.de2000.pose}), worst SSIM ${summary.worst.ssim.value} (${summary.worst.ssim.pose})${summary.pass === false ? "  FAIL" : summary.pass ? "  pass" : ""}`);
   console.log(JSON.stringify(all));
   return summary.pass === false ? 1 : 0;
 }

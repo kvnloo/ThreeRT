@@ -162,12 +162,13 @@ const gradient = (w: number, h: number, seed: number): Rgb8 => {
   return { width: w, height: h, data };
 };
 
-test("ΔE76, p95, SSIM and luminance are the renderer's `compare` numbers on the same pair", () => {
+test("ΔE76, p95, p99, SSIM and luminance are the renderer's `compare` numbers on the same pair", () => {
   // `threert-render compare a.png b.png` on these two images (renderer/src/compare.rs): mean_delta_e 9.96,
-  // p95_delta_e 19.74, ssim 0.8795, luminance_ratio 1.003.
+  // p95_delta_e 19.74, p99_delta_e 25.97, ssim 0.8795, luminance_ratio 1.003.
   const { result } = measure(gradient(24, 16, 1), gradient(24, 16, 2));
   assert.equal(Math.round(result.overall.de76 * 100) / 100, 9.96);
   assert.equal(result.overall.de76_p95, 19.74);
+  assert.equal(result.overall.de76_p99, 25.97);
   assert.equal(result.overall.ssim, 0.8795);
   assert.equal(result.overall.luminance_ratio, 1.003);
 });
