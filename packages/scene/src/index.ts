@@ -11,3 +11,5 @@ export * from "./effects.ts";
 export * from "./procedural.ts";
 export * from "./compat.ts";
 export * from "./raycaster.ts";
+export { Timer, Clock } from "./timer.ts";
+export * from "./timer.ts";
