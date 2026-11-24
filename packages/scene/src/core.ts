@@ -2320,6 +2320,7 @@ export type Environment = SkyAtmosphere | SkyColor | HDRIEnvironment | SkyGradie
 
 /** UE-style exponential height fog. `color` x `intensity` = ambient inscattering radiance (nits). */
 export class ExponentialHeightFog {
+  name = "";
   density: number;
   heightFalloff: number;
   color: Color;
@@ -2394,6 +2395,15 @@ export class Fog extends ExponentialHeightFog {
     this.density = Math.log(20) / Math.max(this._far - this._near, 1e-3);
     this.startDistance = Math.max(this._near, 0);
   }
+  /** A new Fog of the same colour, near and far (and the height-fog settings it inherits). */
+  clone(): Fog {
+    const { name, heightFalloff, intensity, height, maxOpacity } = this;
+    return Object.assign(new Fog(this.color, this.near, this.far), { name, heightFalloff, intensity, height, maxOpacity, volumetric: structuredClone(this.volumetric) });
+  }
+  /** three.js's JSON of a Fog. */
+  toJSON(): { type: "Fog"; name: string; color: number; near: number; far: number } {
+    return { type: "Fog", name: this.name, color: this.color.getHex(), near: this.near, far: this.far };
+  }
 }
 
 /** three.js FogExp2: transmittance exp(-(density d)^2). Mapped to uniform exponential fog of the same e-folding
@@ -2404,8 +2414,12 @@ export class FogExp2 extends ExponentialHeightFog {
     super(density, 0, color);
   }
   clone(): FogExp2 {
-    const { heightFalloff, intensity, height, startDistance, maxOpacity } = this;
-    return Object.assign(new FogExp2(this.color, this.density), { heightFalloff, intensity, height, startDistance, maxOpacity, volumetric: structuredClone(this.volumetric) });
+    const { name, heightFalloff, intensity, height, startDistance, maxOpacity } = this;
+    return Object.assign(new FogExp2(this.color, this.density), { name, heightFalloff, intensity, height, startDistance, maxOpacity, volumetric: structuredClone(this.volumetric) });
+  }
+  /** three.js's JSON of a FogExp2. */
+  toJSON(): { type: "FogExp2"; name: string; color: number; density: number } {
+    return { type: "FogExp2", name: this.name, color: this.color.getHex(), density: this.density };
   }
 }
 

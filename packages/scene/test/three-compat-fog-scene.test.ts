@@ -32,3 +32,28 @@ test("FogExp2.clone keeps the height-fog and volumetric settings it inherits", (
   assert.notEqual(cloned.volumetric, fog.volumetric);
   assert.notEqual(cloned.volumetric!.albedo, fog.volumetric.albedo);
 });
+
+test("Fog.clone is an independent Fog with the same colour, near and far, as three.js r187 has it", () => {
+  const fog = new THREE.Fog(0x336699, 2, 50);
+  fog.name = "haze";
+  const c = fog.clone();
+  assert.ok(c instanceof THREE.Fog);
+  assert.equal(c.isFog, true);
+  assert.deepEqual([c.name, c.color.getHex(), c.near, c.far], ["haze", 0x336699, 2, 50]);
+  assert.equal(c.density, fog.density);
+  assert.equal(c.startDistance, fog.startDistance);
+  assert.notEqual(c.color, fog.color);
+  c.far = 100;
+  assert.equal(fog.far, 50);
+});
+
+test("Fog and FogExp2: name defaults to '' and toJSON is three.js r187's", () => {
+  const fog = new THREE.Fog(0x336699, 2, 50);
+  const exp = new THREE.FogExp2(0xff8800, 0.01);
+  assert.equal(fog.name, "");
+  assert.equal(exp.name, "");
+  exp.name = "mist";
+  assert.equal(exp.clone().name, "mist");
+  assert.deepEqual(fog.toJSON(), { type: "Fog", name: "", color: 0x336699, near: 2, far: 50 });
+  assert.deepEqual(exp.toJSON(), { type: "FogExp2", name: "mist", color: 0xff8800, density: 0.01 });
+});
