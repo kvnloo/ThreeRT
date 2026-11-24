@@ -1000,6 +1000,115 @@ export class Ray {
     const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
     return t >= 0 ? { t, u, v } : null;
   }
+  /** The distance along the ray to `plane` (0 if the origin lies on it), or null if the ray does not reach it. */
+  distanceToPlane(plane: Plane): number | null {
+    const denom = plane.normal.dot(this.direction);
+    if (denom === 0) return plane.distanceToPoint(this.origin) === 0 ? 0 : null;
+    const t = -(this.origin.dot(plane.normal) + plane.constant) / denom;
+    return t >= 0 ? t : null;
+  }
+  /** Where the ray meets `plane`, or null. */
+  intersectPlane(plane: Plane, target = new Vector3()): Vector3 | null {
+    const t = this.distanceToPlane(plane);
+    return t === null ? null : this.at(t, target);
+  }
+  intersectsPlane(plane: Plane): boolean {
+    const d = plane.distanceToPoint(this.origin);
+    if (d === 0) return true;
+    return plane.normal.dot(this.direction) * d < 0;
+  }
+}
+
+/** An infinite plane: the points p with `normal · p + constant = 0` (three.js's Plane). */
+export class Plane {
+  normal: Vector3;
+  constant: number;
+  constructor(normal = new Vector3(1, 0, 0), constant = 0) {
+    this.normal = normal;
+    this.constant = constant;
+  }
+  set(normal: Vector3, constant: number): this {
+    this.normal.copy(normal);
+    this.constant = constant;
+    return this;
+  }
+  setComponents(x: number, y: number, z: number, w: number): this {
+    this.normal.set(x, y, z);
+    this.constant = w;
+    return this;
+  }
+  setFromNormalAndCoplanarPoint(normal: Vector3, point: Vector3): this {
+    this.normal.copy(normal);
+    this.constant = -point.dot(this.normal);
+    return this;
+  }
+  /** The plane through a, b and c, facing the side from which they run counter-clockwise. */
+  setFromCoplanarPoints(a: Vector3, b: Vector3, c: Vector3): this {
+    const n = new Vector3().subVectors(c, b).cross(new Vector3().subVectors(a, b)).normalize();
+    return this.setFromNormalAndCoplanarPoint(n, a);
+  }
+  copy(plane: Plane): this {
+    this.normal.copy(plane.normal);
+    this.constant = plane.constant;
+    return this;
+  }
+  clone(): Plane {
+    return new Plane().copy(this);
+  }
+  /** Scales normal and constant so that the normal has unit length. */
+  normalize(): this {
+    const inv = 1 / this.normal.length();
+    this.normal.multiplyScalar(inv);
+    this.constant *= inv;
+    return this;
+  }
+  negate(): this {
+    this.constant *= -1;
+    this.normal.multiplyScalar(-1);
+    return this;
+  }
+  /** Signed distance (positive on the side the normal points to). */
+  distanceToPoint(point: Vector3): number {
+    return this.normal.dot(point) + this.constant;
+  }
+  distanceToSphere(sphere: Sphere): number {
+    return this.distanceToPoint(sphere.center) - sphere.radius;
+  }
+  projectPoint(point: Vector3, target = new Vector3()): Vector3 {
+    return target.copy(point).addScaledVector(this.normal, -this.distanceToPoint(point));
+  }
+  coplanarPoint(target = new Vector3()): Vector3 {
+    return target.copy(this.normal).multiplyScalar(-this.constant);
+  }
+  intersectsSphere(sphere: Sphere): boolean {
+    return Math.abs(this.distanceToPoint(sphere.center)) <= sphere.radius;
+  }
+  intersectsBox(box: Box3): boolean {
+    const n = this.normal;
+    let min = 0, max = 0;
+    for (const k of ["x", "y", "z"] as const) {
+      const lo = n[k] * box.min[k], hi = n[k] * box.max[k];
+      min += Math.min(lo, hi);
+      max += Math.max(lo, hi);
+    }
+    return min <= -this.constant && max >= -this.constant;
+  }
+  /** The plane moved by `m`; its normal goes through m's normal matrix (the inverse transpose of its upper 3 x 3). */
+  applyMatrix4(m: Matrix4): this {
+    const p = this.coplanarPoint().applyMatrix4(m);
+    const e = m.clone().invert().elements;
+    const { x, y, z } = this.normal;
+    this.normal.set(e[0] * x + e[1] * y + e[2] * z, e[4] * x + e[5] * y + e[6] * z, e[8] * x + e[9] * y + e[10] * z).normalize();
+    this.constant = -p.dot(this.normal);
+    return this;
+  }
+  translate(offset: Vector3): this {
+    this.constant -= offset.dot(this.normal);
+    return this;
+  }
+  equals(plane: Plane): boolean {
+    return plane.normal.x === this.normal.x && plane.normal.y === this.normal.y && plane.normal.z === this.normal.z && plane.constant === this.constant;
+  }
 }
 
 /** A line segment from `start` to `end` (three.js Line3). */
