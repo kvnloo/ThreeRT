@@ -40,16 +40,15 @@ export function d_ggx(a2: number, noh: number) {
   return a2 / (PI * d * d);
 }
 
+/** Height-correlated Smith visibility without the square roots (Hammon 2017), as the kernel's. */
 export function vis_smith_joint_approx(a2: number, nov: number, nol: number) {
-  const a = Math.sqrt(a2);
-  const v = nol * (nov * (1 - a) + a);
-  const l = nov * (nol * (1 - a) + a);
-  return 0.5 / Math.max(v + l, 1e-7);
+  return 0.5 / Math.max(mix(2 * nol * nov, nol + nov, Math.sqrt(a2)), 1e-7);
 }
 
-/** Grey: one channel of the kernel's vec3. */
+/** Schlick's Fresnel (Schlick 1994). Grey: one channel of the kernel's vec3. */
 export function f_schlick(f0: number, f90: number, voh: number) {
-  return f0 + (f90 - f0) * Math.pow(1 - voh, 5);
+  const c = 1 - voh, c2 = c * c;
+  return f0 + (f90 - f0) * (c2 * c2 * c);
 }
 
 export function g1(a2: number, nov: number) {
@@ -116,71 +115,94 @@ export function sample_hg(d: V3, g: number, u: number, w: number): V3 {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The GGX energy table (lib.rs `energy_lut`, computed in doubles here) and its lookup.
+// The GGX energy table (lib.rs `energy_lut` / `specular_albedo`, computed in doubles here) and its lookup
+// (pathtrace.wgsl `energy_node`, `energy_lookup`). Sources as there: the split sum's two terms (Karis 2013, "Environment
+// BRDF"), integrated over visible normals (Heitz 2018); the table's shape over sqrt(cos(view)) (Kulla & Conty 2017,
+// Turquin 2019).
+
+export const ENERGY_N = 32;
+
+/** lib.rs `specular_albedo`: the lobe's albedo toward cos(view) `mu` at `alpha` = roughness^2, as (f0 term, f90
+ *  term), by a midpoint rule over `nr` rings x 2 `nphi` angles of the visible normals' disk. */
+export function specular_albedo(mu: number, alpha: number, nr: number, nphi: number): [number, number] {
+  mu = clamp(mu, 1e-4, 1);
+  if (alpha < 1e-6) {
+    const fc = (1 - mu) ** 5;
+    return [1 - fc, fc];
+  }
+  const vx = Math.sqrt(Math.max(1 - mu * mu, 0)), vz = mu;
+  const k = Math.sqrt(alpha * alpha * vx * vx + vz * vz);
+  const hx = (alpha * vx) / k, hz = vz / k;
+  const s = 0.5 * (1 + hz);
+  const inv_g1 = 0.5 * (1 + Math.sqrt(1 + (alpha * alpha * (1 - mu * mu)) / (mu * mu)));
+  let a = 0, b = 0;
+  for (let i = 0; i < nr; i++) {
+    const t = (i + 0.5) / nr;
+    const r = Math.sqrt(1 - (1 - t) * (1 - t)), w = 2 * (1 - t);
+    for (let j = 0; j < nphi; j++) {
+      const phi = PI * ((j + 0.5) / nphi - 0.5);
+      const p1 = r * Math.cos(phi);
+      const p2 = (1 - s) * Math.sqrt(Math.max(1 - p1 * p1, 0)) + s * r * Math.sin(phi);
+      const pz = Math.sqrt(Math.max(1 - p1 * p1 - p2 * p2, 0));
+      const m = [alpha * (pz * hx - p2 * hz), alpha * p1, Math.max(p2 * hx + pz * hz, 0)];
+      const len = Math.hypot(m[0], m[1], m[2]);
+      const voh = (vx * m[0] + vz * m[2]) / len;
+      const nol = (2 * voh * m[2]) / len - vz;
+      if (nol <= 0 || voh <= 0) continue;
+      const g2 = (2 * mu * nol) / (nol * (mu * (1 - alpha) + alpha) + mu * (nol * (1 - alpha) + alpha));
+      const fc = (1 - voh) ** 5;
+      a += w * (1 - fc) * g2;
+      b += w * fc * g2;
+    }
+  }
+  const kk = inv_g1 / (nr * nphi);
+  return [a * kk, b * kk];
+}
 
 let lutCache: Float64Array | undefined;
 
-/** lib.rs `energy_lut`: 32 x 32 (E.x, E.y), row = roughness, column = cos(view). */
+/** lib.rs `energy_lut`: ENERGY_N x ENERGY_N (E.x, E.y), node (ix, iy) at cos(view) (ix / 31)^2 and roughness iy / 31. */
 export function energy_lut(): Float64Array {
   if (lutCache) return lutCache;
-  const n = 32;
+  const n = ENERGY_N;
   const vals = new Float64Array(n * n * 2);
-  for (let ry = 0; ry < n; ry++) {
-    const roughness = Math.max(ry / (n - 1), 0.02);
-    const a = roughness * roughness;
-    const a2 = a * a;
-    for (let vx = 0; vx < n; vx++) {
-      const nov = Math.max(vx / (n - 1), 1e-3);
-      const v: V3 = [Math.sqrt(1 - nov * nov), 0, nov];
-      let ex = 0, ey = 0;
-      const samples = 1024;
-      for (let i = 0; i < samples; i++) {
-        const u1 = (i + 0.5) / samples;
-        const u2 = reverseBits(i) / 4294967296;
-        const phi = 2 * PI * u2;
-        const cosT = Math.sqrt((1 - u1) / (1 + (a2 - 1) * u1));
-        const sinT = Math.sqrt(1 - cosT * cosT);
-        const hv: V3 = [sinT * Math.cos(phi), sinT * Math.sin(phi), cosT];
-        const l = add(scale(hv, 2 * dot(v, hv)), scale(v, -1));
-        const nol = l[2], noh = hv[2], voh = dot(v, hv);
-        if (nol > 0 && voh > 0) {
-          const visV = nol * (nov * (1 - a) + a);
-          const visL = nov * (nol * (1 - a) + a);
-          const vis = 0.5 / (visV + visL);
-          const est = (vis * nol * 4 * voh) / noh;
-          ex += est;
-          ey += est * Math.pow(1 - voh, 5);
-        }
-      }
-      vals[2 * (ry * n + vx)] = Math.min(ex / samples, 1);
-      vals[2 * (ry * n + vx) + 1] = ey / samples;
+  for (let iy = 0; iy < n; iy++) {
+    const r = iy / (n - 1);
+    for (let ix = 0; ix < n; ix++) {
+      const x = ix / (n - 1);
+      const [a, b] = specular_albedo(x * x, r * r, 48, 8);
+      // (The kernel's table is f32.)
+      vals[2 * (iy * n + ix)] = Math.fround(a);
+      vals[2 * (iy * n + ix) + 1] = Math.fround(b);
     }
   }
   return (lutCache = vals);
 }
 
-function reverseBits(x: number) {
-  let r = 0;
-  for (let i = 0; i < 32; i++) r = r * 2 + ((x >>> i) & 1);
-  return r;
-}
-
-function lut(x: number, y: number): [number, number] {
-  const t = energy_lut(), i = y * 32 + x;
+/** `energy_node`: node i of the table. */
+function energy_node(i: number): [number, number] {
+  const t = energy_lut();
   return [t[2 * i], t[2 * i + 1]];
 }
 
+/** `energy_lookup`: bilinear between the nodes, over sqrt(cos(view)) and the roughness. */
 export function energy_lookup(roughness: number, nov: number): [number, number] {
-  const x = clamp(nov * 31, 0, 31);
-  const y = clamp(roughness * 31, 0, 31);
-  const x0 = Math.floor(x), y0 = Math.floor(y);
-  const x1 = Math.min(x0 + 1, 31), y1 = Math.min(y0 + 1, 31);
+  const n = ENERGY_N;
+  const x = Math.sqrt(clamp(nov, 0, 1)) * (n - 1);
+  const y = clamp(roughness, 0, 1) * (n - 1);
+  const x0 = Math.min(Math.floor(x), n - 2), y0 = Math.min(Math.floor(y), n - 2);
+  const i = y0 * n + x0;
   const fx = x - x0, fy = y - y0;
-  const [a0, a1] = [lut(x0, y0), lut(x1, y0)];
-  const [b0, b1] = [lut(x0, y1), lut(x1, y1)];
-  const ax = mix(a0[0], a1[0], fx), ay = mix(a0[1], a1[1], fx);
-  const bx = mix(b0[0], b1[0], fx), by = mix(b0[1], b1[1], fx);
-  return [mix(ax, bx, fy), mix(ay, by, fy)];
+  const [a0, a1, b0, b1] = [energy_node(i), energy_node(i + 1), energy_node(i + n), energy_node(i + n + 1)];
+  return [mix(mix(a0[0], a1[0], fx), mix(b0[0], b1[0], fx), fy), mix(mix(a0[1], a1[1], fx), mix(b0[1], b1[1], fx), fy)];
+}
+
+/** `spec_terms` for a grey f0: f90 (Lagarde & de Rousiers 2014, Listing 27), the multiple-scattering scale w
+ *  (Turquin 2019, eq. 16; `comp` = P.misc.z of it) and the lobe's albedo with both. */
+export function spec_terms(f0: number, e: [number, number], comp: number) {
+  const f90 = clamp(50 * f0, 0, 1);
+  const w = 1 + f0 * (comp * (1 / Math.max(e[0] + e[1], 1e-3) - 1));
+  return { f90, w, e: (f0 * e[0] + f90 * e[1]) * w };
 }
 
 /** lib.rs `glass_energy`: R + T of a rough dielectric interface toward cos(view) `mu`, by n x n visible normals. */
@@ -234,10 +256,7 @@ export function base_lobes(m: BaseMaterial, nov: number, comp = 1): BaseLobes {
   const roughness = clamp(m.roughness, 0.02, 1), metallic = clamp(m.metallic, 0, 1);
   const diffuse = m.base * (1 - metallic);
   const f0 = mix(0.08 * m.specular, m.base, metallic);
-  const f90 = clamp(50 * f0, 0, 1);
-  const e = energy_lookup(roughness, nov);
-  const w = 1 + comp * f0 * ((1 - e[0]) / e[0]);
-  const e_spec = w * (e[0] * f0 + e[1] * (f90 - f0));
+  const { f90, w, e: e_spec } = spec_terms(f0, energy_lookup(roughness, nov), comp);
   const kd = 1 - e_spec;
   const ws = e_spec, wd = diffuse * kd;
   let p_spec = clamp(ws / Math.max(ws + wd, 1e-6), 0.05, 1);
@@ -361,8 +380,8 @@ export function sample_glass(g: Glass, v: V3, u: number, rz: number, rw: number)
 export const PINS: Record<string, Record<string, string>> = {
   "renderer/shaders/pathtrace.wgsl": {
     d_ggx: "5047ccc98398eccc",
-    vis_smith_joint_approx: "6b097af9c825af2a",
-    f_schlick: "09ce0a0013fb874a",
+    vis_smith_joint_approx: "87489b90da578d11",
+    f_schlick: "ef1485c05814fb44",
     g1: "b8a048109efe855a",
     lambda_ggx: "f76c6887d5020f5d",
     fresnel_dielectric: "d14323fa1fbfd6e0",
@@ -370,9 +389,10 @@ export const PINS: Record<string, Record<string, string>> = {
     basis: "669d0ebec9c49872",
     sample_vndf: "24e788f8f93def00",
     sample_hg: "c156c4ae79234475",
-    lut: "6f91cc3cb739ebeb",
-    energy_lookup: "07c58e0c770f5cc7",
-    lobes: "b5175c3d3de0e89d",
+    energy_node: "34db943a90b6b844",
+    energy_lookup: "29621b0c7081a2ff",
+    spec_terms: "496b7ad632257890",
+    lobes: "0c0b4c62470df6ff",
     eval_bsdf_k: "c42205b11ae6c0cf",
     pdf_bsdf: "442bb004842decc8",
     pdf_spec: "6f6c6ae813a78161",
@@ -381,7 +401,8 @@ export const PINS: Record<string, Record<string, string>> = {
     pdf_dielectric: "174f53d28ab4995e",
   },
   "renderer/src/lib.rs": {
-    energy_lut: "d1a74e7f2f408239",
+    energy_lut: "229747afc86d3d8c",
+    specular_albedo: "56bd8e90c85e0391",
     glass_energy: "05993f30029c99b5",
   },
 };

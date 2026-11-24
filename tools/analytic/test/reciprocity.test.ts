@@ -1,8 +1,8 @@
 // Layer A, analytic (docs/ROADMAP.md § 3): Helmholtz reciprocity of the path tracer's microfacet lobes, without a
 // GPU. f(v, l) = f(l, v) for reflection; for refraction between indices n_v and n_l, f(v, l) / n_l^2 = f(l, v) / n_v^2
-// (Veach 1997, 5.2; Walter et al. 2007). The base as the kernel layers it is not reciprocal by construction, as UE's
-// and Filament's are not: the energy compensation (w) and the diffuse's share (kd) are taken at the view's cosine
-// alone. Its specular lobe with compensation off, and the dielectric's lobes, are.
+// (Veach 1997, 5.2; Walter et al. 2007). The base as the kernel layers it is not reciprocal by construction (nor is
+// Filament's, by its documentation): the energy compensation (w) and the diffuse's share (kd) are taken at the view's
+// cosine alone. Its specular lobe with compensation off, and the dielectric's lobes, are.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { base_lobes, dielectric_t, dir, eval_base, eval_glass, glass_lobes, type V3 } from "../kernel.ts";

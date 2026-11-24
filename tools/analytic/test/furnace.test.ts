@@ -60,13 +60,13 @@ test("white furnace: white metal and white plastic return all of it with energy 
         const mat = { ...m, roughness };
         const on = albedo(mat, nov), off = albedo(mat, nov, 0);
         rows.push(`metallic ${m.metallic} roughness ${roughness} cos ${nov}: ${on.toFixed(4)} (off ${off.toFixed(4)})`);
-        // The GGX energy table's 32 nodes over cos(view), interpolated linearly, are coarsest at grazing views
-        // (measured: within 0.8 % from cos 0.2, 2.9 % below it).
-        const tol = nov >= 0.2 ? 0.01 : 0.035;
+        // The GGX energy table's 32 x 32 nodes over sqrt(cos(view)) and the roughness, interpolated bilinearly
+        // (measured: within 0.1 % from cos 0.2, 0.17 % below it).
+        const tol = nov >= 0.2 ? 0.003 : 0.005;
         assert.ok(Math.abs(on - 1) < tol, `furnace, compensation on: ${rows.at(-1)}`);
         // Metal is the specular lobe alone: below 1 to the estimator's precision. Plastic's diffuse takes what the
-        // table says its specular leaves (kd = 1 - e_spec), so it is as close as the table (measured: 1.2 % over at
-        // roughness 0.1, cos 0.05).
+        // table says its specular leaves (kd = 1 - e_spec), so it is as close as the table (measured: 0.12 % over at
+        // most).
         assert.ok(off < 1 + (m.metallic === 1 ? 2e-3 : tol), `furnace, compensation off creates energy: ${rows.at(-1)}`);
       }
     }
