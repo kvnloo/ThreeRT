@@ -66,6 +66,29 @@ test(".vox: round trip, z-up to y-up, malformed files refused", () => {
   assert.equal(parseVox(encodeVox([{ size: [1, 1, 1], voxels: new Uint8Array([0, 0, 0, 1]) }])).palette[200] & 0xff, 200, "grey palette without RGBA");
 });
 
+test("encodeVox writes only files parseVox reads: a broken model is refused, not written", () => {
+  const ok = { size: [2, 2, 2] as [number, number, number], voxels: new Uint8Array([1, 1, 1, 7]) };
+  assert.equal(voxGrid(parseVox(encodeVox([ok])).models[0]).get(1, 1, 0), 7);
+  const refused = (models: Parameters<typeof encodeVox>[0], palette?: Uint32Array) => assert.throws(() => encodeVox(models, palette), RangeError);
+  refused([]); // parseVox: "no model"
+  refused([{ size: [2, 2, 2], voxels: new Uint8Array([1, 1, 1, 7, 0, 0]) }]); // a partial record, dropped silently before
+  refused([{ size: [2, 2, 2], voxels: new Uint8Array([2, 0, 0, 7]) }]); // parseVox: "a voxel outside its model"
+  refused([{ size: [0, 2, 2], voxels: new Uint8Array(0) }]); // parseVox: size out of range
+  refused([{ size: [2.5, 2, 2], voxels: new Uint8Array(0) }]);
+  refused([ok], new Uint32Array(16)); // entries 16..255 written as 0 before
+});
+
+test(".vox: a chunk is read only within MAIN's children, as its length says", () => {
+  const vox = encodeVox([{ size: [1, 1, 1], voxels: new Uint8Array([0, 0, 0, 1]) }]);
+  // MAIN's children cut short (24 bytes: the SIZE chunk) and the rest still in the file: XYZI is past MAIN's end.
+  const short = vox.slice();
+  new DataView(short.buffer).setUint32(16, 24 + 6, true);
+  assert.throws(() => parseVox(short), /past MAIN's children/);
+  new DataView(short.buffer).setUint32(16, 12, true); // ends inside the SIZE chunk
+  assert.throws(() => parseVox(short), /past MAIN's children/);
+  assert.equal(parseVox(vox).models.length, 1);
+});
+
 test("bulk writes: brick() and fillBrick()", () => {
   const g = new VoxelGrid(0.1);
   g.fillBrick(1, 0, -1, 9);
