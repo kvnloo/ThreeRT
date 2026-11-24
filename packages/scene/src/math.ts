@@ -1379,6 +1379,23 @@ export class Vector2 {
   }
 }
 
+/** What Box3.setFromObject reads of an Object3D (structural, so math.ts need not import the scene graph). */
+export interface BoundedObject {
+  readonly children: readonly BoundedObject[];
+  readonly matrixWorld: Matrix4;
+  updateWorldMatrix(updateParents: boolean, updateChildren: boolean): void;
+  readonly geometry?: {
+    getAttribute?(name: string): { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number } | undefined;
+    boundingBox?: Box3 | null;
+    computeBoundingBox?(): void;
+    boxes?: ArrayLike<number>;
+  };
+  readonly isInstancedMesh?: boolean;
+  readonly isBatchedMesh?: boolean;
+  boundingBox?: Box3 | null;
+  computeBoundingBox?(): void;
+}
+
 /** An axis-aligned box (three.js Box3). */
 export class Box3 {
   readonly isBox3 = true;
@@ -1419,6 +1436,46 @@ export class Box3 {
   }
   union(b: Box3): this {
     return this.expandByPoint(b.min).expandByPoint(b.max);
+  }
+  /** The world-axis-aligned box of `object` and its descendants (three.js). */
+  setFromObject(object: BoundedObject, precise = false): this {
+    return this.makeEmpty().expandByObject(object, precise);
+  }
+  /**
+   * Grows this box by the world box of `object` and its descendants, their world matrices updated on the way down
+   * (the object's ancestors are assumed current, as three.js). By default each geometry's bounding box transformed, a
+   * box that may be loose; `precise` transforms every vertex instead (not for instanced meshes). Procedural geometry
+   * is bounded by its boxes.
+   */
+  expandByObject(object: BoundedObject, precise = false): this {
+    object.updateWorldMatrix(false, false);
+    const geometry = object.geometry;
+    if (geometry) {
+      const position = geometry.getAttribute?.("position");
+      if (precise && position && object.isInstancedMesh !== true && object.isBatchedMesh !== true) {
+        const v = new Vector3();
+        for (let i = 0; i < position.count; i++) this.expandByPoint(v.fromBufferAttribute(position, i).applyMatrix4(object.matrixWorld));
+      } else {
+        let box: Box3 | null = null;
+        if (object.boundingBox !== undefined) {
+          // An object-level box (instanced meshes), where the object computes one.
+          if (object.boundingBox === null) object.computeBoundingBox?.();
+          box = object.boundingBox;
+        }
+        if (!box && geometry.computeBoundingBox) {
+          if (!geometry.boundingBox) geometry.computeBoundingBox();
+          box = geometry.boundingBox ?? null;
+        }
+        if (!box && geometry.boxes) {
+          box = new Box3();
+          const b = geometry.boxes, lo = new Vector3(), hi = new Vector3();
+          for (let i = 0; i + 5 < b.length; i += 6) box.expandByPoint(lo.set(b[i], b[i + 1], b[i + 2])).expandByPoint(hi.set(b[i + 3], b[i + 4], b[i + 5]));
+        }
+        if (box) this.union(box.clone().applyMatrix4(object.matrixWorld));
+      }
+    }
+    for (const child of object.children) this.expandByObject(child, precise);
+    return this;
   }
   /** Narrows this box to its overlap with `b` (three.js). */
   intersect(b: Box3): this {
