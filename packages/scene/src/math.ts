@@ -995,9 +995,38 @@ export class Color {
     this.b = srgbToLinear((hex & 255) / 255);
     return this;
   }
+  /** A CSS color, sRGB-encoded: `#rrggbb`, `#rgb`, `rgb()` / `rgba()` in 0..255 or percent, `hsl()` / `hsla()`, or a
+   *  keyword, as three.js parses them (alpha is ignored). What three.js would warn about and skip, this throws on. */
   setStyle(style: string): this {
     const m = /^#?([0-9a-f]{6})$/i.exec(style.trim());
     if (m) return this.setHex(parseInt(m[1], 16));
+    const short = /^#([0-9a-f]{3})$/i.exec(style.trim());
+    if (short) {
+      const [r, g, b] = [...short[1]].map((c) => srgbToLinear(parseInt(c, 16) / 15));
+      return this.setRGB(r, g, b);
+    }
+    const fn = /^(\w+)\(([^)]*)\)/.exec(style);
+    if (fn) {
+      const [, name, args] = fn;
+      const srgb = (r: number, g: number, b: number) => this.setRGB(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b));
+      let c: RegExpExecArray | null;
+      if (name === "rgb" || name === "rgba") {
+        // rgb(255,0,0) rgba(255,0,0,0.5)
+        if ((c = /^\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+(?:\.\d+)?|\.\d+)\s*)?$/.exec(args))) {
+          return srgb(Math.min(255, parseInt(c[1], 10)) / 255, Math.min(255, parseInt(c[2], 10)) / 255, Math.min(255, parseInt(c[3], 10)) / 255);
+        }
+        // rgb(100%,0%,0%) rgba(100%,0%,0%,0.5) rgb(50.5%,0%,0%)
+        if ((c = /^\s*(\d+(?:\.\d+)?|\.\d+)%\s*,\s*(\d+(?:\.\d+)?|\.\d+)%\s*,\s*(\d+(?:\.\d+)?|\.\d+)%\s*(?:,\s*(\d+(?:\.\d+)?|\.\d+)\s*)?$/.exec(args))) {
+          return srgb(Math.min(100, parseFloat(c[1])) / 100, Math.min(100, parseFloat(c[2])) / 100, Math.min(100, parseFloat(c[3])) / 100);
+        }
+      } else if (name === "hsl" || name === "hsla") {
+        // hsl(120,50%,50%) hsla(120,50%,50%,0.5) hsl(-120,50%,50%)
+        if ((c = /^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*,\s*(\d+(?:\.\d+)?|\.\d+)%\s*,\s*(\d+(?:\.\d+)?|\.\d+)%\s*(?:,\s*(\d+(?:\.\d+)?|\.\d+)\s*)?$/.exec(args))) {
+          return this.setHSL(parseFloat(c[1]) / 360, parseFloat(c[2]) / 100, parseFloat(c[3]) / 100);
+        }
+      }
+      throw new Error(`unsupported color: ${style}`);
+    }
     const named = NAMED_COLORS[style.toLowerCase()];
     if (named !== undefined) return this.setHex(named);
     throw new Error(`unsupported color: ${style}`);
