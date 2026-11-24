@@ -359,6 +359,29 @@ export function sample_glass(g: Glass, v: V3, u: number, rz: number, rw: number)
 
 /** Hashes (test/sync.test.ts `fingerprint`) of the source functions mirrored here, by file and name. */
 export const PINS: Record<string, Record<string, string>> = {
-  "renderer/shaders/pathtrace.wgsl": {},
-  "renderer/src/lib.rs": {},
+  "renderer/shaders/pathtrace.wgsl": {
+    d_ggx: "5047ccc98398eccc",
+    vis_smith_joint_approx: "6b097af9c825af2a",
+    f_schlick: "09ce0a0013fb874a",
+    g1: "b8a048109efe855a",
+    lambda_ggx: "f76c6887d5020f5d",
+    fresnel_dielectric: "d14323fa1fbfd6e0",
+    hg_phase: "dffa6db46f1dfbe5",
+    basis: "669d0ebec9c49872",
+    sample_vndf: "24e788f8f93def00",
+    sample_hg: "c156c4ae79234475",
+    lut: "6f91cc3cb739ebeb",
+    energy_lookup: "07c58e0c770f5cc7",
+    lobes: "b5175c3d3de0e89d",
+    eval_bsdf_k: "c42205b11ae6c0cf",
+    pdf_bsdf: "442bb004842decc8",
+    pdf_spec: "6f6c6ae813a78161",
+    sample_bsdf: "ab06573c53f1794e",
+    dielectric_t: "303cc80cb3feb6b4",
+    pdf_dielectric: "174f53d28ab4995e",
+  },
+  "renderer/src/lib.rs": {
+    energy_lut: "d1a74e7f2f408239",
+    glass_energy: "05993f30029c99b5",
+  },
 };
