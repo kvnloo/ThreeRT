@@ -542,6 +542,18 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
     - (3) popping between levels (step 2's "streaming invisible"): first the levels agree (colour, material and outline
         of the same building far, mid and near: the far level's dark Tochō against the mid level's light curtain wall),
         then a dithered transition for the ~140 m swap; ΔE across a swap at fixed poses;
+        - the dithered transition is deferred (2026-11-24, the supervisor's call on the data): the 140 m swap shows no
+          flicker. Fixed poses offline ΔE 0.00; live, frame by frame through a swap, worst 0.50 / 0.55 against a single
+          frame's noise of 0.44 / 0.47; the tour in lockstep with and without the swap (L0 to 280 m), every 15th frame,
+          at most 0.39 against two runs of the same build's 0.14–0.26 (TokyoRT `tools/quality.ts --swap`). Taken up
+          again if a recording shows a 140 m flicker (replayed in lockstep frame by frame first). The pop seen was the
+          480 m switch (TokyoRT #11).
+        - the 480 m switch after TokyoRT #11 (the far level in the dress's colours): towers SSIM 0.983, within the bar;
+          the skyline 0.967, not. Each far building's own window module (bays, layout, fractions, as the dress draws
+          them) moved it to 0.968 for 8 % more far triangles, so it was not kept: what is left is structure all over
+          (roof rims, rooftop plant, the windows' tone by kind of building, trees), each a little. A far level the dress
+          makes itself (an L2 bake: walls, roofs and flat window quads, ~5–10 M triangles for the area, in place of the
+          source mesher's buildings) would agree by construction; it is a later item. § 0's order goes on to (4).
     - (4) step 6a–6d below, in that order;
     - (5) the rest of step 2: Shibuya stitched in (~20 km²), the drive, expressway and flight paths, resident memory,
         the first frame;
