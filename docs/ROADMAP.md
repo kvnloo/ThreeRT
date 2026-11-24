@@ -542,6 +542,18 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
     - (3) popping between levels (step 2's "streaming invisible"): first the levels agree (colour, material and outline
         of the same building far, mid and near: the far level's dark Tochō against the mid level's light curtain wall),
         then a dithered transition for the ~140 m swap; ΔE across a swap at fixed poses;
+        - the dithered transition is deferred (2026-11-24, the supervisor's call on the data): the 140 m swap shows no
+          flicker. Fixed poses offline ΔE 0.00; live, frame by frame through a swap, worst 0.50 / 0.55 against a single
+          frame's noise of 0.44 / 0.47; the tour in lockstep with and without the swap (L0 to 280 m), every 15th frame,
+          at most 0.39 against two runs of the same build's 0.14–0.26 (TokyoRT `tools/quality.ts --swap`). Taken up
+          again if a recording shows a 140 m flicker (replayed in lockstep frame by frame first). The pop seen was the
+          480 m switch (TokyoRT #11).
+        - the 480 m switch after TokyoRT #11 (the far level in the dress's colours): towers SSIM 0.983, within the bar;
+          the skyline 0.967, not. Each far building's own window module (bays, layout, fractions, as the dress draws
+          them) moved it to 0.968 for 8 % more far triangles, so it was not kept: what is left is structure all over
+          (roof rims, rooftop plant, the windows' tone by kind of building, trees), each a little. A far level the dress
+          makes itself (an L2 bake: walls, roofs and flat window quads, ~5–10 M triangles for the area, in place of the
+          source mesher's buildings) would agree by construction; it is a later item. § 0's order goes on to (4).
     - (4) step 6a–6d below, in that order;
     - (5) the rest of step 2: Shibuya stitched in (~20 km²), the drive, expressway and flight paths, resident memory,
         the first frame;
@@ -558,6 +570,44 @@ Earlier direction (2026-11-05, kept for the history below): finish the three.js 
          height: frame start p95 ≤ 16.7 ms, p99 ≤ 25 ms, no frame over 50 ms;
        - streaming invisible: 5 poses against everything resident at full detail ΔE ≤ 1.0, SSIM ≥ 0.98 (§ 5 item 5's
          bar); popping in motion within the bench-ghosting limits.
+     - Status, part 1 (2026-11-23 → 24, threert/TokyoRT #1–#10; engine #200, #202, #203, #205, #206): one area
+       (Shinjuku, 3.4 × 2.8 km) streamed by level around a flying camera; none of the acceptance is met yet. Step 6's
+       street level was done ahead of it (generated finishes, street models, trees, curtain-wall towers: TokyoRT #1,
+       #5, #6), and step 1b (weather) skipped, both the user's call.
+       - The levels: far (the compiled 256 m tiles, always resident, a quadrant hidden where a nearer level shows it),
+         L1 within 480 m and L0 within 140 m (598 baked 128 m cells: 166 M triangles of their own at L0, 63 M at L1);
+         what repeats is a kit of 8,350 pieces placed as instances (1.7 M copies at L0, 0.45 M at L1; 15 GB of cells
+         where drawing each window out was 23 GB). A cell arrives in place, a frame budget at a time.
+       - Engine: the TLAS built from the instances that changed, as slot ranges (vendored wgpu 30, #200, #203: commit
+         18.9 → 4.9 ms with 470 k instances); the first BLAS build in batches of ≤ 4 M triangles (#202); a scene object
+         8 script objects, none a cycle, so the script's GC no longer pauses (#205: frames with > 30 ms of script in
+         a tour 3 → 0); an offline render's seek under setup's budget (#206).
+       - The tour (`tools/tour.ts`, 90 s of fast flight, M3 Max, MetalFX's denoiser, after the first 20 s): frame
+         interval p50 / p95 / p99 by day 17.4 / 31.9 / 40.6 ms, by night 17.0 / 47.7 / 60.7 ms. Not the bar
+         (p95 16.7, p99 25, none over 50 ms): the slow frames left are commits and acceleration-structure builds.
+         First frame 10–20 s.
+       - Quality (`tools/quality.ts`, `threert-render compare`, ΔE76 / p99 / SSIM, day, 1280 × 720; offline renders
+         at 128 spp, deterministic, so their floor is 0):
+
+         | pose | L0 ↔ L1 at 140 m | L1 ↔ far at 480 m | as streamed vs 2 × radii | live vs offline |
+         |---|---|---|---|---|
+         | Golden Gai alley | 0.00 / 0.0 / 1.000 | 0.00 / 0.0 / 1.000 | 0.04 / 0.8 / 1.000 | 1.47 / 11.5 / 0.935 |
+         | street | 0.00 / 0.0 / 1.000 | 0.01 / 0.4 / 1.000 | 0.04 / 0.7 / 1.000 | 2.07 / 20.7 / 0.951 |
+         | block, 60 m up | 0.00 / 0.0 / 1.000 | 0.11 / 0.8 / 0.996 | 0.12 / 1.0 / 0.996 | 1.69 / 15.8 / 0.953 |
+         | west avenue | 0.00 / 0.0 / 1.000 | 0.08 / 0.9 / 1.000 | 0.08 / 0.9 / 0.999 | 4.94 / 23.7 / 0.860 |
+         | towers, 170 m up | 0.00 / 0.0 / 1.000 | 0.43 / 14.8 / 0.971 | 1.18 / 32.9 / 0.965 | 3.37 / 21.0 / 0.900 |
+         | skyline, 240 m up | 0.01 / 0.4 / 1.000 | 0.85 / 24.2 / 0.965 | 2.79 / 34.5 / 0.876 | 2.77 / 18.8 / 0.899 |
+
+         - The 140 m switch does not show. The 480 m one does: the far level colours buildings from the source app's
+           palette pulled to a cool aerial grey, the dressing in warm, light finishes. That is order item (3)'s first
+           part.
+         - "2 × radii" (L0 to 280 m, L1 to 960 m) stands for everything at full detail: L0 to 300 m is past the
+           renderer's 4 GB vertex buffer.
+         - Streaming in flight, the live frame held at a tour second against the same pose settled (the live view's
+           own noise beside it): 20 s 0.42 / 0.994 (noise 0.39 / 0.995), 45 s while climbing 0.74 / 0.979 (0.48 /
+           0.992), 70 s 0.70 / 0.987 (0.63 / 0.989).
+         - Live against offline is over the bar at every pose: the live path's own distance (denoiser, the sun's
+           glints in glass), the same kind as step 1's table, not streaming.
   3. **The city's lights.** Lit windows that switch on and off, signs, LED screens, street lamps and headlights as
      emitters, 10^5–10^6 across the loaded tiles, in the light tree. Switching an emitter on or off costs no rebuild.
      If the voxel line's "dynamic emission" contract (§ 6 step 3) lands first, use it rather than duplicate it.
@@ -2840,6 +2890,27 @@ Tests: each kind of edit against a build of the edited world, state and picture 
 Mutations: 26. 25 failed a test there was; one, a texture put on a shelf too low for it, none, and has its case now.
 Found by review: a translucent particle's material given another function kept the kernel's old dispatch for the
 translucency pass, which has its particles' functions alone; the kernel is made again where those are others.
+
+**A particle system is a mesh and an instance (2026-11-24).** Particles were world-space triangles of their own
+kind: two a particle among the scene's dynamic triangles (the translucent ones after everything else, in a BLAS of
+their own), a row a triangle, their emitters by a nominal area in the triangles' attributes, every size fixed when
+the scene was uploaded. Now a system is what any geometry that deforms is: a mesh of the pool (a quad a particle,
+four vertices), one instance, a BLAS of its own built again after the particle passes. Stateless and stateful
+systems, those the lights are sampled by (their triangles are the instance's emitters) and translucent ones (an
+instance of the translucency pass's TLAS each) alike; a particle keeps its own object, which a hit finds from its
+instance's and its triangle. The world-space form is gone from the build, the layout, the passes and the kernel.
+The cost is a BLAS build and a TLAS instance a system, where all systems shared four BLASes at most. A frame's GPU
+time on Bistro with opaque particles added (1280 x 720, an M5 Pro; runs alternated): 16 systems of 1024
+particles, 21.25 to 21.48 ms for 21.15 to 21.63 (no difference); 256 systems of 64, 21.44 to 21.55 ms for 21.07 to
+21.11 (+0.41 ms, 1.9 %: 0.16 ms of it in the trace).
+Not changed: a system that comes or goes, a particle function or program, still rebuild the scene.
+Tests: the build's five kinds of system (`a_particle_system_is_a_mesh_of_quads_and_an_instance`); a particle's
+previous positions and the motion at its pixels beside another system; `translucent/systems` (two translucent
+systems, their order reversed between the image's sides).
+Mutations: 28 (the build and the layout, the passes' previous positions, the kernel's object of a particle, the
+builds after the passes, the translucency pass). One had no test, a pass's first frame taking the build's
+positions for its previous ones, and has its assertion now, for both passes; the others failed a test there was,
+one of them by the renderer stopping.
 
 **Volumes and density grids come in place (2026-11-23, after it).** A volume that came, went or was set again
 while a game ran, a still volume's first move, a volume function, a new density grid and a grid program each had
