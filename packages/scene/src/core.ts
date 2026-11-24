@@ -1032,9 +1032,37 @@ export class Texture {
   readonly uuid = `tex${++uid}`;
   uri: string;
   colorSpace: "srgb" | "linear";
-  repeat: [number, number] = [1, 1];
-  offset: [number, number] = [0, 0];
-  wrap: "repeat" | "clamp" = "repeat";
+  private readonly _repeat = new Vector2(1, 1);
+  private readonly _offset = new Vector2(0, 0);
+  /** How many times the texture repeats across the UVs, a `Vector2` as in three.js (`repeat.set(8, 8)`). Assigning a
+   *  `[u, v]` pair or a `Vector2` copies it in. */
+  get repeat(): Vector2 {
+    return this._repeat;
+  }
+  set repeat(value: Vector2 | readonly [number, number]) {
+    if (value instanceof Vector2) this._repeat.copy(value);
+    else this._repeat.set(value[0], value[1]);
+  }
+  /** Where the texture starts in UV space, a `Vector2` as in three.js. Assigning a `[u, v]` pair or a `Vector2` copies it in. */
+  get offset(): Vector2 {
+    return this._offset;
+  }
+  set offset(value: Vector2 | readonly [number, number]) {
+    if (value instanceof Vector2) this._offset.copy(value);
+    else this._offset.set(value[0], value[1]);
+  }
+  /** three.js's wrap modes, per axis. ThreeRT textures repeat unless set otherwise (three.js clamps by default); the
+   *  engine samples a texture with one mode, so it clamps only when both axes are `ClampToEdgeWrapping` (1001), and
+   *  `MirroredRepeatWrapping` samples as `RepeatWrapping`. */
+  wrapS = 1000;
+  wrapT = 1000;
+  /** Both axes at once: `"clamp"` is `ClampToEdgeWrapping` on S and T. */
+  get wrap(): "repeat" | "clamp" {
+    return this.wrapS === 1001 && this.wrapT === 1001 ? "clamp" : "repeat";
+  }
+  set wrap(value: "repeat" | "clamp") {
+    this.wrapS = this.wrapT = value === "clamp" ? 1001 : 1000;
+  }
   /** Raw bytes for generated textures (PNG); external textures are fetched from `uri`. */
   data?: Uint8Array;
   /** Number of times the texture was marked for upload, as in three.js. */

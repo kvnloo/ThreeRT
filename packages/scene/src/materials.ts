@@ -998,7 +998,7 @@ export class SurfaceMaterial extends LibraryMaterial<SurfaceParameters> {
         PuddleScale: Math.max(p.puddles?.scale ?? 1, 0.05), PuddleAmount: p.puddles?.amount ?? 0,
         GrimeAmount: p.grime?.amount ?? 0, GrimeScale: Math.max(p.grime?.scale ?? 1, 0.05),
         WinTop: w?.top ?? 1e4, WinSeed: w?.seed ?? 0,
-        UV: [...(first?.repeat ?? [1, 1]), ...(first?.offset ?? [0, 0])] as V4,
+        UV: first ? [first.repeat.x, first.repeat.y, first.offset.x, first.offset.y] : [1, 1, 0, 0],
         Win0: w ? [w.floorHeight, w.bayWidth, w.windowWidth, w.windowHeight] : [0, 0, 0, 0],
         Win1: w ? [w.groundHeight, w.litChance, w.sill, w.brightness] : [0, 0, 0, 0],
       },
