@@ -318,6 +318,19 @@ test("Raycaster: each object answers with its own raycast, which can be replaced
   assert.equal(rc.intersectObject(group).length, 0);
 });
 
+test("Raycaster: an object off the ray's layers is not asked to raycast, and its children still are, as three.js does", () => {
+  const box = () => new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+  const parent = box(), child = box();
+  child.position.z = -3;
+  parent.add(child);
+  parent.layers.set(1);
+  let asked = 0;
+  parent.raycast = () => { asked++; return false; };
+  const hits = new THREE.Raycaster(new THREE.Vector3(0.1, 0.2, 5), new THREE.Vector3(0, 0, -1)).intersectObject(parent);
+  assert.equal(asked, 0);
+  assert.deepEqual(hits.map((h) => h.object), [child]);
+});
+
 test("Object3D.remove: notifies the child and then its old parent after unparenting, as three.js does", () => {
   const [a, b, x, y, z] = ["a", "b", "x", "y", "z"].map((name) => Object.assign(new THREE.Object3D(), { name }));
   const log: string[] = [];

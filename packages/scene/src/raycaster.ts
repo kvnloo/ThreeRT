@@ -9,7 +9,7 @@
 // what a shape overlaps or meets when moved. Both see the world as the engine has it, with or without a tick since
 // the last change; what the running script changed in the scene reaches the engine when it returns (docs/RUNTIME.md,
 // World handlers).
-import { getEngineBodies, InstancedMesh, Mesh, Object3D, type PerspectiveCamera, physicsBodies, physicsQuery, ProceduralGeometry, ProceduralMesh } from "./core.ts";
+import { getEngineBodies, InstancedMesh, Layers, Mesh, Object3D, onLayers, type PerspectiveCamera, physicsBodies, physicsQuery, ProceduralGeometry, ProceduralMesh } from "./core.ts";
 import { Box3, Matrix4, Quaternion, Ray, Vector2, Vector3 } from "./math.ts";
 import type { BufferGeometry } from "./geometry.ts";
 
@@ -89,6 +89,9 @@ export class Raycaster {
   near: number;
   far: number;
   camera: PerspectiveCamera | null = null;
+  /** three.js: `intersectObject(s)` tests only objects on one of these layers (layer 0 alone by default); their
+   *  children are visited whatever the parent's layers. */
+  layers = new Layers();
   params = { Mesh: {}, Line: { threshold: 1 }, Points: { threshold: 1 } };
   constructor(origin?: Vector3, direction?: Vector3, near = 0, far = Infinity) {
     this.ray = new Ray(origin?.clone(), direction?.clone());
@@ -137,8 +140,9 @@ export class Raycaster {
 
   private visit(o: Object3D, recursive: boolean, out: Intersection[]): void {
     o.updateWorldMatrix(true, false);
-    // (As three.js: each object answers with its own `raycast`, false keeping the ray from its children.)
-    if (o.raycast(this, out) === false) return;
+    // (As three.js: an object on none of the ray's layers is not tested, but its children still are; an object
+    // tested answers with its own `raycast`, false keeping the ray from its children.)
+    if (onLayers(o, this.layers) && o.raycast(this, out) === false) return;
     if (recursive) for (const c of o.children) this.visit(c, true, out);
   }
 

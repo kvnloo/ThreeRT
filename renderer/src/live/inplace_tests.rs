@@ -613,14 +613,19 @@ fn a_moved_card_beside_another_is_written_where_it_lies() {
     }
 }
 
-/// A particle that drifts: its vertices' previous positions are the pass's last (the motion vectors at its pixels
-/// are its step back), and the pass leaves its vertices' UVs as the build made them.
+/// A particle that drifts, beside a system that stands still: its vertices' previous positions are the pass's last
+/// (the motion vectors at its pixels are its step back, and nothing else moves), and the pass leaves the vertices'
+/// UVs as the build made them.
 #[test]
 fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
     let mut w = world();
     w.set_particle_fn("drift", "fn pf_drift(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.6 * i.time, 0.5, 1.0), vec3<f32>(0.3, 0.0, 0.0), vec3<f32>(0.0, 0.3, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    // (Another system before it, two quads that stand still: the drifting one's vertices and their previous positions
+    // are not the scene's first that move.)
+    w.set_particle_fn("still", "fn pf_still(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.5 * f32(i.index), -0.5, 1.0), vec3<f32>(0.1, 0.0, 0.0), vec3<f32>(0.0, 0.1, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(17, "still".into(), None, Kind::Particles { count: 2, emitter: "still".into(), params: vec![], material: 1, emitter_area: 0.0 }, true, false).unwrap();
     w.set_object(18, "drift".into(), None, Kind::Particles { count: 1, emitter: "drift".into(), params: vec![], material: 1, emitter_area: 0.01 }, true, false).unwrap();
     let mut live = match open(&w) {
         Ok(c) if c.g.hwrt => c,
@@ -628,7 +633,7 @@ fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    // (The vertices that move: the particle's six.)
+    // (The vertices that move: four a particle, the systems' meshes.)
     let vertices = |c: &LiveCore| -> (Vec<[f32; 3]>, Vec<[f32; 2]>) {
         let (first, n) = (c.sc.dynamic_verts.0 as u64, c.sc.dynamic_verts.1 as u64);
         let size = crate::indexed::VERTEX_BYTES as u64;
@@ -636,11 +641,17 @@ fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         (v.iter().map(|v| [v[0][0], v[0][1], v[0][2]]).collect(), v.iter().map(|v| [v[0][3], v[1][3]]).collect())
     };
     let built = vertices(&live);
-    assert!(built.1.len() == 6 && built.1.iter().any(|uv| uv[0] != 0.0) && built.1.iter().any(|uv| uv[1] != 0.0), "the particle's six vertices, with the build's UVs ({:?})", built.1);
+    assert!(built.1.len() == 12 && built.1.chunks(4).all(|q| q == [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]), "four vertices a particle (its mesh's quad, in the order the pass writes it), with the build's UVs: {:?}", built.1);
     live.fixed_dt = Some(1.0 / 60.0);
-    for _ in 0..4 {
+    for k in 0..4 {
         live.advance_time(1.0 / 60.0);
         live.render(1, |_, _| {});
+        // (A pass's first run has no last frame: the previous positions are the positions, and nothing moves.)
+        if k == 0 {
+            let m = &live.targets.kernel.motion;
+            let moved = read_back::<f32>(&live, &m.buffer, m.offset, m.size).chunks_exact(4).filter(|p| p[3] > 0.5 && Vec3::new(p[0], p[1], p[2]).length() > 1e-4).count();
+            assert_eq!(moved, 0, "the first frame: no pixel moves");
+        }
     }
     let now = vertices(&live);
     assert!(now.0 != built.0 && now.1 == built.1, "the pass moved the vertices and left their UVs ({:?} -> {:?})", built.1, now.1);
@@ -658,6 +669,10 @@ fn a_gpu_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
     let mut w = world();
     let emit = "fn pe_drift(i: EIn, p: array<vec4<f32>, 8>) -> PState { var s: PState; s.pos = i.at; s.life = 1000.0; s.color = i.color; s.size = 0.3; s.vel = vec3<f32>(0.6, 0.0, 0.0); return s; }";
     w.set_particle_program("drift", emit.into(), "fn pu_drift(s: PState, i: UIn, p: array<vec4<f32>, 8>) -> PState { return s; }".into(), String::new());
+    // (Another system before it, two quads that stand still: the drifting one's vertices and their previous positions
+    // are not the scene's first that move.)
+    w.set_particle_fn("still", "fn pf_still(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.5 * f32(i.index), -0.5, 1.0), vec3<f32>(0.1, 0.0, 0.0), vec3<f32>(0.0, 0.1, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(17, "still".into(), None, Kind::Particles { count: 2, emitter: "still".into(), params: vec![], material: 1, emitter_area: 0.0 }, true, false).unwrap();
     w.set_object(18, "drift".into(), None, Kind::GpuParticles { capacity: 1, program: "drift".into(), params: vec![], material: 1, emitter_area: 0.01, rate: 0.0, collide: Default::default() }, true, false).unwrap();
     let mut live = match open(&w) {
         Ok(c) if c.g.hwrt => c,
@@ -675,11 +690,17 @@ fn a_gpu_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         (v.iter().map(|v| [v[0][0], v[0][1], v[0][2]]).collect(), v.iter().map(|v| [v[0][3], v[1][3]]).collect())
     };
     let built = vertices(&live);
-    assert!(built.1.len() == 6 && built.1.iter().any(|uv| uv[0] != 0.0) && built.1.iter().any(|uv| uv[1] != 0.0), "the particle's six vertices, with the build's UVs ({:?})", built.1);
+    assert!(built.1.len() == 12 && built.1.chunks(4).all(|q| q == [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]), "four vertices a particle (its mesh's quad, in the order the pass writes it), with the build's UVs: {:?}", built.1);
     live.fixed_dt = Some(1.0 / 60.0);
-    for _ in 0..6 {
+    for k in 0..6 {
         live.advance_time(1.0 / 60.0);
         live.render(1, |_, _| {});
+        // (A pass's first run has no last frame: the previous positions are the positions, and nothing moves.)
+        if k == 0 {
+            let m = &live.targets.kernel.motion;
+            let moved = read_back::<f32>(&live, &m.buffer, m.offset, m.size).chunks_exact(4).filter(|p| p[3] > 0.5 && Vec3::new(p[0], p[1], p[2]).length() > 1e-4).count();
+            assert_eq!(moved, 0, "the first frame: no pixel moves");
+        }
     }
     let now = vertices(&live);
     assert!(now.0 != built.0 && now.1 == built.1, "the pass moved the vertices and left their UVs ({:?} -> {:?})", built.1, now.1);
