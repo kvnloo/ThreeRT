@@ -5,6 +5,10 @@
 // - ΔE76 and SSIM are computed exactly as the renderer's `compare` (renderer/src/compare.rs) computes them, so the
 //   numbers in docs/COMPARE.md and the benches stay comparable: ΔE76 on sRGB -> linear -> XYZ -> Lab (D65), SSIM on
 //   gamma-encoded BT.601 luma with an 11 x 11 Gaussian (σ 1.5), clamped edges, C1 = (0.01 · 255)², C2 = (0.03 · 255)².
+//   Sources: CIELAB and ΔE76 from CIE 15:2004 (Colorimetry), sRGB's transfer function and its matrix to XYZ from IEC
+//   61966-2-1; SSIM, its window, σ and constants from Wang, Bovik, Sheikh and Simoncelli, "Image Quality Assessment:
+//   From Error Visibility to Structural Similarity", IEEE Trans. Image Processing 13(4), 2004; BT.601 luma from ITU-R
+//   BT.601.
 // - ΔE2000 is CIEDE2000 (Sharma, Wu, Dalal 2005, kL = kC = kH = 1) on the same Lab values: perceptually more uniform
 //   than ΔE76 in saturated blues and near grey, and smaller than ΔE76 for the same pair in saturated colours.
 
