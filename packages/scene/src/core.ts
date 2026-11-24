@@ -1031,7 +1031,9 @@ export class Scene extends Object3D {
 export class Texture {
   readonly uuid = `tex${++uid}`;
   uri: string;
-  colorSpace: "srgb" | "linear";
+  /** `"srgb"` (three.js's `SRGBColorSpace`) is decoded to linear when sampled; anything else (`"linear"`,
+   *  `LinearSRGBColorSpace`, `NoColorSpace`) is sampled as it is. */
+  colorSpace: "srgb" | "linear" | "srgb-linear" | "";
   private readonly _repeat = new Vector2(1, 1);
   private readonly _offset = new Vector2(0, 0);
   /** How many times the texture repeats across the UVs, a `Vector2` as in three.js (`repeat.set(8, 8)`). Assigning a
@@ -1076,7 +1078,7 @@ export class Texture {
     if (value === true) this.version++;
     this.dirty = value;
   }
-  constructor(uri: string, colorSpace: "srgb" | "linear" = "srgb") {
+  constructor(uri: string, colorSpace: "srgb" | "linear" | "srgb-linear" | "" = "srgb") {
     this.uri = uri;
     this.colorSpace = colorSpace;
   }
@@ -2455,17 +2457,41 @@ export function vec3(v: Vector3 | Color): Vec3 {
   return v instanceof Vector3 ? [v.x, v.y, v.z] : [v.r, v.g, v.b];
 }
 
-/** Texture generated in code: RGBA8 pixels, handed to the engine as they are. */
+/** Texture generated in code: RGBA8 pixels, handed to the engine as they are.
+ *
+ *  Two forms: ThreeRT's `new DataTexture(width, height, rgba, colorSpace = "srgb")`, and three.js's
+ *  `new DataTexture(data, width, height, format, type, mapping, wrapS, wrapT, magFilter, minFilter, anisotropy, colorSpace)`.
+ *  The three.js form takes `RGBAFormat` / `UnsignedByteType` pixels only (a `Uint8Array` or `Uint8ClampedArray`) and
+ *  keeps three.js's defaults: clamped on both axes and `NoColorSpace` (sampled as linear) unless given. */
 export class DataTexture extends Texture {
+  readonly isDataTexture = true;
   readonly width: number;
   readonly height: number;
   readonly pixels: Uint8Array;
-  constructor(width: number, height: number, rgba: Uint8Array, colorSpace: "srgb" | "linear" = "srgb") {
-    super(`generated:${width}x${height}`, colorSpace);
+  constructor(width: number, height: number, rgba: Uint8Array, colorSpace?: "srgb" | "linear");
+  constructor(data: Uint8Array | Uint8ClampedArray, width?: number, height?: number, format?: number, type?: number, mapping?: number, wrapS?: number, wrapT?: number, magFilter?: number, minFilter?: number, anisotropy?: number, colorSpace?: "srgb" | "srgb-linear" | "");
+  constructor(...args: unknown[]) {
+    const three = ArrayBuffer.isView(args[0]);
+    const width = (three ? (args[1] ?? 1) : args[0]) as number;
+    const height = (three ? (args[2] ?? 1) : args[1]) as number;
+    const data = (three ? args[0] : args[2]) as Uint8Array | Uint8ClampedArray;
+    super(`generated:${width}x${height}`, ((three ? args[11] : args[3]) as Texture["colorSpace"] | undefined) ?? (three ? "" : "srgb"));
+    if (three) {
+      const [format = 1023, type = 1009] = args.slice(3, 5) as (number | undefined)[];
+      if (format !== 1023 || type !== 1009 || !(data instanceof Uint8Array || data instanceof Uint8ClampedArray))
+        throw new RangeError(`DataTexture: only RGBAFormat (1023) UnsignedByteType (1009) pixels in a Uint8Array, not format ${format} type ${type}`);
+      this.wrapS = (args[6] as number | undefined) ?? 1001;
+      this.wrapT = (args[7] as number | undefined) ?? 1001;
+    }
+    const rgba = data instanceof Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     if (rgba.length !== width * height * 4) throw new RangeError(`DataTexture: ${rgba.length} bytes are not ${width}x${height} RGBA8 pixels`);
     this.width = width;
     this.height = height;
     this.pixels = rgba;
+  }
+  /** three.js's `image`: the pixels and their size. */
+  get image(): { data: Uint8Array; width: number; height: number } {
+    return { data: this.pixels, width: this.width, height: this.height };
   }
 }
 
