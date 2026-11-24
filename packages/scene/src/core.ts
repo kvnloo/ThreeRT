@@ -2005,10 +2005,12 @@ export interface LightShadow {
   normalBias: number;
   radius: number;
   blurSamples: number;
+  /** three.js frees the shadow map; there is none to free. */
+  dispose(): void;
 }
 
 function lightShadow(): LightShadow {
-  return { mapSize: new Vector2(512, 512), camera: { near: 0.5, far: 500, left: -5, right: 5, top: 5, bottom: -5, fov: 90, updateProjectionMatrix() {} }, bias: 0, normalBias: 0, radius: 1, blurSamples: 8 };
+  return { mapSize: new Vector2(512, 512), camera: { near: 0.5, far: 500, left: -5, right: 5, top: 5, bottom: -5, fov: 90, updateProjectionMatrix() {} }, bias: 0, normalBias: 0, radius: 1, blurSamples: 8, dispose() {} };
 }
 
 export abstract class Light extends Object3D {
@@ -2028,6 +2030,10 @@ export abstract class Light extends Object3D {
   }
   protected override get looksDownNegativeZ(): boolean {
     return true;
+  }
+  /** three.js frees the light's shadow map; ThreeRT's lights hold no GPU resources of their own. */
+  dispose(): void {
+    this.shadow.dispose();
   }
 }
 
@@ -2133,6 +2139,8 @@ export class AmbientLight extends Object3D {
     this.color = new Color(color);
     this.intensity = intensity;
   }
+  /** three.js API; nothing to free. */
+  dispose(): void {}
 }
 
 /** three.js HemisphereLight: sky colour from above, ground colour from below; as AmbientLight, a gradient sky. */
@@ -2149,6 +2157,8 @@ export class HemisphereLight extends Object3D {
     this.groundColor = new Color(groundColor);
     this.intensity = intensity;
   }
+  /** three.js API; nothing to free. */
+  dispose(): void {}
 }
 
 const DEFAULT_EXPOSURE = { mode: "auto", compensation: 0, minEv100: -10, maxEv100: 20 } as const;
