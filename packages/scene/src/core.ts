@@ -111,6 +111,38 @@ export interface PhysicsDesc {
   contacts?: boolean;
 }
 
+/**
+ * three.js EventDispatcher: per-instance listeners by event type. A listener is added once however often it is passed,
+ * and is called with the dispatcher as `this`; during a dispatch the event's `target` is the dispatcher (null after),
+ * and listeners removed or added by a listener do not change who is called for that event. Object3D and the
+ * materials extend it, as other classes can (`class Car extends EventDispatcher<{ type: "start" }>`).
+ */
+type Listener = Function;
+export class EventDispatcher<E extends { type: string } = { type: string; [key: string]: unknown }> {
+  /** @internal By event type (three.js's `_listeners`). */
+  declare _listeners: Record<string, Listener[]> | undefined;
+  addEventListener(type: string, listener: (this: this, event: E) => void): void {
+    const all = (this._listeners ??= {});
+    const l = (all[type] ??= []);
+    if (!l.includes(listener)) l.push(listener);
+  }
+  hasEventListener(type: string, listener: (this: this, event: E) => void): boolean {
+    return this._listeners?.[type]?.includes(listener) ?? false;
+  }
+  removeEventListener(type: string, listener: (this: this, event: E) => void): void {
+    const l = this._listeners?.[type];
+    const i = l ? l.indexOf(listener) : -1;
+    if (i !== -1) l!.splice(i, 1);
+  }
+  dispatchEvent(event: E & { target?: unknown }): void {
+    const l = this._listeners?.[event.type];
+    if (!l) return;
+    event.target = this;
+    for (const f of l.slice()) (f as (this: this, event: E) => void).call(this, event);
+    event.target = null;
+  }
+}
+
 /** An event of an object (`addEventListener`). */
 export interface ObjectEvent {
   type: string;
@@ -354,7 +386,7 @@ function quaternionChanged(this: Quaternion): void {
   touched(o);
 }
 
-export class Object3D {
+export class Object3D extends EventDispatcher<ObjectEvent> {
   readonly isObject3D = true;
   type = "Object3D";
   name = "";
@@ -442,7 +474,6 @@ export class Object3D {
   declare private _physics: Readonly<PhysicsDesc> | null | undefined;
   /** @internal */
   declare _body: BoundBody | undefined;
-  declare private _listeners: Map<string, ((e: ObjectEvent) => void)[]> | undefined;
 
   /**
    * The object's rigid body (see "Physics" above): a description, or just its type. In the scene, the object has the
@@ -502,31 +533,9 @@ export class Object3D {
     return s?.sleeping ?? false;
   }
 
-  /**
-   * three.js's EventDispatcher. The engine's events: "contactstart" / "contactend" (`physics.contacts`), and
-   * "outofworld" when the object's body got more than 1,000 km from the origin and was taken out of the physics world
-   * (the object stays in the scene, without a body until its `physics` is set again).
-   */
-  addEventListener(type: string, listener: (e: ObjectEvent) => void): void {
-    const all = (this._listeners ??= new Map());
-    const l = all.get(type);
-    if (!l) all.set(type, [listener]);
-    else if (!l.includes(listener)) l.push(listener);
-  }
-  hasEventListener(type: string, listener: (e: ObjectEvent) => void): boolean {
-    return this._listeners?.get(type)?.includes(listener) ?? false;
-  }
-  removeEventListener(type: string, listener: (e: ObjectEvent) => void): void {
-    const l = this._listeners?.get(type);
-    if (l?.includes(listener)) l.splice(l.indexOf(listener), 1);
-  }
-  dispatchEvent(event: ObjectEvent): void {
-    const l = this._listeners?.get(event.type);
-    if (!l?.length) return;
-    event.target = this;
-    for (const f of [...l]) f(event);
-    event.target = null;
-  }
+  // three.js's EventDispatcher (inherited). The engine's events: "contactstart" / "contactend" (`physics.contacts`),
+  // and "outofworld" when the object's body got more than 1,000 km from the origin and was taken out of the physics
+  // world (the object stays in the scene, without a body until its `physics` is set again).
   set id(v: string | number | undefined) {
     this._id = v === undefined ? undefined : String(v);
   }
@@ -536,6 +545,7 @@ export class Object3D {
   }
 
   constructor() {
+    super();
     // (shared functions, the object weakly: a closure over the object per rotation and quaternion made two cycles and
     // two objects more an object)
     for (const [part, changed] of [[this.rotation, rotationChanged], [this.quaternion, quaternionChanged]] as const) {
@@ -1088,11 +1098,11 @@ export const DoubleSide = 2;
 
 type MaterialEvent = { type: string; target?: MeshStandardMaterial | null };
 
-export class MeshStandardMaterial {
+/** three.js's material events are per instance (EventDispatcher), including dispose notifications. */
+export class MeshStandardMaterial extends EventDispatcher<MaterialEvent> {
   readonly isMaterial = true;
   readonly isMeshStandardMaterial = true;
   readonly uuid = `mat${++uid}`;
-  private _listeners?: Map<string, Array<(event: MaterialEvent) => void>>;
   type: "standard" | "physical" = "standard";
   /** Colours, emission, roughness, metalness, opacity, maps and the material function binding are picked up by the
    *  engine binding automatically; set this after changing anything else (`side`, a map's `repeat`, ...). */
@@ -1133,6 +1143,7 @@ export class MeshStandardMaterial {
   shader: ShaderBinding | null = null;
 
   constructor(params: MeshStandardMaterialParameters = {}) {
+    super();
     this.setValues(params);
   }
 
@@ -1148,31 +1159,6 @@ export class MeshStandardMaterial {
   /** The material drawn double-sided (`side` "double" or DoubleSide). */
   get doubleSided(): boolean {
     return this.side === "double" || this.side === DoubleSide || this.side === BackSide;
-  }
-
-  /** three.js's material events are per instance, including dispose notifications. */
-  addEventListener(type: string, listener: (event: MaterialEvent) => void): void {
-    const all = (this._listeners ??= new Map());
-    const listeners = all.get(type);
-    if (!listeners) all.set(type, [listener]);
-    else if (!listeners.includes(listener)) listeners.push(listener);
-  }
-
-  hasEventListener(type: string, listener: (event: MaterialEvent) => void): boolean {
-    return this._listeners?.get(type)?.includes(listener) ?? false;
-  }
-
-  removeEventListener(type: string, listener: (event: MaterialEvent) => void): void {
-    const listeners = this._listeners?.get(type);
-    if (listeners?.includes(listener)) listeners.splice(listeners.indexOf(listener), 1);
-  }
-
-  dispatchEvent(event: MaterialEvent): void {
-    const listeners = this._listeners?.get(event.type);
-    if (!listeners?.length) return;
-    event.target = this;
-    for (const listener of [...listeners]) listener.call(this, event);
-    event.target = null;
   }
 
   /** Notify owners of this material; shared textures are not disposed. */
