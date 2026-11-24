@@ -2197,9 +2197,20 @@ export class PerspectiveCamera extends Object3D {
   }
   /** Set the vertical FOV from focal length, using the film height for this aspect ratio (three.js). */
   setFocalLength(focalLength: number): void {
-    const filmHeight = this.filmGauge / Math.max(this.aspect, 1);
-    this.fov = (2 * Math.atan(0.5 * filmHeight / focalLength) * 180) / Math.PI;
+    this.fov = (2 * Math.atan((0.5 * this.getFilmHeight()) / focalLength) * 180) / Math.PI;
     this.updateProjectionMatrix();
+  }
+  /** The focal length, in film-gauge millimeters, that gives the current vertical FOV (three.js). */
+  getFocalLength(): number {
+    return (0.5 * this.getFilmHeight()) / Math.tan((this.fov * Math.PI) / 360);
+  }
+  /** The film's width for this aspect ratio: the gauge, narrowed when the view is portrait (three.js). */
+  getFilmWidth(): number {
+    return this.filmGauge * Math.min(this.aspect, 1);
+  }
+  /** The film's height for this aspect ratio: the gauge, shortened when the view is landscape (three.js). */
+  getFilmHeight(): number {
+    return this.filmGauge / Math.max(this.aspect, 1);
   }
   /** three.js API; the engine reads fov / aspect / near / far as they are. */
   updateProjectionMatrix(): void {}
