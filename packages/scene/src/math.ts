@@ -970,4 +970,76 @@ export const MathUtils = {
   clamp: (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v)),
   euclideanModulo: (n: number, m: number) => ((n % m) + m) % m,
   lerp: (a: number, b: number, t: number) => a + (b - a) * t,
+  /** Maps `x` from the range [a1, a2] to [b1, b2]. */
+  mapLinear: (x: number, a1: number, a2: number, b1: number, b2: number) => b1 + ((x - a1) * (b2 - b1)) / (a2 - a1),
+  /** The fraction of `value` between `x` and `y`; 0 when the range is empty. */
+  inverseLerp: (x: number, y: number, value: number) => (x !== y ? (value - x) / (y - x) : 0),
+  /** Frame-rate independent damping towards `y` (`lambda` per second, `dt` in seconds). */
+  damp: (x: number, y: number, lambda: number, dt: number) => x + (y - x) * (1 - Math.exp(-lambda * dt)),
+  pingpong: (x: number, length = 1) => length - Math.abs((((x % (length * 2)) + length * 2) % (length * 2)) - length),
+  smoothstep(x: number, min: number, max: number): number {
+    if (x <= min) return 0;
+    if (x >= max) return 1;
+    x = (x - min) / (max - min);
+    return x * x * (3 - 2 * x);
+  },
+  smootherstep(x: number, min: number, max: number): number {
+    if (x <= min) return 0;
+    if (x >= max) return 1;
+    x = (x - min) / (max - min);
+    return x * x * x * (x * (x * 6 - 15) + 10);
+  },
+  /** A random integer in [low, high]. */
+  randInt: (low: number, high: number) => low + Math.floor(Math.random() * (high - low + 1)),
+  /** A random float in [low, high). */
+  randFloat: (low: number, high: number) => low + Math.random() * (high - low),
+  /** A random float in (-range / 2, range / 2]. */
+  randFloatSpread: (range: number) => range * (0.5 - Math.random()),
+  /** Deterministic pseudo-random float in [0, 1) (Mulberry32); passing `s` reseeds. */
+  seededRandom(s?: number): number {
+    if (s !== undefined) seed = s;
+    let t = (seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  },
+  /** An RFC 4122 version 4 UUID, lowercase. */
+  generateUUID(): string {
+    const d0 = (Math.random() * 0xffffffff) | 0, d1 = (Math.random() * 0xffffffff) | 0;
+    const d2 = (Math.random() * 0xffffffff) | 0, d3 = (Math.random() * 0xffffffff) | 0;
+    const h = (v: number) => HEX[v & 0xff];
+    return (
+      h(d0) + h(d0 >> 8) + h(d0 >> 16) + h(d0 >> 24) + "-" + h(d1) + h(d1 >> 8) + "-" +
+      h(((d1 >> 16) & 0x0f) | 0x40) + h(d1 >> 24) + "-" + h((d2 & 0x3f) | 0x80) + h(d2 >> 8) + "-" +
+      h(d2 >> 16) + h(d2 >> 24) + h(d3) + h(d3 >> 8) + h(d3 >> 16) + h(d3 >> 24)
+    );
+  },
+  isPowerOfTwo: (value: number) => (value & (value - 1)) === 0 && value !== 0,
+  ceilPowerOfTwo: (value: number) => Math.pow(2, Math.ceil(Math.log(value) / Math.LN2)),
+  floorPowerOfTwo: (value: number) => Math.pow(2, Math.floor(Math.log(value) / Math.LN2)),
+  /** A float in [0, 1] (or [-1, 1]) as the normalized integer `array`'s component type stores. */
+  normalize(value: number, array: ArrayLike<number>): number {
+    if (array.constructor === Float32Array) return value;
+    return Math.round(value * normalizationScale(array));
+  },
+  /** A normalized integer from `array`'s component type, as a float in [0, 1] (or [-1, 1] when signed). */
+  denormalize(value: number, array: ArrayLike<number>): number {
+    if (array.constructor === Float32Array) return value;
+    return Math.max(value / normalizationScale(array), -1);
+  },
 };
+
+function normalizationScale(array: ArrayLike<number>): number {
+  switch (array.constructor) {
+    case Uint32Array: return 4294967295;
+    case Uint16Array: return 65535;
+    case Uint8Array: case Uint8ClampedArray: return 255;
+    case Int32Array: return 2147483647;
+    case Int16Array: return 32767;
+    case Int8Array: return 127;
+  }
+  throw new Error("THREE.MathUtils: Invalid component type.");
+}
+
+let seed = 1234567;
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
