@@ -17,7 +17,7 @@ test("CylinderGeometry has three.js's groups: side 0, top cap 1, bottom cap 2", 
 test("CylinderGeometry floors fractional segment counts, as three.js does", () => {
   const g = new THREE.CylinderGeometry(1, 1, 1, 7.5, 2.5);
   const w = new THREE.CylinderGeometry(1, 1, 1, 7, 2);
-  assert.deepEqual(Array.from(g.getAttribute("position").array), Array.from(w.getAttribute("position").array));
+  assert.deepEqual(Array.from(g.getAttribute("position")!.array), Array.from(w.getAttribute("position")!.array));
   assert.equal(g.parameters.radialSegments, 7.5, "parameters keep what was passed");
 });
 
@@ -25,6 +25,6 @@ test("ConeGeometry takes thetaStart and thetaLength, and has no top cap group", 
   const g = new THREE.ConeGeometry(1, 2, 8, 2, false, 0.5, 3);
   assert.deepEqual(g.parameters, { radius: 1, height: 2, radialSegments: 8, heightSegments: 2, openEnded: false, thetaStart: 0.5, thetaLength: 3 });
   const ref = new THREE.CylinderGeometry(0, 1, 2, 8, 2, false, 0.5, 3);
-  assert.deepEqual(Array.from(g.getAttribute("position").array), Array.from(ref.getAttribute("position").array));
+  assert.deepEqual(Array.from(g.getAttribute("position")!.array), Array.from(ref.getAttribute("position")!.array));
   assert.deepEqual(g.groups.map((x) => x.materialIndex), [0, 2]);
 });
