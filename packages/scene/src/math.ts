@@ -206,6 +206,37 @@ export class Vector3 {
     const tz = 2 * (qx * vy - qy * vx);
     return this.set(vx + qw * tx + qy * tz - qz * ty, vy + qw * ty + qz * tx - qx * tz, vz + qw * tz + qx * ty - qy * tx);
   }
+  applyEuler(euler: Euler): this {
+    return this.applyQuaternion(_vectorQuaternion.setFromEuler(euler, false));
+  }
+  /** Rotates about a normalized axis by an angle in radians. */
+  applyAxisAngle(axis: Vector3, angle: number): this {
+    return this.applyQuaternion(_vectorQuaternion.setFromAxisAngle(axis, angle));
+  }
+  projectOnVector(v: Vector3): this {
+    const denominator = v.lengthSq();
+    if (denominator === 0) return this.set(0, 0, 0);
+    const scalar = v.dot(this) / denominator;
+    return this.set(v.x * scalar, v.y * scalar, v.z * scalar);
+  }
+  /** Removes the component along the plane's normal (the normal need not be normalized). */
+  projectOnPlane(planeNormal: Vector3): this {
+    const denominator = planeNormal.lengthSq();
+    if (denominator === 0) return this;
+    const scalar = planeNormal.dot(this) / denominator;
+    return this.set(this.x - planeNormal.x * scalar, this.y - planeNormal.y * scalar, this.z - planeNormal.z * scalar);
+  }
+  /** Reflects off a plane with the given normalized normal. */
+  reflect(normal: Vector3): this {
+    const d = 2 * this.dot(normal);
+    return this.set(this.x - normal.x * d, this.y - normal.y * d, this.z - normal.z * d);
+  }
+  setFromMatrixColumn(m: Matrix4, index: number): this {
+    return this.fromArray(m.elements, index * 4);
+  }
+  setFromEuler(e: Euler): this {
+    return this.set(e.x, e.y, e.z);
+  }
   setFromMatrixPosition(m: Matrix4): this {
     return this.set(m.elements[12], m.elements[13], m.elements[14]);
   }
@@ -423,6 +454,9 @@ export class Quaternion {
     return this.set(a[o], a[o + 1], a[o + 2], a[o + 3]);
   }
 }
+
+/** Scratch for Vector3.applyEuler / applyAxisAngle. */
+const _vectorQuaternion = new Quaternion();
 
 export type EulerOrder = "XYZ" | "YXZ" | "ZXY" | "ZYX" | "YZX" | "XZY";
 
