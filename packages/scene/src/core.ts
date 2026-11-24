@@ -2,7 +2,7 @@
 // uses physical units (see engine.ts, which binds a scene to the engine).
 
 import { Box3, Color, type ColorLike, Euler, Matrix4, Quaternion, Sphere, Vector2, Vector3 } from "./math.ts";
-import { type BufferGeometry, StaticDrawUsage } from "./geometry.ts";
+import { BufferAttribute, type BufferGeometry } from "./geometry.ts";
 import type { ExposureDesc, Vec3 } from "./engine.ts";
 
 // ---------------------------------------------------------------------------------------------
@@ -1816,34 +1816,40 @@ export class ProceduralMesh extends Object3D {
 
 /**
  * Per-instance numbers of an `InstancedMesh` (three.js `InstancedBufferAttribute`): `itemSize` per instance in `array`.
- * After writing `array` (or `setMatrixAt` / `setColorAt` / `setCustomDataAt`), set `needsUpdate`, as in three.js.
+ * A `BufferAttribute` (its accessors: `getX`, `setXYZ`, `copyAt`, ...), its numbers always a Float32Array. After writing
+ * `array` (or `setMatrixAt` / `setColorAt` / `setCustomDataAt`), set `needsUpdate`, as in three.js.
  */
-export class InstancedBufferAttribute {
+export class InstancedBufferAttribute extends BufferAttribute {
   readonly isInstancedBufferAttribute = true;
-  array: Float32Array;
-  readonly itemSize: number;
-  usage = StaticDrawUsage;
-  /** Bumped by `needsUpdate = true`: the binding sends the array again. */
-  version = 0;
+  declare array: Float32Array;
+  /** three.js: how many meshes share each item (1 here: the renderer reads one item per instance). */
+  meshPerAttribute: number;
   /** The instanced mesh whose table it is, weakly (no reference cycle). */
   declare _owner: WeakRef<Object3D> | undefined;
-  constructor(array: ArrayLike<number>, itemSize: number) {
-    this.array = array instanceof Float32Array ? array : Float32Array.from(array);
-    this.itemSize = itemSize;
+  constructor(array: ArrayLike<number>, itemSize: number, normalized = false, meshPerAttribute = 1) {
+    super(array instanceof Float32Array ? array : Float32Array.from(array), itemSize, normalized);
+    this.meshPerAttribute = meshPerAttribute;
     Object.defineProperty(this, "_owner", { value: undefined, writable: true });
   }
-  get count(): number {
-    return this.array.length / this.itemSize;
-  }
-  set needsUpdate(v: boolean) {
+  /** Bumps `version`: the binding sends the array again. */
+  override set needsUpdate(v: boolean) {
     if (!v) return;
     this.version++;
     const o = this._owner?.deref();
     if (o) touched(o);
   }
-  setUsage(usage: number): this {
-    this.usage = usage;
+  /** Takes `source`'s numbers (a copy), item size, normalization, usage, name and meshPerAttribute (three.js). */
+  copy(source: InstancedBufferAttribute): this {
+    this.array = source.array.slice();
+    (this as { itemSize: number }).itemSize = source.itemSize;
+    this.normalized = source.normalized;
+    this.usage = source.usage;
+    this.name = source.name;
+    this.meshPerAttribute = source.meshPerAttribute;
     return this;
+  }
+  override clone(): InstancedBufferAttribute {
+    return new InstancedBufferAttribute(this.array, this.itemSize).copy(this);
   }
 }
 
@@ -2018,7 +2024,7 @@ export class InstancedMesh extends Object3D {
   override copy(source: Object3D, recursive = true): this {
     super.copy(source, recursive);
     if (source instanceof InstancedMesh) {
-      const dup = (a: InstancedBufferAttribute) => this.own(new InstancedBufferAttribute(a.array.slice(), a.itemSize).setUsage(a.usage));
+      const dup = (a: InstancedBufferAttribute) => this.own(a.clone());
       (this as { instanceMatrix: InstancedBufferAttribute }).instanceMatrix = dup(source.instanceMatrix);
       this._color = source._color && dup(source._color);
       this._instData = source._instData && dup(source._instData);
