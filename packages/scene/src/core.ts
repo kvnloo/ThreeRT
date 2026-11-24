@@ -2469,7 +2469,7 @@ export class DataTexture extends Texture {
   readonly height: number;
   readonly pixels: Uint8Array;
   constructor(width: number, height: number, rgba: Uint8Array, colorSpace?: "srgb" | "linear");
-  constructor(data: Uint8Array | Uint8ClampedArray, width?: number, height?: number, format?: number, type?: number, mapping?: number, wrapS?: number, wrapT?: number, magFilter?: number, minFilter?: number, anisotropy?: number, colorSpace?: "srgb" | "srgb-linear" | "");
+  constructor(data: ArrayBufferView, width?: number, height?: number, format?: number, type?: number, mapping?: number, wrapS?: number, wrapT?: number, magFilter?: number, minFilter?: number, anisotropy?: number, colorSpace?: "srgb" | "srgb-linear" | "");
   constructor(...args: unknown[]) {
     const three = ArrayBuffer.isView(args[0]);
     const width = (three ? (args[1] ?? 1) : args[0]) as number;
