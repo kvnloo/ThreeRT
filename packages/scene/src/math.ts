@@ -1112,6 +1112,16 @@ export class Color {
     const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
     return Object.assign(target, { h: h / 6, s, l });
   }
+  /** Shifts hue, saturation and lightness by the given amounts (three.js; the hue wraps, the others clamp). */
+  offsetHSL(h: number, s: number, l: number): this {
+    const hsl = this.getHSL();
+    return this.setHSL(hsl.h + h, hsl.s + s, hsl.l + l);
+  }
+  /** Interpolates hue, saturation and lightness towards `color` (three.js: the hue takes the straight path, not the shorter way round). */
+  lerpHSL(color: Color, alpha: number): this {
+    const a = this.getHSL(), b = color.getHSL();
+    return this.setHSL(a.h + (b.h - a.h) * alpha, a.s + (b.s - a.s) * alpha, a.l + (b.l - a.l) * alpha);
+  }
   lerp(c: Color, t: number): this {
     return this.setRGB(this.r + (c.r - this.r) * t, this.g + (c.g - this.g) * t, this.b + (c.b - this.b) * t);
   }
