@@ -1,6 +1,6 @@
 // three.js-compatible geometry generators. Vertex layout and winding match three (CCW front faces).
 
-import { Box3, Matrix4, type Quaternion, Sphere, Vector3 } from "./math.ts";
+import { Box3, Matrix4, type Quaternion, Sphere, Vector2, Vector3 } from "./math.ts";
 import type { InterleavedBufferAttribute } from "./interleaved.ts";
 
 let geometryIds = 0;
@@ -204,7 +204,7 @@ export class BufferGeometry {
   type = "BufferGeometry";
   name = "";
   /** Constructor parameters (inspection / regeneration). */
-  parameters: Record<string, number | boolean> = {};
+  parameters: Record<string, number | boolean | number[] | { x: number; y: number }[]> = {};
   /** three.js: the vertex attributes by name (`position`, `normal`, `uv`; others are kept, not drawn). */
   attributes: Record<string, BufferAttribute> = {};
   /** Triangle indices (the DSL's: a Uint32Array; three.js's `index` attribute is `getIndex()`). Empty: not indexed. */
@@ -798,29 +798,54 @@ export class RingGeometry extends BufferGeometry {
 /** Points (x = radius, y = height) turned about the y axis (three.js LatheGeometry). */
 export class LatheGeometry extends BufferGeometry {
   override type = "LatheGeometry";
-  constructor(points: { x: number; y: number }[] = [{ x: 0, y: -0.5 }, { x: 0.5, y: 0 }, { x: 0, y: 0.5 }], segments = 12, phiStart = 0, phiLength = Math.PI * 2) {
+  /** `points` profile (x is the radius, y the height) swept round the y axis, with three.js r187's smooth normals:
+   *  each profile point's normal averages its two segments' and turns with the sweep, so the seam is smooth too. */
+  constructor(points: { x: number; y: number }[] = [new Vector2(0, -0.5), new Vector2(0.5, 0), new Vector2(0, 0.5)], segments = 12, phiStart = 0, phiLength = Math.PI * 2) {
     super();
+    this.parameters = { points, segments, phiStart, phiLength };
     segments = Math.max(1, Math.floor(segments));
-    this.parameters = { segments, phiStart, phiLength };
+    phiLength = Math.max(0, Math.min(Math.PI * 2, phiLength));
     const b = new Builder();
+    // The profile's normals in the xy plane, as three.js builds them.
+    const initNormals: number[] = [];
+    const normal = new Vector3(), curNormal = new Vector3(), prevNormal = new Vector3();
+    const last = points.length - 1;
+    for (let j = 0; j <= last; j++) {
+      if (j === 0) {
+        const dx = points[1].x - points[0].x, dy = points[1].y - points[0].y;
+        normal.set(dy, -dx, dy * 0);
+        prevNormal.copy(normal);
+        normal.normalize();
+        initNormals.push(normal.x, normal.y, normal.z);
+      } else if (j === last) {
+        prevNormal.normalize();
+        initNormals.push(prevNormal.x, prevNormal.y, prevNormal.z);
+      } else {
+        const dx = points[j + 1].x - points[j].x, dy = points[j + 1].y - points[j].y;
+        normal.set(dy, -dx, dy * 0);
+        curNormal.copy(normal);
+        normal.add(prevNormal).normalize();
+        initNormals.push(normal.x, normal.y, normal.z);
+        prevNormal.copy(curNormal);
+      }
+    }
+    const inverseSegments = 1 / segments;
     for (let i = 0; i <= segments; i++) {
-      const phi = phiStart + (i / segments) * phiLength, sin = Math.sin(phi), cos = Math.cos(phi);
-      for (let j = 0; j < points.length; j++) {
+      const phi = phiStart + i * inverseSegments * phiLength, sin = Math.sin(phi), cos = Math.cos(phi);
+      for (let j = 0; j <= last; j++) {
         b.p.push(points[j].x * sin, points[j].y, points[j].x * cos);
-        b.n.push(0, 0, 0);
-        b.uv.push(i / segments, j / (points.length - 1));
+        b.uv.push(i / segments, j / last);
+        b.n.push(initNormals[3 * j] * sin, initNormals[3 * j + 1], initNormals[3 * j] * cos);
       }
     }
     for (let i = 0; i < segments; i++) {
-      for (let j = 0; j < points.length - 1; j++) {
+      for (let j = 0; j < last; j++) {
         const base = j + i * points.length;
         const a = base, bb = base + points.length, c = base + points.length + 1, d = base + 1;
         b.idx.push(a, bb, d, c, d, bb);
       }
     }
     b.finish(this);
-    this.computeVertexNormals();
-    this.needsUpdate = false;
   }
 }
 
