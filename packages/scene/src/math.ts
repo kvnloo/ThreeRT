@@ -1354,6 +1354,15 @@ export class Vector2 {
     const x = this.x - center.x, y = this.y - center.y;
     return this.set(x * c - y * s + center.x, x * s + y * c + center.y);
   }
+  /** Transforms this point by a 2D affine `m` (its translation applies; three.js). */
+  applyMatrix3(m: Matrix3): this {
+    const { x, y } = this, e = m.elements;
+    return this.set(e[0] * x + e[3] * y + e[6], e[1] * x + e[4] * y + e[7]);
+  }
+  /** Each component uniform in [0, 1) (three.js; Math.random: not for deterministic game setup). */
+  random(): this {
+    return this.set(Math.random(), Math.random());
+  }
   roundToZero(): this {
     return this.set(Math.trunc(this.x), Math.trunc(this.y));
   }
