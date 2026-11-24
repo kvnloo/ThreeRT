@@ -387,37 +387,62 @@ impl Tonemapper {
     }
 }
 
-/// UE WhiteBalance: chromaticity of the D-series illuminant (Planckian locus below 4000 K) at `temp`, shifted by
-/// `tint` along the isotherm, adapted to D65 with the Bradford transform; returned as a linear-sRGB matrix.
+/// Krystek 1985: the Planckian locus in CIE 1960 uv at `t` K, and its derivative in `t` (the locus's direction).
+fn planckian_uv(t: f64) -> ([f64; 2], [f64; 2]) {
+    // (a + b t + c t^2) / (1 + d t + e t^2) and its derivative.
+    let rational = |a: f64, b: f64, c: f64, d: f64, e: f64| {
+        let (n, m) = (a + b * t + c * t * t, 1.0 + d * t + e * t * t);
+        (n / m, ((b + 2.0 * c * t) * m - n * (d + 2.0 * e * t)) / (m * m))
+    };
+    let (u, du) = rational(0.860117757, 1.54118254e-4, 1.28641212e-7, 8.42420235e-4, 7.08145163e-7);
+    let (v, dv) = rational(0.317398726, 4.22806245e-5, 4.20481691e-8, -2.89741816e-5, 1.61456053e-7);
+    ([u, v], [du, dv])
+}
+
+fn uv_to_xy([u, v]: [f64; 2]) -> [f64; 2] {
+    let d = 2.0 * u - 8.0 * v + 4.0;
+    [3.0 * u / d, 2.0 * v / d]
+}
+
+/// UE WhiteBalance's source white: the chromaticity of the D-series illuminant at `temp` (the Planckian locus's below
+/// 4000 K), offset by the locus's isotherm at `temp` shifted `tint` * 0.05 across the locus in uv (UE
+/// PlanckianIsothermal: the locus's unit direction turned a quarter, so a tint moves the white across the locus, the
+/// same way at every temperature).
+fn white_point(temp: f32, tint: f32) -> [f64; 2] {
+    let t = temp.clamp(1900.0, 25000.0) as f64;
+    let (p, dp) = planckian_uv(t);
+    let mut xy = if t >= 4000.0 {
+        let x = if t <= 7000.0 { 0.244063 + 0.09911e3 / t + 2.9678e6 / (t * t) - 4.6070e9 / (t * t * t) } else { 0.237040 + 0.24748e3 / t + 1.9018e6 / (t * t) - 2.0064e9 / (t * t * t) };
+        [x, -3.0 * x * x + 2.87 * x - 0.275]
+    } else {
+        uv_to_xy(p)
+    };
+    if tint != 0.0 {
+        let l = (dp[0] * dp[0] + dp[1] * dp[1]).sqrt();
+        let k = tint as f64 * 0.05 / l;
+        let (on, off) = (uv_to_xy(p), uv_to_xy([p[0] - dp[1] * k, p[1] + dp[0] * k]));
+        xy = [xy[0] + off[0] - on[0], xy[1] + off[1] - on[1]];
+    }
+    xy
+}
+
+/// UE WhiteBalance: the source white at `temp` and `tint` (`white_point`) adapted to D65 with the Bradford
+/// transform; returned as a linear-sRGB matrix.
 fn white_balance(temp: f32, tint: f32) -> Mat3 {
     if (temp - 6500.0).abs() < 1.0 && tint == 0.0 {
         return Mat3::IDENTITY;
     }
-    let t = temp.clamp(1900.0, 25000.0) as f64;
-    let (mut x, mut y) = if t >= 4000.0 {
-        let x = if t <= 7000.0 { 0.244063 + 0.09911e3 / t + 2.9678e6 / (t * t) - 4.6070e9 / (t * t * t) } else { 0.237040 + 0.24748e3 / t + 1.9018e6 / (t * t) - 2.0064e9 / (t * t * t) };
-        (x, -3.0 * x * x + 2.87 * x - 0.275)
-    } else {
-        // Krystek 1985 Planckian locus in uv, then to xy.
-        let u = (0.860117757 + 1.54118254e-4 * t + 1.28641212e-7 * t * t) / (1.0 + 8.42420235e-4 * t + 7.08145163e-7 * t * t);
-        let v = (0.317398726 + 4.22806245e-5 * t + 4.20481691e-8 * t * t) / (1.0 - 2.89741816e-5 * t + 1.61456053e-7 * t * t);
-        (3.0 * u / (2.0 * u - 8.0 * v + 4.0), 2.0 * v / (2.0 * u - 8.0 * v + 4.0))
-    };
-    if tint != 0.0 {
-        // Offset perpendicular to the locus in uv (UE: Tint * 0.05 / sqrt(du^2 + dv^2)), approximated in xy.
-        let k = tint as f64 * 0.05 * 0.5;
-        let (dx, dy) = (-(y - 0.3290), x - 0.3127);
-        let l = (dx * dx + dy * dy).sqrt().max(1e-6);
-        x += k * dx / l;
-        y += k * dy / l;
-    }
+    let [x, y] = white_point(temp, tint);
     let xyz = |x: f64, y: f64| Vec3::new((x / y) as f32, 1.0, ((1.0 - x - y) / y) as f32);
     let bradford = m3([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]);
     let src = bradford * xyz(x, y);
     let dst = bradford * xyz(0.3127, 0.3290);
     let cat = bradford.inverse() * Mat3::from_diagonal(dst / src) * bradford;
-    let srgb_to_xyz = m3([[0.4123907993, 0.3575843394, 0.1804807884], [0.2126390059, 0.7151686788, 0.0721923154], [0.0193308187, 0.1191947798, 0.9505321522]]);
-    srgb_to_xyz.inverse() * cat * srgb_to_xyz
+    srgb_to_xyz().inverse() * cat * srgb_to_xyz()
+}
+
+fn srgb_to_xyz() -> Mat3 {
+    m3([[0.4123907993, 0.3575843394, 0.1804807884], [0.2126390059, 0.7151686788, 0.0721923154], [0.0193308187, 0.1191947798, 0.9505321522]])
 }
 
 /// Per-pixel film grain (UE FilmGrainIntensity): mid-tone weighted multiplicative noise.
@@ -599,4 +624,78 @@ pub fn finish(img: &Image, exposure: f32, compensation: f32, p: &PostPreset) -> 
         })
         .collect();
     out.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xy_to_uv([x, y]: [f64; 2]) -> [f64; 2] {
+        let d = -2.0 * x + 12.0 * y + 3.0;
+        [4.0 * x / d, 6.0 * y / d]
+    }
+
+    #[test]
+    fn the_locus_direction_is_ues() {
+        // UE PlanckianIsothermal's derivative of the Krystek locus, written out as it has it.
+        for t in [1900.0, 2700.0, 4000.0, 6500.0, 10000.0, 25000.0] {
+            let ud = (-1.13758118e9 - 1.91615621e6 * t - 1.53177 * t * t) / (1.41213984e6 + 1189.62 * t + t * t).powi(2);
+            let vd = (1.97471536e9 - 705674.0 * t - 308.607 * t * t) / (6.19363586e6 - 1177.62 * t + t * t).powi(2);
+            let (_, [du, dv]) = planckian_uv(t);
+            assert!((du / ud - 1.0).abs() < 1e-5 && (dv / vd - 1.0).abs() < 1e-5, "{t} K: {du} {dv} vs UE {ud} {vd}");
+        }
+    }
+
+    #[test]
+    fn a_tint_moves_the_white_across_the_locus_by_a_twentieth_per_unit() {
+        for temp in [2000.0, 3500.0, 4000.0, 5000.0, 6500.0, 6504.0, 8000.0, 12000.0, 20000.0] {
+            let (_, dp) = planckian_uv(temp as f64);
+            let along = {
+                let l = (dp[0] * dp[0] + dp[1] * dp[1]).sqrt();
+                [dp[0] / l, dp[1] / l]
+            };
+            let w0 = xy_to_uv(white_point(temp, 0.0));
+            for tint in [-1.0f32, -0.25, 0.5, 1.0] {
+                let w = xy_to_uv(white_point(temp, tint));
+                let d = [w[0] - w0[0], w[1] - w0[1]];
+                // Across the locus: magenta (down in v) for a positive tint, at every temperature.
+                let across = -d[0] * along[1] + d[1] * along[0];
+                let on = d[0] * along[0] + d[1] * along[1];
+                assert!((across - 0.05 * tint as f64).abs() < 2e-3 * tint.abs() as f64, "{temp} K tint {tint}: {across} across");
+                assert!(on.abs() < 2e-3 * tint.abs() as f64, "{temp} K tint {tint}: {on} along the locus");
+                assert!(d[1] * tint as f64 <= 0.0, "{temp} K tint {tint}: v moved {}", d[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_balance_renders_its_white_as_white() {
+        assert_eq!(white_balance(6500.0, 0.0), Mat3::IDENTITY);
+        for (temp, tint) in [(2700.0, 0.0), (5000.0, 0.3), (6500.0, -0.5), (9000.0, 1.0)] {
+            let [x, y] = white_point(temp, tint);
+            let white = srgb_to_xyz().inverse() * Vec3::new((x / y) as f32, 1.0, ((1.0 - x - y) / y) as f32);
+            let out = white_balance(temp, tint) * white;
+            // Bradford keeps Y: the white comes out neutral at its luminance.
+            let y_out = srgb_to_xyz().row(1).dot(out);
+            assert!((out / y_out - Vec3::ONE).abs().max_element() < 1e-3, "{temp} K tint {tint}: {out}");
+        }
+        // Near D65 with no tint, next to no change.
+        let m = white_balance(6504.0, 0.0);
+        assert!((m.x_axis - Vec3::X).abs().max_element() < 0.01 && (m.y_axis - Vec3::Y).abs().max_element() < 0.01 && (m.z_axis - Vec3::Z).abs().max_element() < 0.01, "{m}");
+    }
+
+    #[test]
+    fn the_curves_meet_where_they_join() {
+        let (a, b) = (0.0031308f32 * 12.92, 1.055 * 0.0031308f32.powf(1.0 / 2.4) - 0.055);
+        assert!((a - b).abs() < 1e-6 && (linear_to_srgb(0.0031308) - a).abs() < 1e-6);
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
+        assert_eq!((smoothstep(0.5, 1.0, 0.2), smoothstep(0.5, 1.0, 0.75), smoothstep(0.5, 1.0, 2.0)), (0.0, 0.5, 1.0));
+        assert_eq!([Vec3::X, Vec3::Y, Vec3::Z, Vec3::ONE].map(rgb_2_hue).map(f32::round), [0.0, 120.0, 240.0, 0.0]);
+        assert_eq!([center_hue(10.0, 350.0), center_hue(350.0, 10.0), center_hue(90.0, 30.0)], [20.0, -20.0, 60.0]);
+        for r in [0.3, 1.0, 4.5, 31.0, 100.0] {
+            let k = gaussian_kernel(r);
+            assert!((k.iter().map(|w| w.1).sum::<f32>() - 1.0).abs() < 1e-5 && k.len() <= 63, "radius {r}");
+        }
+    }
 }
