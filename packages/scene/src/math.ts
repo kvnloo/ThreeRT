@@ -127,6 +127,10 @@ export class Vector3 {
   manhattanLength(): number {
     return Math.abs(this.x) + Math.abs(this.y) + Math.abs(this.z);
   }
+  /** Column `index` of `m` (three.js). */
+  setFromMatrix3Column(m: Matrix3, index: number): this {
+    return this.fromArray(m.elements, index * 3);
+  }
   setLength(length: number): this {
     return this.normalize().multiplyScalar(length);
   }
@@ -939,6 +943,44 @@ export class Matrix3 {
   /** Inverse transpose of `m`'s upper 3x3: transforms normals under non-uniform scale. */
   getNormalMatrix(m: Matrix4): this {
     return this.setFromMatrix4(m).invert().transpose();
+  }
+  /** The three columns into `xAxis`, `yAxis`, `zAxis` (three.js). */
+  extractBasis(xAxis: Vector3, yAxis: Vector3, zAxis: Vector3): this {
+    xAxis.setFromMatrix3Column(this, 0);
+    yAxis.setFromMatrix3Column(this, 1);
+    zAxis.setFromMatrix3Column(this, 2);
+    return this;
+  }
+  /** Writes the transpose into `r`, leaving this matrix as it is (three.js). */
+  transposeIntoArray(r: { [k: number]: number }): this {
+    const m = this.elements;
+    r[0] = m[0]; r[1] = m[3]; r[2] = m[6];
+    r[3] = m[1]; r[4] = m[4]; r[5] = m[7];
+    r[6] = m[2]; r[7] = m[5]; r[8] = m[8];
+    return this;
+  }
+  /** A 2D UV transform: offset, repeat, rotation about the centre (cx, cy), as three.js composes a texture's matrix. */
+  setUvTransform(tx: number, ty: number, sx: number, sy: number, rotation: number, cx: number, cy: number): this {
+    const c = Math.cos(rotation), s = Math.sin(rotation);
+    return this.set(
+      sx * c, sx * s, -sx * (c * cx + s * cy) + cx + tx,
+      -sy * s, sy * c, -sy * (-s * cx + c * cy) + cy + ty,
+      0, 0, 1,
+    );
+  }
+  /** A 2D translation, by (x, y) or by a Vector2 (three.js). */
+  makeTranslation(x: number | { x: number; y: number }, y?: number): this {
+    if (typeof x === "number") return this.set(1, 0, x, 0, 1, y!, 0, 0, 1);
+    return this.set(1, 0, x.x, 0, 1, x.y, 0, 0, 1);
+  }
+  /** A 2D rotation by `theta`, counter-clockwise (three.js). */
+  makeRotation(theta: number): this {
+    const c = Math.cos(theta), s = Math.sin(theta);
+    return this.set(c, -s, 0, s, c, 0, 0, 0, 1);
+  }
+  /** A 2D scale (three.js). */
+  makeScale(x: number, y: number): this {
+    return this.set(x, 0, 0, 0, y, 0, 0, 0, 1);
   }
   equals(m: Matrix3): boolean {
     return this.elements.every((v, k) => v === m.elements[k]);
