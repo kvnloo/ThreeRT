@@ -174,6 +174,14 @@ export class Vector3 {
   lerp(v: Vector3, t: number): this {
     return this.set(this.x + (v.x - this.x) * t, this.y + (v.y - this.y) * t, this.z + (v.z - this.z) * t);
   }
+  /** From world space to the camera's normalized device coordinates, as three.js does. */
+  project(camera: { matrixWorldInverse: Matrix4; projectionMatrix: Matrix4 }): this {
+    return this.applyMatrix4(camera.matrixWorldInverse).applyMatrix4(camera.projectionMatrix);
+  }
+  /** From the camera's normalized device coordinates back to world space, as three.js does. */
+  unproject(camera: { projectionMatrixInverse: Matrix4; matrixWorld: Matrix4 }): this {
+    return this.applyMatrix4(camera.projectionMatrixInverse).applyMatrix4(camera.matrixWorld);
+  }
   applyMatrix4(m: Matrix4): this {
     const e = m.elements;
     const { x, y, z } = this;
