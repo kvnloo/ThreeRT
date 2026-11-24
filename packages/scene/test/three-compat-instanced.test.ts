@@ -14,3 +14,14 @@ test("InstancedMesh: setMatrixAt returns the mesh for chaining, as three.js does
   mesh.instanceMatrix.needsUpdate = true;
   assert.equal(mesh.instanceMatrix.version, version + 1, "the required upload flag still works");
 });
+
+test("InstancedMesh: setColorAt returns the mesh, and dispose fires dispose, as three.js does", () => {
+  const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial(), 2);
+  assert.equal(mesh.setColorAt(1, new THREE.Color(1, 0, 0)), mesh, "setColorAt chains");
+  assert.deepEqual(mesh.getColorAt(1, new THREE.Color()).toArray(), [1, 0, 0]);
+  assert.equal(mesh.setCustomDataAt(0, [1, 2, 3, 4]), mesh, "setCustomDataAt chains too");
+  let fired: unknown = null;
+  mesh.addEventListener("dispose", (e) => (fired = e.target));
+  assert.equal(mesh.dispose(), mesh);
+  assert.equal(fired, mesh, "dispose event with the mesh as target");
+});
