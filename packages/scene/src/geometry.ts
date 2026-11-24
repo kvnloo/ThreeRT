@@ -867,13 +867,15 @@ export class CapsuleGeometry extends LatheGeometry {
   }
 }
 
-/** Triangles of a convex polyhedron subdivided `detail` times and projected on a sphere of `radius` (three.js
- *  PolyhedronGeometry): flat-shaded at detail 0, smooth above. Every triangle has its own vertices. */
+/** Triangles of a convex polyhedron subdivided `detail` times and projected on a sphere of `radius` (three.js r187
+ *  PolyhedronGeometry): flat-shaded at detail 0, smooth above. Every triangle has its own vertices. The uvs are a
+ *  spherical projection with three's corrections: v runs up from the bottom, a triangle across the u = 0 / 1 seam
+ *  has its small u's moved past 1, and a vertex at a pole takes its triangle's azimuth. */
 export class PolyhedronGeometry extends BufferGeometry {
   override type = "PolyhedronGeometry";
-  constructor(vertices: number[], indices: number[], radius = 1, detail = 0) {
+  constructor(vertices: number[] = [], indices: number[] = [], radius = 1, detail = 0) {
     super();
-    this.parameters = { radius, detail };
+    this.parameters = { vertices, indices, radius, detail };
     const p: number[] = [];
     const v = (k: number) => new Vector3(vertices[k * 3], vertices[k * 3 + 1], vertices[k * 3 + 2]);
     const cols = detail + 1;
@@ -895,13 +897,45 @@ export class PolyhedronGeometry extends BufferGeometry {
         }
       }
     }
+    // Onto the sphere, with three's arithmetic (normalize, then scale) so the pole and seam tests below agree with it.
+    const unit = (x: number, y: number, z: number) => {
+      const l = Math.sqrt(x * x + y * y + z * z);
+      return l > 0 ? [x / l, y / l, z / l] : [x, y, z];
+    };
     for (let i = 0; i < p.length; i += 3) {
-      const l = Math.hypot(p[i], p[i + 1], p[i + 2]) || 1;
-      p[i] *= radius / l; p[i + 1] *= radius / l; p[i + 2] *= radius / l;
+      const [x, y, z] = unit(p[i], p[i + 1], p[i + 2]);
+      p[i] = x * radius; p[i + 1] = y * radius; p[i + 2] = z * radius;
     }
+    const azimuth = (x: number, z: number) => Math.atan2(z, -x);
     const uv: number[] = [];
-    for (let i = 0; i < p.length; i += 3) uv.push(Math.atan2(p[i + 2], -p[i]) / (2 * Math.PI) + 0.5, Math.atan2(-p[i + 1], Math.hypot(p[i], p[i + 2])) / Math.PI + 0.5);
-    const n = detail === 0 ? new Array<number>(p.length).fill(0) : p.map((x) => x / radius);
+    for (let i = 0; i < p.length; i += 3) {
+      const inclination = Math.atan2(-p[i + 1], Math.sqrt(p[i] * p[i] + p[i + 2] * p[i + 2]));
+      uv.push(azimuth(p[i], p[i + 2]) / 2 / Math.PI + 0.5, 1 - (inclination / Math.PI + 0.5));
+    }
+    // correctUVs: per triangle, a u of 1 on the far side wraps to 0, and a pole vertex takes the centroid's azimuth.
+    for (let i = 0, j = 0; i < p.length; i += 9, j += 6) {
+      const azi = azimuth((p[i] + p[i + 3] + p[i + 6]) / 3, (p[i + 2] + p[i + 5] + p[i + 8]) / 3);
+      for (let k = 0; k < 3; k++) {
+        if (azi < 0 && uv[j + 2 * k] === 1) uv[j + 2 * k] -= 1;
+        if (p[i + 3 * k] === 0 && p[i + 3 * k + 2] === 0) uv[j + 2 * k] = azi / 2 / Math.PI + 0.5;
+      }
+    }
+    // correctSeam: a triangle spanning the seam gets its small u's moved past 1.
+    for (let i = 0; i < uv.length; i += 6) {
+      const x0 = uv[i], x1 = uv[i + 2], x2 = uv[i + 4];
+      if (Math.max(x0, x1, x2) > 0.9 && Math.min(x0, x1, x2) < 0.1) {
+        if (x0 < 0.2) uv[i] += 1;
+        if (x1 < 0.2) uv[i + 2] += 1;
+        if (x2 < 0.2) uv[i + 4] += 1;
+      }
+    }
+    const n = detail === 0 ? new Array<number>(p.length).fill(0) : p.slice();
+    if (detail !== 0) {
+      for (let i = 0; i < n.length; i += 3) {
+        const [x, y, z] = unit(n[i], n[i + 1], n[i + 2]);
+        n[i] = x; n[i + 1] = y; n[i + 2] = z;
+      }
+    }
     this.setData(p, n, uv, Uint32Array.from({ length: p.length / 3 }, (_, k) => k));
     if (detail === 0) this.computeVertexNormals();
     this.needsUpdate = false;
@@ -914,6 +948,7 @@ export class IcosahedronGeometry extends PolyhedronGeometry {
     const t = (1 + Math.sqrt(5)) / 2;
     super([-1, t, 0, 1, t, 0, -1, -t, 0, 1, -t, 0, 0, -1, t, 0, 1, t, 0, -1, -t, 0, 1, -t, t, 0, -1, t, 0, 1, -t, 0, -1, -t, 0, 1],
       [0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7, 1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9, 8, 1], radius, detail);
+    this.parameters = { radius, detail };
   }
 }
 
@@ -921,6 +956,7 @@ export class OctahedronGeometry extends PolyhedronGeometry {
   override type = "OctahedronGeometry";
   constructor(radius = 1, detail = 0) {
     super([1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1], [0, 2, 4, 0, 4, 3, 0, 3, 5, 0, 5, 2, 1, 2, 5, 1, 5, 3, 1, 3, 4, 1, 4, 2], radius, detail);
+    this.parameters = { radius, detail };
   }
 }
 
@@ -928,6 +964,7 @@ export class TetrahedronGeometry extends PolyhedronGeometry {
   override type = "TetrahedronGeometry";
   constructor(radius = 1, detail = 0) {
     super([1, 1, 1, -1, -1, 1, -1, 1, -1, 1, -1, -1], [2, 1, 0, 0, 3, 2, 1, 3, 0, 2, 3, 1], radius, detail);
+    this.parameters = { radius, detail };
   }
 }
 
@@ -937,5 +974,6 @@ export class DodecahedronGeometry extends PolyhedronGeometry {
     const t = (1 + Math.sqrt(5)) / 2, r = 1 / t;
     super([-1, -1, -1, -1, -1, 1, -1, 1, -1, -1, 1, 1, 1, -1, -1, 1, -1, 1, 1, 1, -1, 1, 1, 1, 0, -r, -t, 0, -r, t, 0, r, -t, 0, r, t, -r, -t, 0, -r, t, 0, r, -t, 0, r, t, 0, -t, 0, -r, t, 0, -r, -t, 0, r, t, 0, r],
       [3, 11, 7, 3, 7, 15, 3, 15, 13, 7, 19, 17, 7, 17, 6, 7, 6, 15, 17, 4, 8, 17, 8, 10, 17, 10, 6, 8, 0, 16, 8, 16, 2, 8, 2, 10, 0, 12, 1, 0, 1, 18, 0, 18, 16, 6, 10, 2, 6, 2, 13, 6, 13, 15, 2, 16, 18, 2, 18, 3, 2, 3, 13, 18, 1, 9, 18, 9, 11, 18, 11, 3, 4, 14, 12, 4, 12, 0, 4, 0, 8, 11, 9, 5, 11, 5, 19, 11, 19, 7, 19, 5, 14, 19, 14, 4, 19, 4, 17, 1, 12, 14, 1, 14, 5, 1, 5, 9], radius, detail);
+    this.parameters = { radius, detail };
   }
 }
