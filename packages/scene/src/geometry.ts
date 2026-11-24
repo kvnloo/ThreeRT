@@ -533,7 +533,12 @@ export class CylinderGeometry extends BufferGeometry {
   constructor(radiusTop = 1, radiusBottom = 1, height = 1, radialSegments = 32, heightSegments = 1, openEnded = false, thetaStart = 0, thetaLength = Math.PI * 2) {
     super();
     this.parameters = { radiusTop, radiusBottom, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength };
+    radialSegments = Math.floor(radialSegments);
+    heightSegments = Math.floor(heightSegments);
     const b = new Builder();
+    // Groups as three.js has them: the side is material 0, the top cap 1, the bottom cap 2.
+    const groups: GeometryGroup[] = [];
+    const group = (start: number, materialIndex: number) => groups.push({ start, count: b.idx.length - start, materialIndex });
     let index = 0;
     const indexArray: number[][] = [];
     const halfHeight = height / 2;
@@ -561,7 +566,9 @@ export class CylinderGeometry extends BufferGeometry {
         if (radiusBottom > 0 || y !== heightSegments - 1) b.idx.push(bb, c, d);
       }
     }
+    group(0, 0);
     const generateCap = (top: boolean) => {
+      const groupStart = b.idx.length;
       const centerIndexStart = index;
       const radius = top ? radiusTop : radiusBottom;
       const sign = top ? 1 : -1;
@@ -587,20 +594,22 @@ export class CylinderGeometry extends BufferGeometry {
         if (top) b.idx.push(i, i + 1, c);
         else b.idx.push(i + 1, i, c);
       }
+      group(groupStart, top ? 1 : 2);
     };
     if (!openEnded) {
       if (radiusTop > 0) generateCap(true);
       if (radiusBottom > 0) generateCap(false);
     }
     b.finish(this);
+    this.groups = groups;
   }
 }
 
 export class ConeGeometry extends CylinderGeometry {
   override type = "ConeGeometry";
-  constructor(radius = 1, height = 1, radialSegments = 32, heightSegments = 1, openEnded = false) {
-    super(0, radius, height, radialSegments, heightSegments, openEnded);
-    this.parameters = { radius, height, radialSegments, heightSegments, openEnded };
+  constructor(radius = 1, height = 1, radialSegments = 32, heightSegments = 1, openEnded = false, thetaStart = 0, thetaLength = Math.PI * 2) {
+    super(0, radius, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength);
+    this.parameters = { radius, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength };
   }
 }
 
