@@ -429,7 +429,23 @@ export class Quaternion {
   }
   /** The inverse rotation (of a unit quaternion). */
   invert(): this {
+    return this.conjugate();
+  }
+  conjugate(): this {
     return this.set(-this._x, -this._y, -this._z, this._w);
+  }
+  identity(): this {
+    return this.set(0, 0, 0, 1);
+  }
+  lengthSq(): number {
+    return this._x * this._x + this._y * this._y + this._z * this._z + this._w * this._w;
+  }
+  length(): number {
+    return Math.sqrt(this.lengthSq());
+  }
+  /** Set to the spherical interpolation of `qa` to `qb` at `t` (three.js). */
+  slerpQuaternions(qa: Quaternion, qb: Quaternion, t: number): this {
+    return this.copy(qa).slerp(qb, t);
   }
   equals(q: Quaternion): boolean {
     return q._x === this._x && q._y === this._y && q._z === this._z && q._w === this._w;
@@ -440,8 +456,14 @@ export class Quaternion {
     const x0 = Math.random(), r1 = Math.sqrt(1 - x0), r2 = Math.sqrt(x0);
     return this.set(r1 * Math.sin(theta1), r1 * Math.cos(theta1), r2 * Math.sin(theta2), r2 * Math.cos(theta2));
   }
-  toArray(): [number, number, number, number] {
-    return [this._x, this._y, this._z, this._w];
+  toArray(): [number, number, number, number];
+  toArray<T extends { [i: number]: number }>(array: T, offset?: number): T;
+  toArray(array: { [i: number]: number } = [], offset = 0): { [i: number]: number } {
+    array[offset] = this._x;
+    array[offset + 1] = this._y;
+    array[offset + 2] = this._z;
+    array[offset + 3] = this._w;
+    return array;
   }
   fromArray(a: ArrayLike<number>, o = 0): this {
     return this.set(a[o], a[o + 1], a[o + 2], a[o + 3]);
