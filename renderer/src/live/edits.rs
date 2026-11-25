@@ -1276,14 +1276,15 @@ impl LiveCore {
     }
 
     /// An instance that came back, or went unseen: its emitters' areas and centres as it stands now (an unseen one's
-    /// are its mesh's own: `placed_emitter`), for their weights.
-    fn weigh_run(&mut self, r: u32) {
+    /// are its mesh's own: `placed_emitter`), for their weights. `all`: those without area too (a mesh that deforms:
+    /// a pose may leave a triangle none, and the next give it some again).
+    fn weigh_run(&mut self, r: u32, all: bool) {
         let LoadedScene { tables, instances, pool_tris, edit, .. } = &mut self.sc;
         let Some(inst) = instances.get(r as usize) else { return };
         let run = emitter_run(&tables.emitter_tris, instances, r);
         for j in run.clone() {
             let e = tables.emitter_tris[j];
-            if e.area > 0.0 {
+            if all || e.area > 0.0 {
                 let (area, c, _) = crate::placed_emitter(inst, &pool_tris[e.tri as usize - edit.pool_first], e.mat, &tables.materials);
                 (tables.emitter_tris[j].area, tables.emitter_tris[j].c) = (area, c);
             }
@@ -1392,7 +1393,7 @@ impl LiveCore {
                     top.moved(top.inst_base() + r, w, Some((inst.cast_shadow, unseen)));
                     build.instances = true;
                     changes.powers.insert(k);
-                    self.weigh_run(r as u32);
+                    self.weigh_run(r as u32, false);
                     // (A skinned model shown is skinned as it is posed now: its mesh kept the pose it was hidden in.)
                     if skinned && !unseen {
                         changes.poses.insert(k);
@@ -1415,7 +1416,7 @@ impl LiveCore {
                     build.instances = true;
                     changes.powers.insert(k);
                     for r in records {
-                        self.weigh_run(r);
+                        self.weigh_run(r, false);
                     }
                     if !unseen {
                         changes.poses.insert(k);
@@ -1482,7 +1483,7 @@ impl LiveCore {
         self.sc.up.heap.write(q, Table::Objects, 0, bytemuck::cast_slice(&self.sc.tables.objects));
         for k in 0..self.flipped.len() {
             if let Some(r) = self.sc.tables.retained.instance(self.flipped[k]).map(|i| i.instance) {
-                self.weigh_run(r);
+                self.weigh_run(r, false);
             }
         }
         self.fill_moved(placed.iter().map(|&(_, i)| i));
@@ -2454,8 +2455,35 @@ impl LiveCore {
             })
             .collect();
         self.keep_prev_spans(&posed.iter().chain(&self.pose_spans).copied().collect::<Vec<_>>());
+        // Their triangles that emit, placed by the new poses here too: the light tree's moving subtree is refit by
+        // them (`move_emitters`). The light list's own copies are taken again on the GPU, from the vertices the pass
+        // writes (`fill_moved`).
+        let mut lit: Vec<(u32, Vec<(usize, [glam::Vec3A; 3])>)> = vec![];
+        for (g, rows) in &work {
+            let sk = &self.sc.tables.retained.skinned[*g as usize];
+            let run = emitter_run(&self.sc.tables.emitter_tris, &self.sc.instances, sk.instance);
+            if run.is_empty() {
+                continue;
+            }
+            let m = self.sc.meshes[sk.mesh as usize];
+            let Some((vertices, index)) = self.sc.skins.get(sk.source as usize).filter(|s| s.1.len() == m.count as usize) else { return Ok(false) };
+            let first = self.sc.edit.pool_first + m.first as usize;
+            let placed = |e: &crate::EmitterTri| {
+                let k = (e.tri as usize).checked_sub(first)?;
+                Some((m.first as usize + k, (*index.get(k)?).map(|v| glam::Vec3A::from(crate::skin::skin_corner(&vertices[v as usize], rows).0))))
+            };
+            lit.push((sk.instance, self.sc.tables.emitter_tris[run].iter().filter_map(placed).collect()));
+        }
         if !self.g.skin(&self.sc.up, &work) {
             return Ok(false);
+        }
+        for &(at, t) in lit.iter().flat_map(|l| &l.1) {
+            self.sc.pool_tris[at] = t;
+        }
+        self.fill_moved(lit.iter().map(|l| l.0));
+        // (And their weights, by the areas the pose gives them.)
+        for l in &lit {
+            self.weigh_run(l.0, true);
         }
         self.pose_spans = posed;
         self.pose_reposed = true;
@@ -2972,8 +3000,8 @@ impl LiveCore {
                         return Err("a model with material functions the scene has not got, or posed (its materials load with a rebuild)".into());
                     }
                     let key = scene::model_key(uri, functions);
-                    if features & gpu::F_INST == 0 || m.determinant() == 0.0 || std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "0") {
-                        return Err("a model the build would flatten (no size, instancing off, or the scene's first instance)".into());
+                    if features & gpu::F_INST == 0 || m.determinant() == 0.0 {
+                        return Err("a model without size, or the scene's first instance".into());
                     }
                     // (Shadow rays pass the glass among a caster's other sections under a kernel feature: a scene where
                     // no instance of the model cast a shadow was built without it.)
@@ -3240,9 +3268,9 @@ impl LiveCore {
                     if features & gpu::F_INST == 0 {
                         return Err("the scene's first instanced mesh (kernel feature)".into());
                     }
-                    // An instanced object placed without size, or instancing off (the build flattens).
-                    if (capacity.is_some() && m.determinant() == 0.0) || std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "0") {
-                        return Err("an instanced object without size, or instancing off".into());
+                    // An instanced object placed without size.
+                    if capacity.is_some() && m.determinant() == 0.0 {
+                        return Err("an instanced object without size".into());
                     }
                     let mats = ids.iter().map(|k| tables.retained.materials.get(k).copied().ok_or("unknown material")).collect::<std::result::Result<Vec<u32>, _>>()?;
                     let mat = mats[0];

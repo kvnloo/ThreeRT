@@ -1014,7 +1014,7 @@ struct RigidPart {
 /// A posed skinned model's mesh: the model's triangles in its own space, a mesh a model. The skinning pass skins it at
 /// each new pose (gpu.rs `skin`: the CPU sends the pose's matrices) and its BLAS is built again; the model moves as
 /// its instance (hardware RT). Never shared: two models in one pose are two meshes (a mesh shared came apart when
-/// one of them took another pose, and that was a rebuild). Only a model none of whose triangles emits.
+/// one of them took another pose, and that was a rebuild).
 #[derive(Clone, Debug)]
 pub struct Skinned {
     pub mesh: u32,
@@ -1650,7 +1650,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         materials.push(gm);
     }
 
-    let mut tris: Vec<[Vec3A; 3]> = vec![];
+    let tris: Vec<[Vec3A; 3]> = vec![];
     let mut tri_flags: Vec<u32> = vec![];
     let mut attrs: Vec<GpuTriAttr> = vec![];
     let mut lights: Vec<GpuLight> = vec![];
@@ -1671,13 +1671,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     let mut grids: Vec<GridBuild> = vec![];
     let grid_programs: Vec<(String, String, String)> = w.grid_programs.iter().map(|(k, (c, h))| (k.clone(), c.clone(), h.clone())).collect();
     let mut objects: Vec<[f32; 4]> = vec![];
-    // Static glTF models drawn more than once share their triangles (model space, one BLAS): opaque, shadow-casting
-    // per node. THREERT_INSTANCING=0 flattens everything.
-    let instancing = std::env::var("THREERT_INSTANCING").map_or(true, |v| v != "0");
     let mut pool_tris: Vec<[Vec3A; 3]> = vec![];
-    let (mut vcolors, mut pool_vcolors): (Vec<[u32; 3]>, Vec<[u32; 3]>) = (vec![], vec![]);
-    // Whether a mesh's triangles carry its geometry's vertex colours: any of its materials asks for them.
-    let colored = |g: &world::Geometry, mats: &mut dyn Iterator<Item = &u32>| !g.colors.is_empty() && mats.filter(|k| w.materials.get(k).is_some_and(|m| m.vertex_colors)).count() > 0;
+    let (vcolors, mut pool_vcolors): (Vec<[u32; 3]>, Vec<[u32; 3]>) = (vec![], vec![]);
     let mut pool_attrs: Vec<GpuTriAttr> = vec![];
     let mut meshes: Vec<InstMesh> = vec![];
     let mut instances: Vec<Instance> = vec![];
@@ -1703,7 +1698,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
     let mut skin_rest: Vec<Vec<skin::PaletteRows>> = vec![];
     let mut skin_source_of: HashMap<(String, Option<Vec<String>>, Vec<bool>), (u32, Arc<Vec<(u32, u32, u32)>>)> = HashMap::new();
     // Flattened instances' triangle ranges.
-    let mut tri_instances: Vec<(u32, u32, u32)> = vec![];
+    let tri_instances: Vec<(u32, u32, u32)> = vec![];
     // The rect lights' card mesh, once a scene has a card (`card_mesh`).
     let mut card: Option<u32> = None;
     // Instance colours anywhere: object entries of 4 vec4s, and the kernel's F_TINT.
@@ -1714,9 +1709,8 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         let m = worlds[id];
         let first = tris.len() as u32;
         let shown = w.shown(*id);
-        let flags = if n.cast_shadow { 0 } else { TRI_NO_SHADOW };
         match &n.kind {
-            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } if instancing => {
+            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } => {
                 // A mesh is an instance of its geometry's mesh: the triangles in model space in the pool, one BLAS,
                 // shared by the objects of the geometry whatever their materials, which are the instance's rows
                 // (`section_mesh`, `Row`: a cutout, glass, one that emits). A move is the instance's transform
@@ -1765,8 +1759,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 // copies' records and entries contiguous (live/edits.rs `update_instanced` rewrites them in place).
                 // With a material that emits each copy has its emitters in the light list (`rows_emitters`), a
                 // hidden copy's at no weight (its object has no power). A copy may mirror
-                // the mesh (`INST_MIRRORED`). Without instancing each copy is its own triangles, and changing the
-                // instances rebuilds.
+                // the mesh (`INST_MIRRORED`).
                 let empty = world::InstanceTable::default();
                 let t = w.instanced.get(id).unwrap_or(&empty);
                 let placed: Vec<(Mat4, bool)> = (0..*capacity as usize).map(|i| instance_world(m, t, i)).collect();
@@ -1787,77 +1780,34 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 let material = mats.first().ok_or_else(|| anyhow!("object {}: an instanced mesh needs a material", n.name))?;
                 let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
                 let emits = emissive(&materials[mat as usize]);
-                let vc = colored(g, &mut std::iter::once(material));
-                if instancing {
-                    // (The geometry whole, with the object's first material: the mesh an object of one material has.)
-                    let key = (*geometry, false);
-                    let mesh = match retained.own_mesh.get(&key) {
-                        Some(&k) => Some(k),
-                        None => {
-                            let d = section_mesh(g, false, pool_tris.len() as u32, sections.len() as u32, colored_meshes.contains(&key));
-                            (!d.tris.is_empty()).then(|| {
-                                meshes.push(d.mesh);
-                                sections.extend(d.sections);
-                                put_colors(&mut pool_vcolors, pool_tris.len(), d.colors);
-                                pool_tris.extend(d.tris);
-                                pool_attrs.extend(d.attrs);
-                                let k = meshes.len() as u32 - 1;
-                                retained.own_mesh.insert(key, k);
-                                k
-                            })
-                        }
-                    };
-                    if let Some(mesh) = mesh {
-                        let object = (objects.len() / stride) as u32;
-                        retained.proxy(*id).draw = Draw::Instanced(InstancedPlace { first: instances.len() as u32, capacity: *capacity, object, mesh: Some(mesh), drawn: t.count });
-                        let mine = section_rows(meshes[mesh as usize].sections(&sections), std::slice::from_ref(&mat), &materials);
-                        for (i, &(wm, hidden)) in placed.iter().enumerate() {
-                            let (lo, hi) = meshes[mesh as usize].placed_bounds(wm);
-                            objects.extend_from_slice(&copy_row(entry(i, wm, Vec3::from(hi - lo)), emits && hidden)[..stride]);
-                            instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
-                            rows.extend(mine.iter().copied());
-                        }
+                // (The geometry whole, with the object's first material: the mesh an object of one material has.)
+                let key = (*geometry, false);
+                let mesh = match retained.own_mesh.get(&key) {
+                    Some(&k) => Some(k),
+                    None => {
+                        let d = section_mesh(g, false, pool_tris.len() as u32, sections.len() as u32, colored_meshes.contains(&key));
+                        (!d.tris.is_empty()).then(|| {
+                            meshes.push(d.mesh);
+                            sections.extend(d.sections);
+                            put_colors(&mut pool_vcolors, pool_tris.len(), d.colors);
+                            pool_tris.extend(d.tris);
+                            pool_attrs.extend(d.attrs);
+                            let k = meshes.len() as u32 - 1;
+                            retained.own_mesh.insert(key, k);
+                            k
+                        })
                     }
-                    continue;
-                }
-                // Flattened: nothing kept to change it by (`Draw::Fixed`; an entry a copy, as the instances have).
-                retained.proxy(*id);
-                for (i, &(wm, hidden)) in placed.iter().enumerate() {
-                    if hidden {
-                        continue;
+                };
+                if let Some(mesh) = mesh {
+                    let object = (objects.len() / stride) as u32;
+                    retained.proxy(*id).draw = Draw::Instanced(InstancedPlace { first: instances.len() as u32, capacity: *capacity, object, mesh: Some(mesh), drawn: t.count });
+                    let mine = section_rows(meshes[mesh as usize].sections(&sections), std::slice::from_ref(&mat), &materials);
+                    for (i, &(wm, hidden)) in placed.iter().enumerate() {
+                        let (lo, hi) = meshes[mesh as usize].placed_bounds(wm);
+                        objects.extend_from_slice(&copy_row(entry(i, wm, Vec3::from(hi - lo)), emits && hidden)[..stride]);
+                        instances.push(Instance { mesh, world: wm, object: object + i as u32, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                        rows.extend(mine.iter().copied());
                     }
-                    let start = tris.len();
-                    put_colors(&mut vcolors, start, vc.then(|| tri_colors(g, wm.determinant() < 0.0, None)));
-                    append_arrays(g, wm, mat, flags, None, &mut tris, &mut tri_flags, &mut attrs);
-                    let (mut lo, mut hi) = (Vec3A::splat(f32::MAX), Vec3A::splat(f32::MIN));
-                    for v in tris[start..].iter().flatten() {
-                        lo = lo.min(*v);
-                        hi = hi.max(*v);
-                    }
-                    let oi = (objects.len() / stride) as u32;
-                    objects.extend_from_slice(&entry(i, wm, Vec3::from((hi - lo).max(Vec3A::ZERO)))[..stride]);
-                    for a in &mut attrs[start..] {
-                        a.x[1] = f32::from_bits(oi);
-                    }
-                    tri_nodes.push((n.name.clone(), start as u32, tris.len() as u32));
-                    tri_instances.push((start as u32, tris.len() as u32, i as u32));
-                }
-            }
-            Kind::Mesh { geometry, material, materials: mesh_mats, .. } if shown => {
-                let g = w.geometries.get(geometry).ok_or_else(|| anyhow!("object {}: unknown geometry {geometry}", n.name))?;
-                let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
-                // Several materials: each geometry group's triangles with its own (three.js's material array).
-                let gpu_mats = mesh_mats.iter().map(|k| retained.materials.get(k).copied().ok_or_else(|| anyhow!("object {}: unknown material {k}", n.name))).collect::<Result<Vec<u32>>>()?;
-                let per_tri = group_materials(g, &gpu_mats);
-                let movable = w.movable(*id);
-                // Coloured where the triangle's own material asks (each group's; without groups, the mesh's).
-                let wants = |k: &u32| w.materials.get(k).is_some_and(|m| m.vertex_colors);
-                let vc_tri = group_materials(g, &mesh_mats.iter().map(|k| u32::from(wants(k))).collect::<Vec<_>>());
-                let vc = !g.colors.is_empty() && match &vc_tri { Some(v) => v.iter().any(|f| *f == Some(1)), None => wants(material) };
-                put_colors(&mut vcolors, tris.len(), vc.then(|| tri_colors(g, m.determinant() < 0.0, vc_tri.as_deref())));
-                append_arrays(g, m, mat, if movable { flags | TRI_DYNAMIC } else { flags }, per_tri.as_deref(), &mut tris, &mut tri_flags, &mut attrs);
-                if movable {
-                    retained.proxy(*id).draw = Draw::Dynamic(DynamicModel { first, mats: attrs[first as usize..].iter().map(|a| a.uv[3].to_bits()).collect(), ..Default::default() });
                 }
             }
             Kind::Model { uri, nodes, animation, functions } if shown => {
@@ -1895,16 +1845,14 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     };
                     Ok((i, mesh_class(&materials[i as usize]), emissive(&materials[i as usize])))
                 };
-                // A posed model the build flattens has dynamic triangles (re-skinned in place). A movable one is an
-                // instance whose transform moves.
+                // (A posed model is posed in place: its parts' instances, or its mesh by the skinning pass. A movable one
+                // is an instance whose transform moves.)
                 let posed = animation.is_some() && glb.animated();
                 let movable = w.movable(*id);
-                let dynamic = posed || movable;
-                let flags = if dynamic { flags | TRI_DYNAMIC } else { flags };
                 // Posed rigid model: its parts as instances (`RigidModel`: the nodes its clip leaves alone merged into
                 // one mesh, each node it moves a mesh); a movable one too (each update re-places its instances from
                 // the object's transform).
-                if instancing && posed && nodes.is_none() && glb.rigid() {
+                if posed && nodes.is_none() && glb.rigid() {
                     let a = animation.as_ref().unwrap();
                     let globals = glb.node_globals(Some(a))?;
                     let pkey = (key.clone(), rigid_pose_key(a));
@@ -1979,17 +1927,30 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                     continue;
                 }
                 // A posed skinned model is an instance of a mesh of its own, in its own space, which the skinning pass
-                // skins at each new pose (`Skinned`). One with emitting triangles is not yet: skinned alone, below.
-                if instancing && posed && m.determinant() != 0.0 && !(nodes.is_none() && glb.rigid()) {
+                // skins at each new pose (`Skinned`). Its triangles that emit are its instance's emitters, as any
+                // mesh's: the light list takes them again from the skinned vertices at each pose (live/edits.rs
+                // `repose_skinned`). Placed without size it is an instance no ray sees (`placed_world`).
+                if posed && !(nodes.is_none() && glb.rigid()) {
                     let a = animation.as_ref().unwrap();
                     let local = glb.triangles(Mat4::IDENTITY, nodes.as_deref(), Some(a))?;
                     let mut classed: [Vec<(usize, u32)>; 4] = Default::default();
+                    let mut emitting: std::collections::HashSet<u32> = Default::default();
                     for (k, t) in local.iter().enumerate() {
-                        // (A mesh that deforms does not keep its emitters: the light list does not follow a pose yet.)
                         let (mat, class, emits) = resolve(t.material.and_then(|i| doc.materials().nth(i)))?;
-                        classed[if emits { FLAT } else { class as usize }].push((k, mat));
+                        classed[class as usize].push((k, mat));
+                        if emits {
+                            emitting.insert(mat);
+                        }
                     }
-                    if classed[FLAT].is_empty() && !local.is_empty() {
+                    // A cutout on exactly an emitter's vertices is left out: a skinned model is one mesh, where the
+                    // cutout's holes would take the emitter with them (`split_coincident`). What is drawn is the
+                    // emitter, as where the two are meshes apart. (Glass on what lies under it stays, as it was.)
+                    for (k, mat, class) in split_coincident(&mut classed, &emitting, &|k| local[k].p) {
+                        if class == 2 {
+                            classed[2].push((k, mat));
+                        }
+                    }
+                    if !local.is_empty() {
                         let (order, sects, mine) = model_sections(&kept(&classed));
                         // (The model's corners in its mesh's order: one copy for every placement of the model.)
                         let mirrors = glb.mirrored(Some(a))?;
@@ -2024,13 +1985,14 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         let mesh = meshes.len() as u32 - 1;
                         sections.extend(sects);
                         retained.mesh_rows.insert(mesh, mine.clone());
-                        let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
                         let pivot = m.transform_point3(Vec3::ZERO);
+                        let (world, gone) = placed_world(m, pivot);
+                        let (lo, hi) = meshes[mesh as usize].placed_bounds(world);
                         let size = hi - lo;
                         let oi = (objects.len() / stride) as u32;
-                        objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
+                        objects.extend_from_slice(&object_row(pivot, if gone { 0.0 } else { n.power }, size, n.custom, [1.0; 3])[..stride]);
                         let i = instances.len() as u32;
-                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
+                        instances.push(Instance { mesh, world, object: oi, cast_shadow: rows_cast(&mine, n.cast_shadow), name: n.name.clone(), sub: None, hidden: gone, masked: gone, first_emitter: 0, rows: rows.len() as u32, bits: rows_bits(&mine), prev: 0, verts: 0 });
                         rows.extend(mine);
                         retained.skinned.push(Skinned { mesh, uri: uri.clone(), nodes: nodes.clone(), animation: a.clone(), order: tri_order, object: *id, instance: i, source, palette_len: glb.palette_len() as u32, mirrors });
                         *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: i, mesh: MeshKind::Skinned(retained.skinned.len() as u32 - 1), moves: true }) };
@@ -2040,7 +2002,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         continue;
                     }
                 }
-                if instancing && !posed {
+                if !posed {
                     let key = mesh_key.clone();
                     let mesh = match mesh_of.get(&key) {
                         Some(k) => *k,
@@ -2065,9 +2027,6 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                                 for v in local.iter().flat_map(|t| t.p) {
                                     (im.lo, im.hi) = (im.lo.min(v.into()), im.hi.max(v.into()));
                                 }
-                            }
-                            if std::env::var("THREERT_INSTANCING").is_ok_and(|v| v == "log") {
-                                eprintln!("instancing: {uri} {nodes:?}: {} opaque, {} cutout, {} glass in the mesh; {} in a second mesh", classed[0].len(), classed[1].len(), classed[2].len(), over.len());
                             }
                             // (What an edit can place another instance of: a mesh whole in the pool.)
                             if let Some(k) = k.filter(|&k| meshes[k as usize].over == NO_OVER) {
@@ -2100,15 +2059,7 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                         continue;
                     }
                 }
-                let mut mats = vec![];
-                for t in glb.triangles(m, nodes.as_deref(), animation.as_ref())? {
-                    let mat = resolve(t.material.and_then(|i| doc.materials().nth(i)))?.0;
-                    push_tri(&mut tris, &mut tri_flags, &mut attrs, t.p, t.n, t.uv, t.tangent, mat, flags);
-                    mats.push(mat);
-                }
-                if dynamic {
-                    retained.proxy(*id).draw = Draw::Dynamic(DynamicModel { first, mats, ..Default::default() });
-                }
+                // (A model without a triangle draws nothing.)
             }
             Kind::Light(l) => match (l, gpu_light_shown(l, m, n.power, shown)) {
                 (_, Some(gl)) => {
@@ -2167,7 +2118,6 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
                 // instance of it; each particle its own object (pivot, bounds and per-particle data for material
                 // functions). The quads are collapsed at the node until the particle pass writes their vertices where
                 // the particles are (the instance places nothing), and the mesh's BLAS is built again after the pass.
-                // (Whatever THREERT_INSTANCING says: a system has no flattened form.)
                 let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
                 let func = particle_fns.iter().position(|(k, _, _)| k == emitter).ok_or_else(|| anyhow!("object {}: unknown particle function {emitter}", n.name))? as u32;
                 let pivot = m.transform_point3(Vec3::ZERO);
@@ -2730,7 +2680,7 @@ pub fn mesh_class(g: &GpuMaterial) -> u32 {
     }
 }
 
-/// `classed`'s last list: the emitters of a mesh that deforms, which leave it (the model is flattened then).
+/// How many classes a model's triangles are of (`classed`'s lists before this one).
 pub const FLAT: usize = 3;
 
 /// The build's arrays a mesh of the pool and its instance are added to.
@@ -3282,6 +3232,67 @@ mod instance_tests {
         let power = |id: u32| sc.objects[sc.retained.proxies[&id].object.unwrap() as usize * object_stride(sc.tinted)][3];
         assert_eq!([power(1), power(2), power(3)], [1.0, 0.0, 0.0], "an unseen model's object has no power");
         assert!(matches!(sc.retained.proxies[&2].draw, Draw::Instance(_)), "it comes back as its instance does");
+    }
+
+    /// A posed skinned model's triangles that emit stay in its mesh (tests/render/data/arm-glow.glb: arm.glb with its
+    /// light half emitting, and a clip, `vanish`, that scales its tip joint from nothing to its size): the model is an instance of a mesh that deforms, and they are its instance's emitters,
+    /// moving ones, each its mesh's triangle as the instance places it. Nothing is a world-space triangle. One placed
+    /// without size is an instance no ray sees. No GPU.
+    #[test]
+    fn a_posed_skinned_models_emitters_are_its_instances() {
+        let mut w = World::default();
+        let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+        w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+        w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+        for (id, scale) in [(1, 1.5), (2, 0.0)] {
+            let animation = Some(desc::Animation { clip: "bend".into(), time: 0.25, r#loop: true, nodes: Default::default() });
+            w.set_object(id, format!("arm{id}"), None, Kind::Model { uri: "tests/render/data/arm-glow.glb".into(), nodes: None, animation, functions: vec![] }, true, false).unwrap();
+            w.set_transform(id, Vec3::new(id as f32 * 3.0, 0.5, -1.0), glam::Quat::from_rotation_y(0.4), Vec3::splat(scale)).unwrap();
+        }
+        let mut sc = build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap();
+        assert_eq!((sc.tris.len(), sc.instances.len(), sc.retained.skinned.len()), (0, 2, 2), "an instance a model, of a mesh of its own");
+        assert!(sc.meshes.iter().all(|m| m.deforms) && sc.instances.iter().map(|i| (i.hidden, i.masked)).collect::<Vec<_>>() == [(false, false), (true, true)]);
+        let power = |id: u32| sc.objects[sc.retained.proxies[&id].object.unwrap() as usize * object_stride(sc.tinted)][3];
+        assert_eq!([power(1), power(2)], [1.0, 0.0], "the unseen one's object has no power");
+        let a = sc.instances[0].clone();
+        let m = sc.meshes[a.mesh as usize];
+        let glow = rows_emitters(m.sections(&sc.sections), &sc.rows[a.rows as usize..][..m.sect_count as usize], &sc.materials);
+        assert!(glow > 0 && glow < m.count, "its emitting half: {glow} of {} triangles", m.count);
+        let p = crate::prepare_as(true, false, &mut sc, &mut vec![]);
+        let pool_first = sc.attrs.len() - sc.pool_tris.len();
+        let mine: Vec<usize> = (0..p.emitter_tris.len()).filter(|&i| p.emitter_tris[i].inst == 0).collect();
+        assert_eq!(mine.len() as u32, glow, "its instance's emitters");
+        for i in mine {
+            let e = &p.emitter_tris[i];
+            assert!(e.moves && !e.card && e.area > 0.0, "emitter {i}: one that moves");
+            let want = sc.pool_tris[e.tri as usize - pool_first].map(|v| a.world.transform_point3(v.into()));
+            let got = p.gpu_emitter_tris[i].vertices().map(Vec3::from);
+            assert!((0..3).all(|c| got[c].abs_diff_eq(want[c], 1e-5)), "emitter {i}: its mesh's triangle where the instance places it");
+        }
+    }
+
+    /// A posed skinned model's cutout on exactly an emitter's vertices is left out of its mesh (tests/render/data/
+    /// arm-glow-decal.glb: arm-glow.glb with a masked primitive on its emitting one's vertices): the mesh, its rows
+    /// and its emitters are the model's without the cutout. No GPU.
+    #[test]
+    fn a_skinned_models_cutout_on_an_emitter_is_left_out() {
+        let scene = |uri: &str| {
+            let mut w = World::default();
+            let cam = serde_json::from_value(serde_json::json!({ "fov": 50, "near": 0.1, "far": 100, "exposure": { "mode": "manual", "ev100": 0 } })).unwrap();
+            w.set_object(9, "camera".into(), None, Kind::Camera(cam), true, false).unwrap();
+            w.set_settings(world::Settings { camera: Some(9), ..Default::default() });
+            let animation = Some(desc::Animation { clip: "bend".into(), time: 0.25, r#loop: true, nodes: Default::default() });
+            w.set_object(1, "arm".into(), None, Kind::Model { uri: format!("tests/render/data/{uri}"), nodes: None, animation, functions: vec![] }, true, false).unwrap();
+            build(&w, Path::new(".."), &crate::default_presets_dir(), None).unwrap()
+        };
+        let (with, without) = (scene("arm-glow-decal.glb"), scene("arm-glow.glb"));
+        assert_eq!((with.tris.len(), with.meshes.len(), with.instances.len()), (0, 1, 1));
+        assert_eq!(with.pool_tris, without.pool_tris, "the mesh's triangles: the model's without the cutout's");
+        let classes = |sc: &Scene| sc.rows.iter().map(|r| r[0] & (ROW_CUTOUT | ROW_GLASS)).collect::<Vec<_>>();
+        assert_eq!((classes(&with), with.sections.clone()), (classes(&without), without.sections.clone()), "no section is a cutout's");
+        assert!(classes(&with).iter().all(|c| *c == 0));
+        let emitters = |sc: &Scene| rows_emitters(sc.meshes[0].sections(&sc.sections), &sc.rows, &sc.materials);
+        assert_eq!((emitters(&with), emitters(&without)), (2, 2));
     }
 
     /// A cutout on exactly an emitter's vertices leaves the mesh for the model's second one (`split_coincident`), in a
