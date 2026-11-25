@@ -88,7 +88,7 @@ impl EditSplit {
 /// procedural word (counted from the region's start) and TLAS instance, and where they started.
 #[derive(Default)]
 pub(super) struct EditState {
-    /// Triangles (GPU order), kernel records (a record's TLAS instance is `inst_base` + it) and object-table entries
+    /// Triangles (GPU order), kernel records (a record's TLAS instance, or its unit, is at it) and object-table entries
     /// edits can place: holes left by what they no longer draw, then the room, which grows past its end (ROADMAP § 6
     /// step 5).
     pub(super) tris: Holes,
@@ -106,14 +106,12 @@ pub(super) struct EditState {
     /// Times the room grew (frame log `grows`), and whether the scene bind group must be made again.
     pub(super) grows: u32,
     pub(super) rebind: bool,
-    /// (triangles, records, objects, words, TLAS instances) the scene itself has: the room starts there.
-    pub(super) base: (usize, usize, usize, usize, usize),
+    /// (triangles, records, objects, words) the scene itself has: the room starts there.
+    pub(super) base: (usize, usize, usize, usize),
     /// The instances' rows (`scene::Row`) edits can place, as the records are, and the run each record an edit placed
     /// has (its first row, how many): given back with the record, kept where an object is placed again with as many.
     pub(super) rows: Holes,
     pub(super) row_runs: std::collections::HashMap<usize, (usize, usize)>,
-    /// The first pool triangle (instanced meshes' triangles are counted from it).
-    pub(super) pool_first: usize,
     /// Procedural blobs in the region by hash: their first word (the build's and those edits wrote).
     pub(super) blobs: std::collections::HashMap<[u8; 32], usize>,
     /// The previous frame's positions (a vertex each) of the deforming meshes edits place: the build's before them,
@@ -300,7 +298,7 @@ pub(super) fn make_mesh(cx: &mut Meshing, data: scene::MeshData, colored: bool, 
                 cx.edit.verts.give(old.vfirst as usize, old.vcount as usize);
                 (cx.meshes[k as usize].vfirst, cx.meshes[k as usize].vcount) = (vfirst as u32, nv as u32);
                 if let gpu::Top::Hw(accel) = &mut *cx.top {
-                    cx.g.set_mesh(accel, k, cx.edit.pool_first + old.first as usize, &cx.meshes[k as usize], cx.sections);
+                    cx.g.set_mesh(accel, k, old.first as usize, &cx.meshes[k as usize], cx.sections);
                 }
             }
             let im = cx.meshes[k as usize];
@@ -314,7 +312,7 @@ pub(super) fn make_mesh(cx: &mut Meshing, data: scene::MeshData, colored: bool, 
                 let root = units.add_tree(k, tree).ok_or("edit room: tree nodes")?;
                 cx.g.write_tree(cx.nodes, root, tree);
             }
-            (k, cx.edit.pool_first + im.first as usize, im)
+            (k, im.first as usize, im)
         }
         None => {
             // A hole that fits, else the room's end (grown if it lacks room).
@@ -341,7 +339,7 @@ pub(super) fn make_mesh(cx: &mut Meshing, data: scene::MeshData, colored: bool, 
                 }
             };
             cx.sections[sect_first as usize..][..n].copy_from_slice(&sects);
-            let im = scene::InstMesh { sect_first, sect_count: n as u32, colored, vfirst: vfirst as u32, vcount: nv as u32, ..scene::own_inst_mesh(&t, (first - cx.edit.pool_first) as u32) };
+            let im = scene::InstMesh { sect_first, sect_count: n as u32, colored, vfirst: vfirst as u32, vcount: nv as u32, ..scene::own_inst_mesh(&t, first as u32) };
             let k = match &mut *cx.top {
                 gpu::Top::Hw(accel) => match dead {
                     Some(k) => {
@@ -390,18 +388,17 @@ pub(super) fn make_mesh(cx: &mut Meshing, data: scene::MeshData, colored: bool, 
         cx.w_colors.put((first * 12) as u64, bytemuck::cast_slice(&c));
     }
     cx.split.upload += t2.elapsed().as_secs_f64() * 1e3;
-    let rel = first - cx.edit.pool_first;
-    if cx.pool_tris.len() < rel + t.len() {
-        cx.pool_tris.resize(rel + t.len(), [glam::Vec3A::ZERO; 3]);
+    if cx.pool_tris.len() < first + t.len() {
+        cx.pool_tris.resize(first + t.len(), [glam::Vec3A::ZERO; 3]);
     }
-    cx.pool_tris[rel..rel + t.len()].copy_from_slice(&t);
+    cx.pool_tris[first..first + t.len()].copy_from_slice(&t);
     // (Software traversal: where its tree left each triangle of its sections, `mesh_places`.)
     if cx.top.sw() {
-        if cx.pool_place.len() < rel + t.len() {
-            cx.pool_place.resize(rel + t.len(), [0; 2]);
+        if cx.pool_place.len() < first + t.len() {
+            cx.pool_place.resize(first + t.len(), [0; 2]);
         }
         for (j, x) in a.iter().enumerate() {
-            cx.pool_place[rel + j] = [x.uv[3].to_bits(), x.x[3].to_bits()];
+            cx.pool_place[first + j] = [x.uv[3].to_bits(), x.x[3].to_bits()];
         }
     }
     let _ = im;
@@ -426,7 +423,6 @@ pub(super) struct Placing<'a, 'b> {
     new_emitters: &'a mut Vec<(u32, crate::GpuEmitterTri)>,
     emitters_changed: &'a mut bool,
     top: &'a mut gpu::Top<'b>,
-    inst_base: usize,
 }
 
 /// An instance placed at `record` by an edit: its rows in the room, each with where its section's triangles start;
@@ -436,7 +432,7 @@ pub(super) fn place_instance(cx: &mut Placing, record: usize, inst: &mut scene::
     let im = cx.meshes[inst.mesh as usize];
     let sects = im.sections(cx.sections);
     for (s, row) in sects.iter().zip(mine.iter_mut()) {
-        row[1] = cx.edit.pool_first as u32 + im.first + s.first;
+        row[1] = im.first + s.first;
     }
     let row_at = rows_for(cx.edit, cx.grow, cx.words, cx.instances, cx.meshes, record, mine.len())?;
     inst.rows = row_at as u32;
@@ -458,7 +454,7 @@ pub(super) fn place_instance(cx: &mut Placing, record: usize, inst: &mut scene::
             starts.get(s as usize).copied().flatten().map(|x| ((x + i) as usize, of[s as usize], s))
         };
         let (a, b) = (im.first as usize, (im.first + im.count) as usize);
-        let made = crate::instance_emitters(inst, record as u32, &cx.pool_tris[a..b], (cx.edit.pool_first + a) as u32, &numbered, n, &cx.tables.materials, moves, None);
+        let made = crate::instance_emitters(inst, record as u32, &cx.pool_tris[a..b], a as u32, &numbered, n, &cx.tables.materials, moves, None);
         for (j, (e, w)) in made.into_iter().enumerate() {
             cx.new_emitters.push(((first + j) as u32, crate::GpuEmitterTri::of(&e, w, 0)));
             match cx.tables.emitter_tris.get_mut(first + j) {
@@ -479,13 +475,13 @@ pub(super) fn place_instance(cx: &mut Placing, record: usize, inst: &mut scene::
     }
     cx.rows[row_at..row_at + mine.len()].copy_from_slice(mine);
     inst.verts = im.vfirst;
-    let gpu = cx.top.record(inst.gpu(cx.edit.pool_first as u32 + im.first), inst.mesh, inst.cast_shadow);
+    let gpu = cx.top.record(inst.gpu(im.first), inst.mesh, inst.cast_shadow);
     cx.w_records.put((record * std::mem::size_of::<scene::GpuInstance>()) as u64, bytemuck::bytes_of(&gpu));
     if record >= cx.gpu_instances.len() {
         cx.gpu_instances.resize(record + 1, scene::GpuInstance::default());
     }
     cx.gpu_instances[record] = gpu;
-    cx.top.place(cx.inst_base + record, inst.mesh, inst.world, gpu::INSTANCE_BIT | record as u32, inst.cast_shadow, inst.hidden);
+    cx.top.place(record, inst.mesh, inst.world, inst.cast_shadow, inst.hidden);
     if cx.instances.len() <= record {
         cx.instances.resize(record + 1, scene::Instance { name: String::new(), hidden: true, ..inst.clone() });
     }
@@ -531,7 +527,7 @@ pub(super) fn drop_mesh_user(k: u32, edit: &mut EditState, tables: &mut tables::
     *n = n.saturating_sub(1);
     if *n == 0 && edit.managed.remove(&k) {
         let im = meshes[k as usize];
-        edit.tris.give(edit.pool_first + im.first as usize, im.count as usize);
+        edit.tris.give(im.first as usize, im.count as usize);
         edit.verts.give(im.vfirst as usize, im.vcount as usize);
         tables.retained.own_mesh.retain(|_, v| *v != k);
         tables.retained.model_mesh.retain(|_, v| *v != k);
@@ -636,7 +632,7 @@ impl Grow<'_> {
         true
     }
 
-    /// Kernel records and the TLAS (a record's instance is `inst_base` + it).
+    /// Kernel records and the TLAS (a record's instance is at it).
     pub(super) fn records(&self, h: &mut Holes, extra: usize, heap: &mut Heap<Table>, accel: &mut gpu::Accel) -> bool {
         if !self.ok {
             return false;
@@ -645,7 +641,7 @@ impl Grow<'_> {
         if !self.table(heap, Table::Instances, (cap * std::mem::size_of::<scene::GpuInstance>()) as u64) {
             return false;
         }
-        self.g.grow_tlas(accel, accel.inst_base + cap);
+        self.g.grow_tlas(accel, cap);
         h.cap = cap;
         true
     }
@@ -890,8 +886,8 @@ impl LiveCore {
         if !changes.promoted.is_empty() {
             eprintln!("live: {} moved, now movable (this once rebuilds; set `movable = true` in the scene code to avoid it)", changes.promoted.join(", "));
         }
-        // Moved movable subtrees: their drawables are re-transformed with the posed models, their lights rewritten in
-        // the light table.
+        // Posed models, and what of the moved movable subtrees no instance moves (a rebuild's, below); their lights
+        // are rewritten in the light table.
         let mut dynamic = changes.poses.clone();
         // Still objects that moved for the first time: their meshes' instances move from now on, or the scene rebuilds.
         for id in std::mem::take(&mut changes.started) {
@@ -913,7 +909,7 @@ impl LiveCore {
                         let masked = inst.is_some_and(|i| self.sc.instances.get(i.instance as usize).is_some_and(|x| x.masked));
                         if world.shown(k) || masked {
                             // Movable models placed as instances move their transform (a posed skinned model too); the rest
-                            // re-transform triangles.
+                            // rebuild.
                             match inst.map(|i| i.instance) {
                                 Some(i) if !changes.poses.contains(&k) || inst.is_some_and(|i| matches!(i.mesh, scene::MeshKind::Skinned(_))) => placed.push((k, i)),
                                 _ => {
@@ -985,7 +981,8 @@ impl LiveCore {
             }
             catch_up.flush_section(&self.g.queue, &self.sc.up.heap, Table::Instances);
         }
-        if rigid_ok && (dynamic.is_empty() || (!changes.structural && self.repose(world, &dynamic, &mut top)?)) {
+        // (What moved and is no instance's to move: a rebuild's.)
+        if rigid_ok && dynamic.is_empty() {
             // Moved emitters: their triangles in the list and the light tree's moving subtree around them, once (after
             // every in-place update).
             if std::mem::take(&mut self.emitters_moved) {
@@ -994,7 +991,7 @@ impl LiveCore {
             changes.poses.clear();
             changes.moved.clear();
             // Moving objects move their shadows and reflections over static surfaces: let anti-lag look for it.
-            if !dynamic.is_empty() || !placed.is_empty() || !rigid.is_empty() || !shared.is_empty() || !procs_moved.is_empty() || instanced_done {
+            if !placed.is_empty() || !rigid.is_empty() || !shared.is_empty() || !procs_moved.is_empty() || instanced_done {
                 self.lit_changed = self.frame.max(1);
             }
         }
@@ -1165,11 +1162,11 @@ impl LiveCore {
     }
 
     /// The kernel features the scene needs as it is now: what its materials and the environment ask for (edits change
-    /// them), with the structural ones the build found (textures, material functions, the traversal groups;
+    /// them), with the structural ones the build found (textures, material functions;
     /// `gpu::instance_features`). A new variant is compiled once, then cached.
     pub(super) fn kernel_features(&self) -> u32 {
-        let (textures, functions, groups) = self.sc.fixed_features;
-        gpu::features_of(&self.sc.tables.materials, self.env.settings.features(), textures, functions, groups, self.sc.instance_features)
+        let (textures, functions) = self.sc.fixed_features;
+        gpu::features_of(&self.sc.tables.materials, self.env.settings.features(), textures, functions, self.sc.instance_features)
     }
 
     /// The view's state from the world as it is now (`ViewState::of`: the scene's camera with its lens, depth of field
@@ -1279,13 +1276,13 @@ impl LiveCore {
     /// are its mesh's own: `placed_emitter`), for their weights. `all`: those without area too (a mesh that deforms:
     /// a pose may leave a triangle none, and the next give it some again).
     fn weigh_run(&mut self, r: u32, all: bool) {
-        let LoadedScene { tables, instances, pool_tris, edit, .. } = &mut self.sc;
+        let LoadedScene { tables, instances, pool_tris, .. } = &mut self.sc;
         let Some(inst) = instances.get(r as usize) else { return };
         let run = emitter_run(&tables.emitter_tris, instances, r);
         for j in run.clone() {
             let e = tables.emitter_tris[j];
             if all || e.area > 0.0 {
-                let (area, c, _) = crate::placed_emitter(inst, &pool_tris[e.tri as usize - edit.pool_first], e.mat, &tables.materials);
+                let (area, c, _) = crate::placed_emitter(inst, &pool_tris[e.tri as usize], e.mat, &tables.materials);
                 (tables.emitter_tris[j].area, tables.emitter_tris[j].c) = (area, c);
             }
         }
@@ -1330,7 +1327,7 @@ impl LiveCore {
     /// Instance `r`'s emitters become moving ones, where it has some that are not: a new run of the light list, placed
     /// by `to` (where this commit moves the instance); the light tree keeps the old one where it stood, at no weight.
     fn emitters_start_moving(&mut self, r: u32, to: glam::Mat4) {
-        let LoadedScene { tables, instances, pool_tris, meshes, rows, up, edit, .. } = &mut self.sc;
+        let LoadedScene { tables, instances, pool_tris, meshes, rows, up, .. } = &mut self.sc;
         let old = emitter_run(&tables.emitter_tris, instances, r);
         if old.is_empty() || tables.emitter_tris[old.clone()].iter().all(|e| e.moves) {
             return;
@@ -1340,7 +1337,7 @@ impl LiveCore {
         for j in old {
             let e = crate::EmitterTri { moves: true, in_tree: false, ..tables.emitter_tris[j] };
             tables.emitter_tris[j].area = 0.0;
-            let w = pool_tris[e.tri as usize - edit.pool_first].map(|v| glam::Vec3A::from(to.transform_point3(v.into())));
+            let w = pool_tris[e.tri as usize].map(|v| glam::Vec3A::from(to.transform_point3(v.into())));
             self.pending_emitters.push((tables.emitter_tris.len() as u32, crate::GpuEmitterTri::of(&e, w, 0)));
             tables.emitter_tris.push(e);
         }
@@ -1360,8 +1357,8 @@ impl LiveCore {
     /// each by its instance's mask above the triangles (a posed rigid model's every part's; a posed skinned model's
     /// own), where no ray sees a
     /// hidden one, and its row's power (`Tables::apply`: a hidden mesh's emitters at no weight). False where
-    /// something under it is drawn another way, or a mesh is not such an instance (the build flattened it, or an edit
-    /// took it out while it was hidden): the caller rebuilds.
+    /// something under it is drawn another way, or a mesh is not such an instance (an edit took it out while it was
+    /// hidden): the caller rebuilds.
     fn show_meshes(&mut self, world: &World, id: u32, children: &std::collections::HashMap<u32, Vec<u32>>, changes: &mut crate::world::Changes, build: &mut gpu::TopBuild) -> bool {
         for k in world.subtree_with(id, children) {
             match &world.objects[&k].kind {
@@ -1385,12 +1382,12 @@ impl LiveCore {
                         continue;
                     }
                     let Some(mut top) = gpu::Top::of(&mut self.sc.up.accel, &mut self.sc.up.units) else { return false };
-                    // (Software traversal: a mesh that deforms and has no tree is in the still tree, no instance to mask.)
+                    // (Software traversal: a mesh without a tree is no unit: no instance to mask.)
                     if !top.has_mesh(inst.mesh) {
                         return false;
                     }
                     (inst.hidden, inst.masked) = (unseen, unseen);
-                    top.moved(top.inst_base() + r, w, Some((inst.cast_shadow, unseen)));
+                    top.moved(r, w, Some((inst.cast_shadow, unseen)));
                     build.instances = true;
                     changes.powers.insert(k);
                     self.weigh_run(r as u32, false);
@@ -1411,7 +1408,7 @@ impl LiveCore {
                     for &r in &records {
                         let Some(inst) = self.sc.instances.get_mut(r as usize) else { return false };
                         (inst.hidden, inst.masked) = (unseen, unseen);
-                        top.moved(top.inst_base() + r as usize, inst.world, Some((inst.cast_shadow, unseen)));
+                        top.moved(r as usize, inst.world, Some((inst.cast_shadow, unseen)));
                     }
                     build.instances = true;
                     changes.powers.insert(k);
@@ -1466,12 +1463,11 @@ impl LiveCore {
             let st = self.sc.tables.stride;
             let o = &mut self.sc.tables.objects[inst.object as usize * st];
             (o[0], o[1], o[2]) = (pivot.x, pivot.y, pivot.z);
-            let slot = top.inst_base() + i as usize;
             // (Unseen while it has no size, or its object is hidden: `Instance::masked`. Its row's power follows.)
             let unseen = gone || !world.shown(node);
             let flipped = inst.hidden != unseen;
             (inst.hidden, inst.masked) = (unseen, unseen);
-            top.moved(slot, w, Some((inst.cast_shadow, unseen)));
+            top.moved(i as usize, w, Some((inst.cast_shadow, unseen)));
             self.inst_moving.push(i);
             if flipped {
                 self.flipped.push(node);
@@ -1794,39 +1790,25 @@ impl LiveCore {
             rec.p = old.p;
             gpu_instances[r] = rec;
             up.heap.write(q, Table::Instances, r as u64 * size, bytemuck::bytes_of(&rec));
-            top.moved(top.inst_base() + r, inst.world, Some((cast, inst.hidden)));
+            top.moved(r, inst.world, Some((cast, inst.hidden)));
             build.instances = true;
         }
         Ok(())
     }
 
-    /// Emitter entries for the materials that started emitting (`Tables::started_emitting`): their flattened static
-    /// triangles (`mat_runs`), positions from `tris`, in the power-share part of the CDF (path code 0, as the light
-    /// tree's moving emitters; ROADMAP § 6 step 3). Returns them (each one's index and triangle) for `write_emitters`.
+    /// Emitter entries for the materials that started emitting (`Tables::started_emitting`), in the power-share part
+    /// of the CDF (path code 0, as the light tree's moving emitters; ROADMAP § 6 step 3). Returns them (each one's
+    /// index and triangle) for `write_emitters`.
     pub(super) fn add_material_emitters(&mut self) -> Vec<(u32, crate::GpuEmitterTri)> {
         let q = &self.g.queue;
         let sc = &mut self.sc;
         let mut new = vec![];
         let started = std::mem::take(&mut sc.tables.started_emitting);
-        for &mat in &started {
-            for &[first, end, obj] in sc.mat_runs.get(&mat).map_or(&[][..], |v| v.as_slice()) {
-                for k in first..end {
-                    let Some(&[a, b, c]) = sc.tri_order.get(k as usize).and_then(|&i| sc.tris.get(i as usize)) else { continue };
-                    let area = 0.5 * (b - a).cross(c - a).length();
-                    if area > 0.0 {
-                        let centre = (a + b + c) / 3.0;
-                        let e = crate::EmitterTri { tri: k, mat, obj, area, c: centre.to_array(), moves: false, nominal: false, in_tree: false, inst: crate::NO_INST, part: 0, card: sc.tables.materials[mat as usize].tex1[2] == scene::MAT_EMITTER_CARD };
-                        new.push((sc.tables.emitter_tris.len() as u32, crate::GpuEmitterTri::of(&e, [a, b, c], 0)));
-                        sc.tables.emitter_tris.push(e);
-                    }
-                }
-            }
-        }
         // The instances with a row of one of them (a mesh's, a model's, an instanced object's copies): each gets its
         // emitters as a new run at the list's end, the sections that emit now one after another, where each starts
         // in its row and the run's first in the instance's record; the run it had, of fewer, stays at no weight.
         if !started.is_empty() && !sc.meshes.is_empty() {
-            let LoadedScene { tables, instances, meshes, pool_tris, pool_place, sections, rows, edit, up, .. } = sc;
+            let LoadedScene { tables, instances, meshes, pool_tris, pool_place, sections, rows, up, .. } = sc;
             let moving = tables.retained.moving_records();
             let mut records: Vec<usize> = tables
                 .retained
@@ -1879,7 +1861,7 @@ impl LiveCore {
                     let (s, i) = place[j];
                     starts.get(s as usize).copied().flatten().map(|x| ((x + i) as usize, scene::row_material(&mine[s as usize]), s))
                 };
-                let first_tri = edit.pool_first + im.first as usize;
+                let first_tri = im.first as usize;
                 let (b0, b1) = (im.first as usize, (im.first + im.count) as usize);
                 for (e, w) in crate::instance_emitters(&instances[r], r as u32, &pool_tris[b0..b1], first_tri as u32, &numbered, n as usize, &tables.materials, moving.contains(&(r as u32)), None) {
                     new.push((tables.emitter_tris.len() as u32, crate::GpuEmitterTri::of(&e, w, 0)));
@@ -1898,37 +1880,27 @@ impl LiveCore {
     /// share of power, its count. With the tree's slot for emitters added in place (scenes that can edit geometry), their
     /// subtree is grown again first and their entries go right after the static ones (ROADMAP § 6 step 4); without it
     /// they stay at the end, by power share. `new`: the emitters made or made again since the last call (each one's
-    /// index and triangle): their triangles into the list, their entries into their triangles' attributes. The tables
+    /// index and triangle): their triangles into the list. The tables
     /// grow (and the scene bind group is made again) when entries were added past them: a scene that adds none keeps
     /// its layout.
     pub(super) fn write_emitters(&mut self, new: &[(u32, crate::GpuEmitterTri)]) {
         self.land_powers_now();
-        let g = &self.g;
-        let LoadedScene { tables: e, base: b, up, pool_tris, tris: flat, tri_order, edit, instances, codes_sent: sent, .. } = &mut self.sc;
+        let LoadedScene { tables: e, base: b, pool_tris, instances, codes_sent: sent, .. } = &mut self.sc;
         let size = std::mem::size_of::<crate::GpuEmitterTri>();
-        let (mut w_tris, mut w_rows) = (Gather::default(), Gather::default());
+        let mut w_tris = Gather::default();
         for (i, t) in new {
             w_tris.put((*i as usize * size) as u64, bytemuck::bytes_of(t));
-            // (A triangle in world space names its emitter; a mesh's is numbered among its mesh's.)
-            if t.inst == crate::NO_INST {
-                w_rows.put((t.tri as usize * 16 + 12) as u64, bytemuck::bytes_of(&(i + 1)));
-            }
         }
-        w_rows.flush_section(&g.queue, &up.words, Stream::Triangles);
         // Emitters added in place, with the tree's slot for them (`ltree::build_slotted`): its subtree grown again over
         // those alive, their entries right after the static ones in the CDF (the tree's order: `emitter_order`) and
         // their path codes with their triangles in the list (written over the code 0 they were made with).
         if let Some(t) = e.light_tree.as_mut() {
             if t.dynamic.is_some() {
-                let (mats, objs, st, pf) = (&e.materials, &e.objects, e.stride, edit.pool_first);
-                // (An emitter's triangle in world space: an instance's is its mesh's, placed.)
+                let (mats, objs, st) = (&e.materials, &e.objects, e.stride);
+                // (An emitter's triangle in world space: its mesh's, placed by its instance.)
                 let verts = |x: &crate::EmitterTri| {
-                    let k = x.tri as usize;
-                    let t = if k >= pf { pool_tris.get(k - pf).copied() } else { tri_order.get(k).and_then(|&i| flat.get(i as usize)).copied() };
-                    match instances.get(x.inst as usize) {
-                        Some(i) if x.inst != crate::NO_INST => t.map(|t| t.map(|v| glam::Vec3A::from(i.world.transform_point3(v.into())))),
-                        _ => t,
-                    }
+                    let (t, i) = (pool_tris.get(x.tri as usize)?, instances.get(x.inst as usize)?);
+                    Some(t.map(|v| glam::Vec3A::from(i.world.transform_point3(v.into()))))
                 };
                 let mut items = vec![];
                 for (i, x) in e.emitter_tris.iter().enumerate() {
@@ -2104,7 +2076,7 @@ impl LiveCore {
     /// An object given another material (`World::set_object`): every copy's row names it, with its class, and the
     /// copies' emitters go or are made with it.
     /// Returns how many objects it updated; Err: why it cannot (software traversal, an object the build
-    /// flattened or did not place this way, a kernel feature the material needs), and the caller rebuilds.
+    /// did not place this way, a kernel feature the material needs), and the caller rebuilds.
     /// `THREERT_EDIT_REBUILD=1` always rebuilds (A/B).
     pub(super) fn update_instanced(&mut self, world: &World, ids: &[u32], build: &mut gpu::TopBuild) -> std::result::Result<usize, String> {
         use crate::world::Kind;
@@ -2124,7 +2096,7 @@ impl LiveCore {
             let Some(n) = world.objects.get(&id).filter(|_| world.shown(id)) else { continue };
             let Kind::Instanced { capacity, procedural, materials, .. } = &n.kind else { continue };
             let (capacity, procedural) = (*capacity, *procedural);
-            let Some(&place) = sc.tables.retained.instanced(id) else { return Err("an instanced mesh the build flattened".into()) };
+            let Some(&place) = sc.tables.retained.instanced(id) else { return Err("an instanced mesh the build did not place".into()) };
             if place.capacity != capacity || place.mesh.is_none() != procedural {
                 return Err("an instanced mesh the build placed otherwise".into());
             }
@@ -2167,7 +2139,7 @@ impl LiveCore {
                         let at = sc.tables.emitter_tris.len();
                         (inst.first_emitter, row[2]) = (at as u32, at as u32);
                         let (a, b) = (mesh.first as usize, (mesh.first + mesh.count) as usize);
-                        let made = crate::instance_emitters(inst, r as u32, &sc.pool_tris[a..b], (sc.edit.pool_first + a) as u32, &|k| Some((k, mat, 0)), mesh.count as usize, &sc.tables.materials, true, None);
+                        let made = crate::instance_emitters(inst, r as u32, &sc.pool_tris[a..b], a as u32, &|k| Some((k, mat, 0)), mesh.count as usize, &sc.tables.materials, true, None);
                         for (j, (e, w)) in made.into_iter().enumerate() {
                             self.pending_emitters.push(((at + j) as u32, crate::GpuEmitterTri::of(&e, w, 0)));
                             sc.tables.emitter_tris.push(e);
@@ -2183,9 +2155,8 @@ impl LiveCore {
                 w_rows.flush_section(&self.g.queue, &sc.up.words, Stream::Rows);
                 cap = capacity as usize;
             }
-            // (A record's slot is `inst_base` + it, a procedural copy's record the first procedural one + its index.)
+            // (A procedural copy's record: the first procedural one + its index.)
             let rec0 = if procedural { sc.proc_first + first } else { first };
-            let slot0 = top.inst_base() + rec0;
             for i in 0..cap {
                 let (wm, hidden) = scene::instance_world(m, t, i);
                 let old = sc.gpu_instances[rec0 + i];
@@ -2211,7 +2182,7 @@ impl LiveCore {
                         let run = emitter_run(&sc.tables.emitter_tris, &sc.instances, (rec0 + i) as u32);
                         let inst = &sc.instances[first + i];
                         for e in &mut sc.tables.emitter_tris[run] {
-                            let (area, c, _) = crate::placed_emitter(inst, &sc.pool_tris[e.tri as usize - sc.edit.pool_first], e.mat, &sc.tables.materials);
+                            let (area, c, _) = crate::placed_emitter(inst, &sc.pool_tris[e.tri as usize], e.mat, &sc.tables.materials);
                             reweigh |= (area - e.area).abs() > 1e-5 * area.max(e.area);
                             (e.area, e.c) = (area, c);
                         }
@@ -2230,7 +2201,7 @@ impl LiveCore {
                 let edited = if e[0][3] != entry[0][3] { now } else { e[1][3] };
                 e.copy_from_slice(&entry[..st]);
                 e[1][3] = edited;
-                top.moved(slot0 + i, wm, Some((casts, hidden)));
+                top.moved(rec0 + i, wm, Some((casts, hidden)));
             }
             let q = &self.g.queue;
             sc.up.heap.write(q, Table::Instances, (rec0 * size) as u64, bytemuck::cast_slice(&sc.gpu_instances[rec0..rec0 + cap]));
@@ -2274,7 +2245,7 @@ impl LiveCore {
             let o = &mut self.sc.tables.objects[p.object as usize * st];
             (o[0], o[1], o[2]) = (pivot.x, pivot.y, pivot.z);
             if let Some(accel) = self.sc.up.accel.as_mut() {
-                if let Some(t) = accel.tlas[accel.inst_base + i].as_mut() {
+                if let Some(t) = accel.tlas[i].as_mut() {
                     t.transform = gpu::tlas_rows(w);
                 }
             }
@@ -2354,7 +2325,7 @@ impl LiveCore {
                 r.p = old.m;
                 self.sc.gpu_instances[i as usize] = r;
                 (ilo, ihi) = (ilo.min(i as usize), ihi.max(i as usize + 1));
-                top.moved(top.inst_base() + i as usize, w, Some((inst.cast_shadow, gone || inst.hidden)));
+                top.moved(i as usize, w, Some((inst.cast_shadow, gone || inst.hidden)));
                 // (Rigid models' instances are theirs alone: no other update this commit placed them.)
                 self.inst_moving.push(i);
             }
@@ -2467,7 +2438,7 @@ impl LiveCore {
             }
             let m = self.sc.meshes[sk.mesh as usize];
             let Some((vertices, index)) = self.sc.skins.get(sk.source as usize).filter(|s| s.1.len() == m.count as usize) else { return Ok(false) };
-            let first = self.sc.edit.pool_first + m.first as usize;
+            let first = m.first as usize;
             let placed = |e: &crate::EmitterTri| {
                 let k = (e.tri as usize).checked_sub(first)?;
                 Some((m.first as usize + k, (*index.get(k)?).map(|v| glam::Vec3A::from(crate::skin::skin_corner(&vertices[v as usize], rows).0))))
@@ -2503,41 +2474,6 @@ impl LiveCore {
         Ok(true)
     }
 
-    /// Re-skins posed models and re-transforms movable objects in place (hardware RT): their triangles and shading
-    /// attributes; the commit builds the dynamic BLASes and the TLAS. Their directly seen surfaces keep a short history for a moment,
-    /// like a power edit (no per-object motion vectors). False when it cannot (not dynamic at build, no hardware RT, a
-    /// different triangle count): the caller rebuilds.
-    pub(super) fn repose(&mut self, world: &World, ids: &std::collections::HashSet<u32>, build: &mut gpu::TopBuild) -> Result<bool> {
-        let dynamic = |p: &mut scene::Proxy| match &mut p.draw {
-            scene::Draw::Dynamic(d) => Some(std::mem::take(d)),
-            _ => None,
-        };
-        // (Their models out of the proxies while `reskin` has the scene, then back.)
-        let proxies = &mut self.sc.tables.retained.proxies;
-        let models: std::collections::HashMap<u32, scene::DynamicModel> = ids.iter().filter_map(|id| Some((*id, dynamic(proxies.get_mut(id)?)?))).collect();
-        let t_skin = Instant::now();
-        let res = if self.sc.up.accel.is_none() || models.len() < ids.len() { Ok(None) } else { self.reskin(world, ids, &models) };
-        self.cpu_skin_ms += t_skin.elapsed().as_secs_f32() * 1000.0;
-        for (id, d) in models {
-            self.sc.tables.retained.proxy(id).draw = scene::Draw::Dynamic(d);
-        }
-        let Some((lo, hi)) = res? else { return Ok(false) };
-        self.emitters_moved = true;
-        let t_up = Instant::now();
-        // Motion vectors: the GPU still holds the previous frame's vertices for this span (and for last update's span,
-        // if different): keep them as `prev_verts` before uploading the new ones.
-        let both = self.prev_span.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi)));
-        self.keep_prev(both);
-        self.prev_span = Some((lo, hi));
-        self.reposed = true;
-        // Upload the touched span of the dynamic tail; the commit builds the dynamic BLASes and the TLAS.
-        self.upload_dynamic(lo, hi);
-        self.sc.up.heap.write(&self.g.queue, Table::Objects, 0, bytemuck::cast_slice(&self.sc.tables.objects));
-        build.dynamic = true;
-        self.cpu_upload_ms += t_up.elapsed().as_secs_f32() * 1000.0;
-        Ok(true)
-    }
-
     /// The emitters of instances that moved (those of a mesh that emits): their runs of the light list taken again on
     /// the GPU, through the records just queued; the light tree's moving subtree after (`move_emitters`).
     pub(super) fn fill_moved(&mut self, records: impl Iterator<Item = u32>) {
@@ -2559,59 +2495,27 @@ impl LiveCore {
         }
     }
 
-    /// The emitters the CPU moves moved: their triangles in the list taken again on the GPU, from the triangles this
-    /// commit uploaded (`gpu::EmitterFills::moved`); and the light tree's moving subtree refit around them (the CPU copy
-    /// of the dynamic tail), its nodes and the root uploaded (`ltree::LightTree::refit_moving`).
+    /// Emitters moved (their instances did, `fill_moved`): the light tree's moving subtree refit around them, its
+    /// nodes and the root uploaded (`ltree::LightTree::refit_moving`).
     pub(super) fn move_emitters(&mut self) {
-        if let Some(f) = &self.sc.up.fills.moved {
-            let mut e = self.g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("emitter fill") });
-            self.g.fill_emitters(f, &mut e);
-            self.g.queue.submit([e.finish()]);
-        }
-        let first = self.sc.dynamic.0;
-        let (verts, tables) = (&self.sc.dynamic.1, &mut self.sc.tables);
+        let tables = &mut self.sc.tables;
         let tris = &tables.emitter_tris;
         let (q, heap) = (&self.g.queue, &self.sc.up.heap);
         let Some(t) = tables.light_tree.as_mut().filter(|t| t.moving_count > 0) else { return };
-        let (instances, pool_tris, pool_first) = (&self.sc.instances, &self.sc.pool_tris, self.sc.edit.pool_first);
+        let (instances, pool_tris) = (&self.sc.instances, &self.sc.pool_tris);
         t.refit_moving(&|e| {
             let x = &tris[e];
-            // (An instance's: its mesh's triangle, placed; none while the instance is hidden.)
-            if x.inst != crate::NO_INST {
-                let i = &instances[x.inst as usize];
-                return (!i.hidden).then(|| pool_tris[x.tri as usize - pool_first].map(|v| i.world.transform_point3(v.into()).to_array()));
-            }
-            let r = (x.tri as usize - first) * 3;
-            Some(crate::ltree::tri_vertices(&verts[r..r + 3]))
+            // (Its mesh's triangle, placed; none while the instance is hidden.)
+            let i = instances.get(x.inst as usize)?;
+            (!i.hidden).then(|| pool_tris[x.tri as usize].map(|v| i.world.transform_point3(v.into()).to_array()))
         });
         heap.write(q, Table::LightTree, 0, bytemuck::cast_slice(&t.nodes[..1]));
         heap.write(q, Table::LightTree, 2 * 16, bytemuck::cast_slice(&t.nodes[2..3]));
         heap.write(q, Table::LightTree, t.moving_nodes as u64 * 16, bytemuck::cast_slice(&t.nodes[t.moving_nodes..]));
     }
 
-    /// The dynamic tail's triangles `lo..hi` as the CPU has them now (`sc.dynamic`), to the GPU: their vertices, three
-    /// a triangle from the first vertex that moves (their indices and rows are the build's).
-    fn upload_dynamic(&self, lo: usize, hi: usize) {
-        let (_, _, attrs, corners) = &self.sc.dynamic;
-        let vertices = crate::indexed::apart_vertices(&corners[lo * 3..hi * 3], &attrs[lo..hi]);
-        let at = (self.sc.dynamic_verts.0 as usize + lo * 3) * crate::indexed::VERTEX_BYTES;
-        self.g.queue.write_buffer(&self.sc.up.vertices, at as u64, bytemuck::cast_slice(&vertices));
-    }
-
-    /// Copies the GPU's current vertices of a span of the dynamic tail's triangles (three each, the first of the
-    /// vertices that move) into the previous frame's (submitted before any write queued after it, so it reads what the
-    /// last frame traced).
-    pub(super) fn keep_prev(&self, (lo, hi): (usize, usize)) {
-        let up = &self.sc.up;
-        let first = self.sc.dynamic_verts.0 as usize;
-        let mut e = self.g.device.create_command_encoder(&Default::default());
-        let size = crate::indexed::VERTEX_BYTES;
-        e.copy_buffer_to_buffer(&up.vertices, ((first + lo * 3) * size) as u64, &up.prev_vertices, (lo * 3 * size) as u64, ((hi - lo) * 3 * size) as u64);
-        self.g.queue.submit([e.finish()]);
-    }
-
-    /// Likewise for deforming meshes, each where it lies: (its first vertex in the scene's, its first among the
-    /// previous frame's, how many vertices).
+    /// Copies the GPU's current vertices of deforming meshes to the previous frame's, each where it lies: (its first
+    /// vertex in the scene's, its first among the previous frame's, how many vertices).
     pub(super) fn keep_prev_spans(&self, spans: &[(usize, usize, usize)]) {
         if spans.is_empty() {
             return;
@@ -2623,109 +2527,6 @@ impl LiveCore {
             e.copy_buffer_to_buffer(&up.vertices, (verts * size) as u64, &up.prev_vertices, (prev * size) as u64, (n * size) as u64);
         }
         self.g.queue.submit([e.finish()]);
-    }
-
-    /// Skins / transforms the objects into the CPU copy of the dynamic tail; the touched span (relative to the tail), or
-    /// None when one cannot be updated in place.
-    pub(super) fn reskin(&mut self, world: &World, ids: &std::collections::HashSet<u32>, models: &std::collections::HashMap<u32, scene::DynamicModel>) -> Result<Option<(usize, usize)>> {
-        use rayon::prelude::*;
-        if ids.iter().any(|id| !world.shown(*id)) {
-            return Ok(None);
-        }
-        // Objects whose triangles form one run of the dynamic tail (one traversal group) are skinned / re-transformed in
-        // parallel, one task per object, straight into their own spans of the tail and of the CPU triangles (one core
-        // took 17 ms for the crowd scene's 150 walkers, docs/ROADMAP.md § 0): ordered by span, the objects split the
-        // arrays into disjoint slices. The others (e.g. opaque and cutout materials in different groups) one by one.
-        let run = |d: &scene::DynamicModel| !d.finals.is_empty() && d.finals.iter().enumerate().all(|(j, &f)| f == d.finals[0] + j as u32);
-        let (mut runs, scattered): (Vec<u32>, Vec<u32>) = ids.iter().copied().partition(|id| run(&models[id]));
-        runs.sort_by_key(|id| models[id].finals[0]);
-        let assets = &self.assets;
-        let sc = &mut self.sc;
-        let (first, verts, attrs, blas) = &mut sc.dynamic;
-        let first = *first;
-        let (mut lo, mut hi) = (usize::MAX, 0);
-        // The CPU triangles in build order: each object's slice.
-        let mut by_build = runs.clone();
-        by_build.sort_by_key(|id| models[id].first);
-        let mut tris_of: std::collections::HashMap<u32, &mut [[glam::Vec3A; 3]]> = std::collections::HashMap::with_capacity(runs.len());
-        let (mut tr, mut toff): (&mut [[glam::Vec3A; 3]], usize) = (&mut sc.tris[..], 0);
-        for id in &by_build {
-            let d = &models[id];
-            let (t0, n) = (d.first as usize, d.finals.len());
-            let (_, r) = std::mem::take(&mut tr).split_at_mut(t0 - toff);
-            let (t, r) = r.split_at_mut(n);
-            tr = r;
-            toff = t0 + n;
-            tris_of.insert(*id, t);
-        }
-        let (mut vr, mut ar, mut br): (&mut [[f32; 4]], &mut [scene::GpuTriAttr], &mut [[f32; 3]]) = (&mut verts[..], &mut attrs[..], &mut blas[..]);
-        let mut voff = 0usize;
-        let mut jobs = Vec::with_capacity(runs.len());
-        for id in &runs {
-            let d = &models[id];
-            let (k0, n) = (d.finals[0] as usize - first, d.finals.len());
-            let (_, r) = std::mem::take(&mut vr).split_at_mut(k0 * 3 - voff * 3);
-            let (v, r) = r.split_at_mut(n * 3);
-            vr = r;
-            let (_, r) = std::mem::take(&mut ar).split_at_mut(k0 - voff);
-            let (a, r) = r.split_at_mut(n);
-            ar = r;
-            let (_, r) = std::mem::take(&mut br).split_at_mut(k0 * 3 - voff * 3);
-            let (b, r) = r.split_at_mut(n * 3);
-            br = r;
-            voff = k0 + n;
-            (lo, hi) = (lo.min(k0), hi.max(k0 + n));
-            jobs.push((*id, v, a, b, tris_of.remove(id).unwrap()));
-        }
-        let ok: Vec<Result<bool>> = jobs
-            .into_par_iter()
-            .map(|(id, v, a, b, t)| {
-                let d = &models[&id];
-                let Some(tris) = scene::dynamic_tris(world, id, d, assets)? else { return Ok(false) };
-                if tris.len() != d.finals.len() {
-                    return Ok(false);
-                }
-                for (j, (p, at)) in tris.into_iter().enumerate() {
-                    let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
-                    v[j * 3..j * 3 + 3].copy_from_slice(&[[p[0].x, p[0].y, p[0].z, f32::from_bits(d.flags[j])], [e1.x, e1.y, e1.z, 0.0], [e2.x, e2.y, e2.z, 0.0]]);
-                    // (x.w: an emitter's light-tree code, which stays with its triangle.)
-                    a[j] = scene::GpuTriAttr { x: [at.x[0], f32::from_bits(d.object), at.x[2], a[j].x[3]], ..at };
-                    b[j * 3..j * 3 + 3].copy_from_slice(&scene::blas_tri(p.map(|q| q.to_array())));
-                    t[j] = p.map(glam::Vec3A::from);
-                }
-                Ok(true)
-            })
-            .collect();
-        for r in ok {
-            if !r? {
-                return Ok(None);
-            }
-        }
-        for id in &scattered {
-            let d = &models[id];
-            let Some(tris) = scene::dynamic_tris(world, *id, d, assets)? else { return Ok(None) };
-            if tris.len() != d.finals.len() {
-                return Ok(None);
-            }
-            for (j, (p, a)) in tris.into_iter().enumerate() {
-                let k = d.finals[j] as usize - first;
-                let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
-                verts[k * 3..k * 3 + 3].copy_from_slice(&[[p[0].x, p[0].y, p[0].z, f32::from_bits(d.flags[j])], [e1.x, e1.y, e1.z, 0.0], [e2.x, e2.y, e2.z, 0.0]]);
-                attrs[k] = scene::GpuTriAttr { x: [a.x[0], f32::from_bits(d.object), a.x[2], attrs[k].x[3]], ..a };
-                blas[k * 3..k * 3 + 3].copy_from_slice(&scene::blas_tri(p.map(|v| v.to_array())));
-                sc.tris[(d.first + j as u32) as usize] = p.map(glam::Vec3A::from);
-                (lo, hi) = (lo.min(k), hi.max(k + 1));
-            }
-        }
-        for id in ids {
-            let d = &models[id];
-            // Pivot (material functions' object position). Motion vectors carry its history.
-            let pivot = world.world_matrix(*id).transform_point3(glam::Vec3::ZERO);
-            let st = sc.tables.stride;
-            let o = &mut sc.tables.objects[d.object as usize * st];
-            (o[0], o[1], o[2]) = (pivot.x, pivot.y, pivot.z);
-        }
-        Ok((lo < hi).then_some((lo, hi)))
     }
 
     /// Rebuilds the GPU scene from the world.
@@ -2767,16 +2568,15 @@ impl LiveCore {
                 }
             }
         }
-        let (inst_base, proc_first) = (top.inst_base(), *proc_first);
-        // An object's (slot, record), where an edit can place it again or take it out: an instance of a mesh that is
-        // its own, or that an edit placed (a model the build placed is the build's to change), or procedural geometry.
-        let slot_of = |id: u32, edit: &EditState, tables: &tables::Tables| -> Option<(usize, usize)> {
-            let record = match &tables.retained.proxies.get(&id)?.draw {
-                scene::Draw::Instance(i) if i.mesh.own() || edit.in_room(i.instance as usize) => i.instance as usize,
-                scene::Draw::Procedural(j) => proc_first + *j as usize,
-                _ => return None,
-            };
-            Some((inst_base + record, record))
+        let proc_first = *proc_first;
+        // An object's record, where an edit can place it again or take it out: an instance of a mesh that is its own,
+        // or that an edit placed (a model the build placed is the build's to change), or procedural geometry.
+        let record_of = |id: u32, edit: &EditState, tables: &tables::Tables| -> Option<usize> {
+            match &tables.retained.proxies.get(&id)?.draw {
+                scene::Draw::Instance(i) if i.mesh.own() || edit.in_room(i.instance as usize) => Some(i.instance as usize),
+                scene::Draw::Procedural(j) => Some(proc_first + *j as usize),
+                _ => None,
+            }
         };
         let q = &g.queue;
         // An instance's emitters go (area 0: their weight; the light tree keeps its shape) when its object is removed,
@@ -2795,7 +2595,7 @@ impl LiveCore {
             if let Some((place, mesh)) = tables.retained.instanced(*id).and_then(|p| Some((*p, p.mesh?))) {
                 let (r0, cap) = (place.first as usize, place.capacity as usize);
                 for r in r0..r0 + cap {
-                    top.clear(inst_base + r);
+                    top.clear(r);
                     // (A copy's emitters go as an instance's do.)
                     let run = emitter_run(&tables.emitter_tris, instances, r as u32);
                     emitters_changed |= !run.is_empty();
@@ -2818,7 +2618,7 @@ impl LiveCore {
             if let Some(r) = tables.retained.rigid(*id) {
                 for rec in r.records() {
                     let rec = rec as usize;
-                    top.clear(inst_base + rec);
+                    top.clear(rec);
                     let run = emitter_run(&tables.emitter_tris, instances, rec as u32);
                     emitters_changed |= !run.is_empty();
                     tables.emitter_tris[run].iter_mut().for_each(|e| e.area = 0.0);
@@ -2843,11 +2643,10 @@ impl LiveCore {
             // model, an instance of its own mesh, where its mesh is one the rays reach by its instance. Its mesh's
             // triangles and its skinning job stay until the next rebuild, as the build's do.)
             let its_own = |i: &scene::InstanceRef| whole(i, instances, meshes) || (matches!(i.mesh, scene::MeshKind::Skinned(_)) && instances.get(i.instance as usize).is_some_and(|x| top.has_mesh(x.mesh)));
-            let at = slot_of(*id, edit, tables).or_else(|| tables.retained.instance(*id).filter(|i| its_own(i)).map(|i| (inst_base + i.instance as usize, i.instance as usize)));
-            // Drawn, and not at a record an edit can clear (a model of two instances, anything the build flattened): a
-            // rebuild takes it out.
+            let at = record_of(*id, edit, tables).or_else(|| tables.retained.instance(*id).filter(|i| its_own(i)).map(|i| i.instance as usize));
+            // Drawn, and not at a record an edit can clear (a model of two instances): a rebuild takes it out.
             if at.is_none() && tables.retained.proxies.contains_key(id) {
-                return Err("an object the build placed otherwise (a model in parts, something it flattened) removed".into());
+                return Err("an object the build placed otherwise (a model in parts) removed".into());
             }
             // (A skinned model an edit placed: with its mesh's triangles go the room of its previous vertices and its
             // slot among the skinned, which the next one placed takes. The build's stay until the next rebuild.)
@@ -2865,8 +2664,8 @@ impl LiveCore {
                 edit.free_skinned.push(g as u32);
             }
             let proxy = tables.retained.proxies.remove(id);
-            if let Some((slot, record)) = at {
-                top.clear(slot);
+            if let Some(record) = at {
+                top.clear(record);
                 if let Some(k) = undraw(proxy.as_ref().map(|p| &p.draw), instances, procs) {
                     drop_mesh_user(k, edit, tables, meshes);
                 }
@@ -2894,13 +2693,13 @@ impl LiveCore {
         let mask = |shadow: bool| if shadow { 1 } else { 2 };
         for id in todo {
             let Some(o) = world.objects.get(&id) else { continue };
-            let at = slot_of(id, edit, tables);
+            let at = record_of(id, edit, tables);
             emitters_changed |= release(id, tables, instances);
             // (A mesh that is hidden is placed all the same, as an instance no ray sees: below.)
             let is_mesh = matches!(o.kind, Kind::Mesh { .. });
             if !world.shown(id) && !is_mesh {
-                if let Some((slot, _)) = at {
-                    top.clear(slot);
+                if let Some(r) = at {
+                    top.clear(r);
                 }
                 if tables.retained.instanced(id).is_some_and(|p| edit.in_room(p.first as usize)) {
                     return Err("an instanced mesh added in place hidden".into());
@@ -2911,10 +2710,10 @@ impl LiveCore {
                 continue;
             }
             // The mesh it draws now, as an instance at its record: a user fewer once it is placed again (below).
-            let was = at.and_then(|(_, r)| instances.get(r)).filter(|i| !i.hidden || i.masked).map(|i| i.mesh);
-            // Drawn but not by a TLAS instance of its own: the build flattened it (movable, or a material instances skip).
+            let was = at.and_then(|r| instances.get(r)).filter(|i| !i.hidden || i.masked).map(|i| i.mesh);
+            // Drawn but not by an instance an edit can place again (a model the build placed).
             if at.is_none() && tables.retained.proxies.contains_key(&id) {
-                return Err("an object the build flattened".into());
+                return Err("an object the build placed otherwise".into());
             }
             let m = world.world_matrix(id);
             // A mesh that is hidden, or placed without size, is an instance no ray sees, at a point if it has no size
@@ -2944,8 +2743,8 @@ impl LiveCore {
                         return Err("the scene's first procedural object (kernel feature)".into());
                     }
                     let Some(p) = scene::proc_object(world, id, m, object as u32, &tables.retained.materials, assets).map_err(|e| format!("{e:#}"))? else {
-                        if let Some((slot, _)) = at {
-                            top.clear(slot);
+                        if let Some(r) = at {
+                            top.clear(r);
                         }
                         undraw(tables.retained.proxies.get(&id).map(|p| &p.draw), instances, procs);
                         continue;
@@ -2987,7 +2786,7 @@ impl LiveCore {
                     let blas = g.proc_blas(&p.blob, &mut pending_procs);
                     let entry = p.object_entry(o);
                     let gpu = p.gpu(header as u32);
-                    (at.map(|(_, r)| r), Placed::Proc(blas, p, gpu), entry)
+                    (at, Placed::Proc(blas, p, gpu), entry)
                 }
                 Kind::Model { uri, nodes, animation, functions } => {
                     // A model already in the scene: another instance of its mesh, of each of its parts' meshes if it is
@@ -3101,7 +2900,7 @@ impl LiveCore {
                         };
                         sections[sect_first as usize..][..ns].copy_from_slice(&sects);
                         // (Other poses reach further: its bounds wider, as the build's.)
-                        let own = scene::own_inst_mesh(&t, (first - edit.pool_first) as u32);
+                        let own = scene::own_inst_mesh(&t, first as u32);
                         let pad = if a.nodes.is_empty() { (own.hi - own.lo) * 0.25 } else { glam::Vec3A::splat((own.hi - own.lo).length()) };
                         let im = scene::InstMesh { lo: own.lo - pad, hi: own.hi + pad, deforms: true, sect_first, sect_count: ns as u32, vfirst: vfirst as u32, vcount: nv as u32, ..own };
                         let mesh = match &mut top {
@@ -3130,11 +2929,10 @@ impl LiveCore {
                         }
                         // (It has not moved yet: its previous vertices are its own.)
                         q.write_buffer(&up.prev_vertices, (prev * crate::indexed::VERTEX_BYTES) as u64, bytemuck::cast_slice(&vertices));
-                        let rel = first - edit.pool_first;
-                        if pool_tris.len() < rel + n {
-                            pool_tris.resize(rel + n, [glam::Vec3A::ZERO; 3]);
+                        if pool_tris.len() < first + n {
+                            pool_tris.resize(first + n, [glam::Vec3A::ZERO; 3]);
                         }
-                        pool_tris[rel..rel + n].copy_from_slice(&t);
+                        pool_tris[first..first + n].copy_from_slice(&t);
                         // Its slot among the skinned (one an edit took out again, else a new one), and the pass's job.
                         let slot = edit.free_skinned.pop().unwrap_or(tables.retained.skinned.len() as u32);
                         let sk = scene::Skinned { mesh, uri: uri.clone(), nodes: nodes.clone(), animation: a.clone(), order, object: id, instance: 0, source, palette_len, mirrors };
@@ -3156,7 +2954,7 @@ impl LiveCore {
                         let mut placed = vec![];
                         for &(node, mesh) in &parts {
                             if !top.has_mesh(mesh) {
-                                return Err("a model whose mesh is no unit (software traversal flattens it)".into());
+                                return Err("a model whose mesh is no unit (software traversal has no tree for it)".into());
                             }
                             let mine = tables.retained.mesh_rows.get(&mesh).ok_or("a model's mesh without its rows")?.clone();
                             if glass_caster(&mine) {
@@ -3235,7 +3033,7 @@ impl LiveCore {
                         };
                         let im = meshes[mesh as usize];
                         if !top.has_mesh(mesh) {
-                            return Err("a model whose mesh is no unit (it deforms; software traversal flattens it)".into());
+                            return Err("a model whose mesh is no unit (software traversal has no tree for it)".into());
                         }
                         // (Its rows, the mesh's own, are placed with its record below.)
                         let mine = tables.retained.mesh_rows.get(&mesh).ok_or("a model's mesh without its rows")?.clone();
@@ -3249,7 +3047,7 @@ impl LiveCore {
                         let inst = scene::Instance { mesh, world: m, object: object as u32, cast_shadow: scene::rows_cast(&mine, o.cast_shadow), name: o.name.clone(), sub: None, hidden: false, masked: false, first_emitter: 0, rows: 0, bits: scene::rows_bits(&mine), prev: 0, verts: 0 };
                         let (lo, hi) = im.placed_bounds(m);
                         let entry = scene::object_row(m.transform_point3(glam::Vec3::ZERO), o.power, hi - lo, o.custom, [1.0; 3]);
-                        (at.map(|(_, r)| r), Placed::Mesh(inst, mine), entry)
+                        (at, Placed::Mesh(inst, mine), entry)
                     }
                 }
                 Kind::Mesh { .. } | Kind::Instanced { procedural: false, .. } => {
@@ -3304,8 +3102,8 @@ impl LiveCore {
                             let had = tables.retained.own_mesh.get(&key).is_some_and(|&k| meshes[k as usize].colored);
                             let data = scene::section_mesh(geo, grouped, 0, 0, colored || had);
                             if data.tris.is_empty() {
-                                if let Some((slot, _)) = at {
-                                    top.clear(slot);
+                                if let Some(r) = at {
+                                    top.clear(r);
                                 }
                                 // (No longer drawn: its mesh a user fewer now, as when it is hidden.)
                                 if let Some(k) = undraw(tables.retained.proxies.get(&id).map(|p| &p.draw), instances, procs) {
@@ -3331,8 +3129,8 @@ impl LiveCore {
                         drop_mesh_user(k, edit, tables, meshes);
                     }
                     if let Some(cap) = capacity {
-                        // An instanced mesh added in place: `cap` records (their TLAS instances `inst_base` + them) and
-                        // object entries, contiguous, as the build places one (`update_instanced` then rewrites them).
+                        // An instanced mesh added in place: `cap` records and object entries, contiguous, as the build
+                        // places one (`update_instanced` then rewrites them).
                         let empty = crate::world::InstanceTable::default();
                         let t = world.instanced.get(&id).unwrap_or(&empty);
                         if t.colors.is_some() && features & gpu::F_TINT == 0 {
@@ -3375,7 +3173,7 @@ impl LiveCore {
                         for (i, &(wm, hidden)) in placed.iter().enumerate() {
                             let row_at = run + i;
                             let mut row = scene::row_of(mat, &tables.materials);
-                            row[1] = edit.pool_first as u32 + im.first;
+                            row[1] = im.first;
                             let mut inst = scene::Instance { mesh, world: wm, object: (o0 + i) as u32, cast_shadow: scene::rows_cast(&[row], o.cast_shadow), name: o.name.clone(), sub: Some(i as u32), hidden, masked: false, first_emitter: 0, rows: row_at as u32, bits: scene::rows_bits(&[row]), prev: 0, verts: im.vfirst };
                             // A copy whose material emits: its emitters, a run at the light list's end; moving ones
                             // (`update_instanced` changes the copies in place), a hidden copy's at no weight.
@@ -3383,7 +3181,7 @@ impl LiveCore {
                                 let first = tables.emitter_tris.len();
                                 (inst.first_emitter, row[2]) = (first as u32, first as u32);
                                 let (a, b) = (im.first as usize, (im.first + im.count) as usize);
-                                let made = crate::instance_emitters(&inst, (r0 + i) as u32, &pool_tris[a..b], (edit.pool_first + a) as u32, &|k| Some((k, mat, 0)), im.count as usize, &tables.materials, true, None);
+                                let made = crate::instance_emitters(&inst, (r0 + i) as u32, &pool_tris[a..b], a as u32, &|k| Some((k, mat, 0)), im.count as usize, &tables.materials, true, None);
                                 for (j, (e, w)) in made.into_iter().enumerate() {
                                     new_emitters.push(((first + j) as u32, crate::GpuEmitterTri::of(&e, w, 0)));
                                     tables.emitter_tris.push(e);
@@ -3396,10 +3194,10 @@ impl LiveCore {
                                 rows.resize(row_at + 1, [0; 4]);
                             }
                             rows[row_at] = row;
-                            let rec = top.record(inst.gpu((edit.pool_first as u32) + im.first), mesh, inst.cast_shadow);
+                            let rec = top.record(inst.gpu(im.first), mesh, inst.cast_shadow);
                             w_records.put(((r0 + i) * size) as u64, bytemuck::bytes_of(&rec));
                             gpu_instances[r0 + i] = rec;
-                            top.place(inst_base + r0 + i, mesh, wm, gpu::INSTANCE_BIT | (r0 + i) as u32, inst.cast_shadow, hidden);
+                            top.place(r0 + i, mesh, wm, inst.cast_shadow, hidden);
                             let (lo, hi) = im.placed_bounds(wm);
                             let entry = scene::copy_row(scene::object_row(wm.transform_point3(glam::Vec3::ZERO), o.power, hi - lo, t.custom(i, o.custom), t.color(i)), emits && hidden);
                             w_objects.put(((o0 + i) * st * 16) as u64, bytemuck::cast_slice(&entry[..st]));
@@ -3419,7 +3217,7 @@ impl LiveCore {
                     let inst = scene::Instance { mesh, world: m, object: object as u32, cast_shadow: scene::rows_cast(&mine, o.cast_shadow), name: o.name.clone(), sub: None, hidden: unseen, masked: unseen, first_emitter: 0, rows: 0, bits: scene::rows_bits(&mine), prev: 0, verts: 0 };
                     let (lo, hi) = im.placed_bounds(m);
                     let entry = scene::object_row(m.transform_point3(glam::Vec3::ZERO), if unseen { 0.0 } else { o.power }, hi - lo, o.custom, [1.0; 3]);
-                    (at.map(|(_, r)| r), Placed::Mesh(inst, mine), entry)
+                    (at, Placed::Mesh(inst, mine), entry)
                 }
                 _ => return Err("not an object an edit places".into()),
             };
@@ -3429,8 +3227,8 @@ impl LiveCore {
                 Placed::Parts(parts) => parts.len(),
                 _ => 1,
             };
-            let (slot, record) = match (at, record) {
-                (Some((slot, _)), Some(r)) => (slot, r),
+            let record = match (at, record) {
+                (Some(_), Some(r)) => r,
                 _ => {
                     let r = match edit.records.take(n) {
                         Some(r) => r,
@@ -3441,7 +3239,7 @@ impl LiveCore {
                         }
                         None => return Err(if matches!(top, gpu::Top::Sw(_)) { "edit room: records (software traversal's does not grow)" } else { "edit room: records (particles, or the device's limits)" }.into()),
                     };
-                    (inst_base + r, r)
+                    r
                 }
             };
             // Above the triangles, and the record's value where the build's are: `instances[record]`, or `procs` at the
@@ -3449,7 +3247,7 @@ impl LiveCore {
             // (A mesh a body drives moves as an instance does, as the build's: `commit`.)
             let moves = o.driven || world.movable(id);
             let mut place = |record: usize, inst: &mut scene::Instance, mine: &mut [scene::Row], moves: bool| {
-                let mut cx = Placing { edit: &mut *edit, grow: &grow, words: &mut up.words, tables: &mut *tables, instances: &mut *instances, gpu_instances: &mut *gpu_instances, meshes: &meshes[..], sections: &sections[..], rows: &mut *rows, pool_tris: &pool_tris[..], pool_place: &pool_place[..], w_rows: &mut w_rows, w_records: &mut w_records, new_emitters: &mut new_emitters, emitters_changed: &mut emitters_changed, top: &mut top, inst_base };
+                let mut cx = Placing { edit: &mut *edit, grow: &grow, words: &mut up.words, tables: &mut *tables, instances: &mut *instances, gpu_instances: &mut *gpu_instances, meshes: &meshes[..], sections: &sections[..], rows: &mut *rows, pool_tris: &pool_tris[..], pool_place: &pool_place[..], w_rows: &mut w_rows, w_records: &mut w_records, new_emitters: &mut new_emitters, emitters_changed: &mut emitters_changed, top: &mut top };
                 place_instance(&mut cx, record, inst, mine, moves)
             };
             let draw = match blas {
@@ -3459,7 +3257,7 @@ impl LiveCore {
                         gpu_instances.resize(record + 1, scene::GpuInstance::default());
                     }
                     gpu_instances[record] = gpu;
-                    top.place_blas(slot, &blas, m, record as u32, mask(o.cast_shadow));
+                    top.place_blas(record, &blas, m, mask(o.cast_shadow));
                     let j = record - proc_first;
                     if procs.len() <= j {
                         procs.resize(j + 1, scene::ProcObject { name: String::new(), materials: vec![], hidden: true, ..p.clone() });

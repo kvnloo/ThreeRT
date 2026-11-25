@@ -2920,6 +2920,20 @@ Mutations: 26. 25 failed a test there was; one, a texture put on a shelf too low
 Found by review: a translucent particle's material given another function kept the kernel's old dispatch for the
 translucency pass, which has its particles' functions alone; the kernel is made again where those are others.
 
+**Nothing reads a world-space triangle (2026-11-25, after it).** Nothing made one any more; what read them is
+deleted. Hardware traversal: the traversal groups and their BLASes, with the feature for a group past 2^24
+triangles and the bit that told a model's TLAS instance from a group's (an instance's custom data is its record).
+Software traversal: the tree over the scene's own triangles and its walk (the kernel's `trace` is the units' walk,
+then the procedural objects'; the node buffer starts with the mesh trees). The kernel: a row a triangle, and what
+a hit without an instance read (the test of a hit's instance stays where its record is read: every hit passes it,
+and without it a frame is 1 to 3 % longer in some scenes, a crowd under the sky 6.36 -> 6.57 ms). The CPU:
+`Scene::tris` and what went with it, posed models as triangles the CPU moved, their emitters, picking over them.
+A deletion: the pictures are the same, with one exception that is not this step's doing. A TLAS's empty slots are
+instances without extent at the world's origin (the patched wgpu's, since 2026-11-23), and on Metal a ray that
+starts there loses its hit, as do a few that pass it: the groups' eight slots were empty in every scene, and with
+them gone a scene whose TLAS has no empty slot renders such rays right (eleven render tests under hardware
+traversal, failing since then, pass). A TLAS with an empty slot (an edit room, an instance removed) still has it.
+
 **Software traversal has units alone (2026-11-25, after it).** An offline render under software traversal
 flattened every instance into world-space triangles (kept so on 2026-11-11, for its bytes to stay main's while
 units were new), and so did a scene with a mesh no tree could be made of or with more instances than a top tree

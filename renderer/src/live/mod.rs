@@ -356,11 +356,6 @@ pub struct LiveCore {
     kernel_bg: wgpu::BindGroup,
     /// The same for the translucency pass (`gpu::Gpu::tl_live_layout`; hardware traversal).
     tl_kernel_bg: Option<wgpu::BindGroup>,
-    /// Span (relative to the dynamic tail) re-transformed by the last in-place update whose previous-frame vertices
-    /// (`Uploaded::prev_verts`) still hold the frame before it: synced to the current ones next frame.
-    prev_span: Option<(usize, usize)>,
-    /// An in-place update happened this frame (it keeps `prev_verts` itself).
-    reposed: bool,
     /// Dynamic triangles moved in this commit: the light tree's moving subtree is refit once at its end.
     emitters_moved: bool,
     /// An instanced object's emitting copies changed size or were shown or hidden in this commit: the emitters are
@@ -582,7 +577,7 @@ impl LiveCore {
         let mut core = LiveCore {
             kernel: None,
             more_features: Default::default(),
-            reconstructor, quality: Quality::Native, frame_generation: FrameGeneration::Off, latency: Latency::Auto, rendering_control: None, pending_emitters: vec![], flipped: vec![], top_builds: 0, particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, view, env, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: Default::default(), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, build_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false, emitters_reweigh: false,  pose_spans: vec![], pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
+            reconstructor, quality: Quality::Native, frame_generation: FrameGeneration::Off, latency: Latency::Auto, rendering_control: None, pending_emitters: vec![], flipped: vec![], top_builds: 0, particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, view, env, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: Default::default(), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, build_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, cache, kernel_bg, tl_kernel_bg, emitters_moved: false, emitters_reweigh: false,  pose_spans: vec![], pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
         core.spark_lights = core.sc.tables.emitter_tris.iter().any(|e| e.nominal);
         core.apply_post();
         Ok(core)
@@ -669,7 +664,7 @@ impl LiveCore {
         }
         let Some(a) = up.accel.as_ref() else { return serde_json::Value::Null };
         let buffers = [&up.vertices, &up.prev_vertices, &up.heap.buffer, &up.words.buffer].iter().map(|b| b.size()).sum::<u64>();
-        let live: u64 = self.sc.meshes.iter().enumerate().filter(|(k, _)| e.users.get(&(*k as u32)).copied().unwrap_or(0) > 0).map(|(_, m)| m.count as u64).sum::<u64>() + e.pool_first as u64;
+        let live: u64 = self.sc.meshes.iter().enumerate().filter(|(k, _)| e.users.get(&(*k as u32)).copied().unwrap_or(0) > 0).map(|(_, m)| m.count as u64).sum::<u64>();
         let mb = |b: f64| (b / (1 << 20) as f64 * 10.0).round() / 10.0;
         serde_json::json!({
             "tris": [e.tris.used(), e.tris.cap], "records": [e.records.used(), e.records.cap], "objects": [e.objects.used(), e.objects.cap],
@@ -702,7 +697,6 @@ impl LiveCore {
         self.kernel = None;
         self.spark_lights = self.sc.tables.emitter_tris.iter().any(|e| e.nominal);
         self.inst_moving.clear();
-        self.prev_span = None;
         self.pose_spans.clear();
         self.emitters_moved = false;
         self.emitters_reweigh = false;
@@ -1075,9 +1069,7 @@ impl LiveCore {
             }
             best
         };
-        let (mut t, i) = closest(&self.sc.tris, o, d);
-        let mut node = self.sc.tri_nodes.iter().find(|(_, a, b)| (*a as usize..*b as usize).contains(&i)).map(|n| n.0.as_str());
-        let mut sub = self.sc.tri_instances.iter().find(|(a, b, _)| (*a as usize..*b as usize).contains(&i)).map(|r| r.2);
+        let (mut t, mut node, mut sub) = (f32::INFINITY, None, None);
         let mut posed = Default::default();
         for inst in self.sc.instances.iter().filter(|i| !i.hidden) {
             let m = self.sc.meshes[inst.mesh as usize];
@@ -1121,8 +1113,7 @@ impl LiveCore {
 
     /// World-space triangles of a node (empty for lights without geometry, cameras, hidden nodes).
     pub fn node_tris(&self, id: &str) -> Vec<[glam::Vec3A; 3]> {
-        // World-space triangles (what the build flattened of an instance's mesh among them), then its instanced mesh.
-        let mut out: Vec<[glam::Vec3A; 3]> = scene::node_ranges(&self.sc.tri_nodes, id).flat_map(|r| self.sc.tris[r].iter().copied()).collect();
+        let mut out = vec![];
         // A model's first instance; every drawn instance of an instanced object.
         let mut of_node = self.sc.instances.iter().filter(|i| i.name == id && !i.hidden);
         let first = of_node.next();
@@ -1396,7 +1387,7 @@ mod instanced_tests {
             let mut sc = crate::scene::build(&w, Path::new("."), &presets, None).unwrap();
             (sc.width, sc.height) = (64, 36);
             let prep = crate::prepare(g, &mut sc, &mut vec![]);
-            let frame = g.render(&sc, prep.groups, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 16, &mut vec![]).unwrap();
+            let frame = g.render(&sc, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 16, &mut vec![]).unwrap();
             frame.color.iter().flatten().map(|v| v.to_bits()).collect::<Vec<u32>>()
         };
         let (a, b) = (offline(&views), offline(&whole));

@@ -120,7 +120,7 @@ fn forget(core: &mut LiveCore) {
 /// Whether the rays see the instance at `record`: by its mask above the triangles, or its unit.
 fn seen_by_rays(c: &LiveCore, record: u32) -> bool {
     match (&c.sc.up.accel, &c.sc.up.units) {
-        (Some(a), _) => a.tlas[a.inst_base + record as usize].as_ref().is_some_and(|t| t.mask != 0),
+        (Some(a), _) => a.tlas[record as usize].as_ref().is_some_and(|t| t.mask != 0),
         (None, Some(u)) => u.slots.get(record as usize).copied().flatten().is_some_and(|x| !x.hidden),
         _ => false,
     }
@@ -355,7 +355,7 @@ fn a_ray_that_meets_an_emitter_weighs_it_by_that_triangles_entry() {
         (sc.width, sc.height) = (96, 54);
         // (Under software traversal with units, as a live view has the scene.)
         let prep = crate::prepare_as(g.hwrt, &mut sc, &mut vec![]);
-        let frame = g.render(&sc, prep.groups, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 64, &mut vec![]).unwrap();
+        let frame = g.render(&sc, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 64, &mut vec![]).unwrap();
         BESIDE_EMITTERS.map(|[x0, y0, x1, y1]| (y0..y1).flat_map(|y| (x0..x1).map(move |x| y * 96 + x)).map(|k| frame.color[k].iter().sum::<f32>() as f64).sum::<f64>() / (3 * (x1 - x0) * (y1 - y0)) as f64)
     };
     let (one, each) = (lit(false), lit(true));
@@ -589,7 +589,6 @@ fn a_moved_card_beside_another_is_placed_where_its_light_is() {
             .collect()
     };
     let placed = |m: glam::Mat4, to: Vec3| m.abs_diff_eq(scene::card_world(glam::Mat4::from_rotation_translation(turn, to), 0.4, 0.3), 1e-6);
-    assert!(live.sc.dynamic.1.is_empty() && live.sc.tris.is_empty(), "a card is no world-space triangle");
     let first = cards(&live);
     assert!((0..3).all(|k| placed(first[k].0, at[k])), "as loaded: each card where its light is");
     assert!(first.iter().all(|c| c.1.m == c.1.p), "as loaded: nothing has moved");
@@ -759,17 +758,15 @@ fn a_skinned_primitive_without_normals_is_shaded_by_its_triangles() {
     let built = |w: &World| {
         let mut sc = scene::build(w, Path::new(".."), &crate::default_presets_dir(), None).unwrap();
         (sc.width, sc.height) = (96, 54);
-        // (Under software traversal with units, as a live view has the scene: without them the model is flattened
-        // into world-space triangles with the CPU's normals.)
         let prep = crate::prepare_as(g.hwrt, &mut sc, &mut vec![]);
         (sc, prep)
     };
     // The mesh's triangles whose three vertices have no normal, as the instance places them: the largest.
     let (centre, normal, edge) = {
-        let (sc, prep) = built(&w);
+        let (sc, _) = built(&w);
         let m = sc.meshes.iter().position(|m| m.deforms).expect("a deforming mesh");
         let (im, world, x) = (sc.meshes[m], sc.instances.iter().find(|i| i.mesh as usize == m).unwrap().world, &sc.indexed);
-        let first = prep.groups.iter().sum::<usize>() + im.first as usize;
+        let first = im.first as usize;
         let bare = x.indices[first..first + im.count as usize].iter().filter(|t| t.iter().all(|&v| x.vertices[(im.vfirst + v) as usize][1][..3] == [0.0; 3]));
         let placed = bare.map(|t| t.map(|v| world.transform_point3(Vec3::from_slice(&x.vertices[(im.vfirst + v) as usize][0][..3]))));
         let p = placed.max_by(|a, b| (a[1] - a[0]).cross(a[2] - a[0]).length().total_cmp(&(b[1] - b[0]).cross(b[2] - b[0]).length())).expect("triangles without normals");
@@ -777,7 +774,7 @@ fn a_skinned_primitive_without_normals_is_shaded_by_its_triangles() {
     };
     w.set_transform(4, centre + normal * edge, glam::Quat::from_rotation_arc(Vec3::NEG_Z, -normal), Vec3::ONE).unwrap();
     let (sc, prep) = built(&w);
-    let frame = g.render(&sc, prep.groups, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 1, &mut vec![]).unwrap();
+    let frame = g.render(&sc, bytemuck::cast_slice(&prep.nodes), &prep.emitters, &prep.gpu_emitter_tris, &prep.emitter_runs, crate::ltree::nodes_of(prep.light_tree.as_ref()), &prep.env, &prep.env_cdf, &prep.energy, prep.params, 1, &mut vec![]).unwrap();
     let seen = Vec3::from(frame.normal[27 * 96 + 48]);
     assert!(seen.dot(normal).abs() > 0.999 && (seen.length() - 1.0).abs() < 1e-3, "the picture's middle has the normal {seen}; the triangle's is {normal}");
 }
@@ -1006,8 +1003,7 @@ fn moves_in_place_leave_what_a_build_does() {
     }
 }
 
-/// An instanced object whose copies emit is gone from the picture once it is removed (its copies were flattened once,
-/// and nothing took them out).
+/// An instanced object whose copies emit is gone from the picture once it is removed.
 #[test]
 fn an_emitting_instanced_object_removed_is_gone() {
     let presets = crate::default_presets_dir();
@@ -1072,10 +1068,9 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
     let (tables, up) = (&c.sc.tables, &c.sc.up);
     let size = std::mem::size_of::<crate::GpuEmitterTri>();
     let list = read(&up.heap.buffer, up.heap.at(Table::EmitterTris), (tables.emitter_tris.len() * size) as u64);
-    // (The triangles as the kernel reads them: three indices each; the vertices; the rows of those that have one.)
+    // (The triangles as the kernel reads them: three indices each; the vertices.)
     let vertices: Vec<crate::indexed::Vertex> = read_back(c, &up.vertices, 0, up.vertices.size());
     let index: Vec<u32> = read_back(c, &up.words.buffer, up.words.at(Stream::Indices), up.words.cap(Stream::Indices));
-    let tri_rows: Vec<[u32; 4]> = read_back(c, &up.words.buffer, up.words.at(Stream::Triangles), up.words.cap(Stream::Triangles) / 16 * 16);
     // (Software traversal: the trees' leaves, whose ids say a mesh's triangle's section and its index there.)
     let leaves: Vec<crate::indexed::Leaf> = if c.g.hwrt { vec![] } else { read_back(c, &up.bg_parts.leaves, 0, up.bg_parts.leaves.size() / crate::indexed::LEAF_BYTES as u64 * crate::indexed::LEAF_BYTES as u64) };
     let codes = crate::emitter_codes(&tables.emitter_tris, &crate::emitter_order(&tables.emitter_tris, tables.light_tree.as_ref()), tables.light_tree.as_ref());
@@ -1096,40 +1091,33 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
         if e.area <= 0.0 {
             continue;
         }
-        // (A mesh's indices count from its instance's first vertex; a world-space triangle's from the first of all.)
-        let base = if e.inst == crate::NO_INST { 0 } else { c.sc.instances[e.inst as usize].verts };
+        // (A mesh's indices count from its instance's first vertex.)
+        let base = c.sc.instances[e.inst as usize].verts;
         let p: [glam::Vec3A; 3] = std::array::from_fn(|k| glam::Vec3A::from_slice(&vertices[(base + index[e.tri as usize * 3 + k]) as usize][0][..3]));
-        if e.inst == crate::NO_INST {
-            // (A triangle no instance places has a row: its material, its object, its flags, its emitter + 1. The
-            // list's record names the row: the triangle's own.)
-            assert_eq!(r, crate::GpuEmitterTri::of(e, p, code & !crate::EMITTER_MOVES), "{what}: emitter {i} of the list against its triangle {}", e.tri);
-            assert_eq!((r.part, tri_rows[e.tri as usize][3]), (e.tri, i as u32 + 1), "{what}: emitter {i}'s record names its triangle's row, and the row the emitter");
-        } else {
-            // (The record as the GPU has it.)
-            let (inst, record) = (&c.sc.instances[e.inst as usize], bytemuck::pod_read_unaligned::<scene::GpuInstance>(&records[e.inst as usize * record_size..][..record_size]));
-            let placed = [inst.world.transform_point3(p[0].into()), inst.world.transform_vector3((p[1] - p[0]).into()), inst.world.transform_vector3((p[2] - p[0]).into())];
-            assert_eq!(record.info[2], inst.verts, "{what}: instance {}'s record has its mesh's first vertex", e.inst);
-            assert_eq!((r.tri, r.inst, r.code, r.part), (e.tri, e.inst, code, e.part), "{what}: emitter {i}'s words (its triangle, its instance, its code, its section)");
-            for (got, want) in [r.v0, r.e1, r.e2].into_iter().zip(placed) {
-                assert!((glam::Vec3::from(got) - want).length() <= 1e-4 * (1.0 + want.length()), "{what}: emitter {i}'s triangle {got:?}, its instance places it at {want:?}");
-            }
-            // Its section's row as the GPU has it says the material and where the section's emitters start, the
-            // triangle its index among them: its place after the section's first triangle (hardware traversal), or
-            // what its tree's leaf says (software traversal: a tree has a mesh's triangles in its own order).
-            let at = (record.info[3] + e.part) as usize;
-            let row: scene::Row = bytemuck::pod_read_unaligned(&gpu_rows[at * 16..][..16]);
-            assert_eq!(row, c.sc.rows[at], "{what}: row {at} on the GPU is the scene's");
-            assert_eq!(record.info[3], inst.rows, "{what}: instance {}'s record has its rows", e.inst);
-            assert!(inst.first_emitter <= i as u32, "{what}: emitter {i} is of instance {}'s run, from {}", e.inst, inst.first_emitter);
-            let rank = if c.g.hwrt {
-                e.tri.wrapping_sub(row[1])
-            } else {
-                let l = &leaves[e.tri as usize];
-                assert_eq!(l[0][3].to_bits(), e.part, "{what}: triangle {}'s leaf has its section", e.tri);
-                l[1][3].to_bits()
-            };
-            assert_eq!((row[2].wrapping_add(rank), scene::row_material(&row)), (i as u32, e.mat), "{what}: triangle {} of instance {} finds its emitter, of its row's material", e.tri, e.inst);
+        // (The record as the GPU has it.)
+        let (inst, record) = (&c.sc.instances[e.inst as usize], bytemuck::pod_read_unaligned::<scene::GpuInstance>(&records[e.inst as usize * record_size..][..record_size]));
+        let placed = [inst.world.transform_point3(p[0].into()), inst.world.transform_vector3((p[1] - p[0]).into()), inst.world.transform_vector3((p[2] - p[0]).into())];
+        assert_eq!(record.info[2], inst.verts, "{what}: instance {}'s record has its mesh's first vertex", e.inst);
+        assert_eq!((r.tri, r.inst, r.code, r.part), (e.tri, e.inst, code, e.part), "{what}: emitter {i}'s words (its triangle, its instance, its code, its section)");
+        for (got, want) in [r.v0, r.e1, r.e2].into_iter().zip(placed) {
+            assert!((glam::Vec3::from(got) - want).length() <= 1e-4 * (1.0 + want.length()), "{what}: emitter {i}'s triangle {got:?}, its instance places it at {want:?}");
         }
+        // Its section's row as the GPU has it says the material and where the section's emitters start, the
+        // triangle its index among them: its place after the section's first triangle (hardware traversal), or
+        // what its tree's leaf says (software traversal: a tree has a mesh's triangles in its own order).
+        let at = (record.info[3] + e.part) as usize;
+        let row: scene::Row = bytemuck::pod_read_unaligned(&gpu_rows[at * 16..][..16]);
+        assert_eq!(row, c.sc.rows[at], "{what}: row {at} on the GPU is the scene's");
+        assert_eq!(record.info[3], inst.rows, "{what}: instance {}'s record has its rows", e.inst);
+        assert!(inst.first_emitter <= i as u32, "{what}: emitter {i} is of instance {}'s run, from {}", e.inst, inst.first_emitter);
+        let rank = if c.g.hwrt {
+            e.tri.wrapping_sub(row[1])
+        } else {
+            let l = &leaves[e.tri as usize];
+            assert_eq!(l[0][3].to_bits(), e.part, "{what}: triangle {}'s leaf has its section", e.tri);
+            l[1][3].to_bits()
+        };
+        assert_eq!((row[2].wrapping_add(rank), scene::row_material(&row)), (i as u32, e.mat), "{what}: triangle {} of instance {} finds its emitter, of its row's material", e.tri, e.inst);
         alive += 1;
     }
     assert!(alive > 0, "{what}: the list has emitters");
@@ -1491,7 +1479,6 @@ fn the_light_list_holds_its_triangles() {
         w.take_changes();
         assert_eq!(live.sc.tables.light_tree.as_ref().is_some_and(|t| t.moving_count > 0), tree, "the mover is in the tree's moving subtree");
         assert!(live.sc.tables.emitter_tris.iter().any(|e| e.inst != crate::NO_INST && e.moves), "the mover's emitters are its instance's");
-        assert!(live.sc.up.fills.moved.is_none(), "no triangle is left for the CPU to move");
         list_is_its_triangles("a moving emitter, as loaded", &live);
         w.set_transform(13, Vec3::new(0.1, -0.3, 0.9), glam::Quat::from_rotation_z(0.5), Vec3::ONE).unwrap();
         let rebuilt = live.commit(&mut w).unwrap();
@@ -2639,10 +2626,9 @@ fn an_instanced_object_given_another_material_has_it_in_its_copies_rows() {
     lit_as_a_build(what, &mut live, &mut open(&w).unwrap());
 }
 
-/// What still changes by a rebuild: a material of world-space triangles. Particles' (dynamic triangles: their class
-/// is theirs, and they get no emitters in place) when it starts emitting or becomes a cutout; one that still
-/// triangles have (the build groups them by whether they are cutouts) when it becomes a cutout. The same change of
-/// a material that only instances' rows name is in place.
+/// What still changes by a rebuild: a particle system's material (its triangles are its pass's: they get no emitters
+/// in place) when it starts emitting or becomes a cutout. The same change of a material that only instances' rows
+/// name is in place.
 #[test]
 fn a_material_of_world_space_triangles_changes_by_a_rebuild() {
     let presets = crate::default_presets_dir();
@@ -2669,17 +2655,12 @@ fn a_material_of_world_space_triangles_changes_by_a_rebuild() {
     };
     w.take_changes();
     let index = |c: &LiveCore, id: u32| c.sc.tables.retained.materials[&id];
-    assert!(live.sc.tables.moving_mats.contains(&index(&live, 62)) && !live.sc.tables.moving_mats.contains(&index(&live, 64)), "the particles' material is dynamic triangles', the tile's is not");
+    assert!(live.sc.tables.moving_mats.contains(&index(&live, 62)) && !live.sc.tables.moving_mats.contains(&index(&live, 64)), "the particles' material is the pass's, the tile's is not");
     // The tile's material, which rows alone name: a cutout and back, in place.
     for (test, what) in [(0.5, "becomes a cutout"), (0.0, "is none again")] {
         w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": test })));
         assert!(!live.commit(&mut w).unwrap(), "a material of rows {what}: in place ({:?})", live.fallback);
     }
-    // The same, were it still triangles' too: a rebuild.
-    let k = index(&live, 64);
-    live.sc.tables.static_mats.insert(k);
-    w.set_material(64, plain(serde_json::json!({ "opacity": 0.9, "alphaTest": 0.5 })));
-    assert!(live.commit(&mut w).unwrap(), "a material of still triangles becomes a cutout: a rebuild");
     // The particles' material: it starts emitting, it becomes a cutout.
     w.set_material(62, plain(serde_json::json!({ "emissive": [1.0, 0.8, 0.6], "emissiveIntensity": 20 })));
     assert!(live.commit(&mut w).unwrap(), "the particles' material starts emitting: a rebuild");
@@ -3164,7 +3145,7 @@ fn a_posed_rigid_model_with_a_second_mesh_is_hidden_and_removed_in_place() {
     w.take_changes();
     {
         let r = live.sc.tables.retained.rigid(32).expect("a posed rigid model");
-        assert!(live.sc.tris.is_empty() && r.records().iter().any(|&i| live.sc.meshes.iter().any(|m| m.over == live.sc.instances[i as usize].mesh)), "one of its instances is of a part's second mesh");
+        assert!(r.records().iter().any(|&i| live.sc.meshes.iter().any(|m| m.over == live.sc.instances[i as usize].mesh)), "one of its instances is of a part's second mesh");
     }
     let before = picture(&mut live, 48);
     w.set_visible(32, false).unwrap();
@@ -3257,7 +3238,7 @@ fn a_posed_skinned_models_emitters_follow_its_pose() {
     w.take_changes();
     let sk = live.sc.tables.retained.skinned.iter().find(|s| s.object == 30).expect("a posed skinned model").clone();
     let its = |c: &LiveCore| c.sc.tables.emitter_tris.iter().filter(|e| e.inst == sk.instance && e.area > 0.0).copied().collect::<Vec<_>>();
-    assert!(live.sc.tris.is_empty() && !its(&live).is_empty() && its(&live).iter().all(|e| e.moves), "its emitters are its instance's, moving ones");
+    assert!(!its(&live).is_empty() && its(&live).iter().all(|e| e.moves), "its emitters are its instance's, moving ones");
     list_is_its_triangles("as loaded", &live);
     // (The codes the load uploaded are on record: the first write of the weights sends those that change, not all.)
     {
@@ -3275,7 +3256,7 @@ fn a_posed_skinned_models_emitters_follow_its_pose() {
         let cpu = skinned_on_cpu(&live, &sk, &bend(time).unwrap()).p;
         let m = live.sc.meshes[sk.mesh as usize];
         for e in its(&live) {
-            let k = e.tri as usize - live.sc.edit.pool_first - m.first as usize;
+            let k = e.tri as usize - m.first as usize;
             let got: Vec<f32> = live.sc.pool_tris[m.first as usize + k].iter().flat_map(|v| v.to_array()).collect();
             assert!(got.iter().zip(&cpu[k * 9..k * 9 + 9]).all(|(a, b)| (a - b).abs() < 1e-5), "{what}: the CPU has triangle {k} at {got:?}, the pose {:?}", &cpu[k * 9..k * 9 + 9]);
         }
@@ -3373,7 +3354,7 @@ fn a_posed_skinned_model_is_added_in_place() {
         w.set_object(id, format!("m{id}"), None, model(name, bend(0.0)), true, false).unwrap();
         w.set_transform(id, Vec3::new(x, -0.8, 0.8), glam::Quat::IDENTITY, Vec3::splat(1.2)).unwrap();
     }
-    // (A movable rect light's card: world-space triangles that move, whose previous vertices lie before the meshes'.)
+    // (A movable rect light's card: an instance of the cards' mesh.)
     let card = serde_json::from_value(serde_json::json!({ "type": "rect", "color": [1, 1, 1], "castShadow": true, "intensity": 1, "width": 0.3, "height": 0.3, "range": 0 })).unwrap();
     w.set_object(22, "card".into(), None, Kind::Light(card), true, true).unwrap();
     w.set_transform(22, Vec3::new(-2.4, 1.3, 0.6), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
@@ -3731,7 +3712,7 @@ fn a_posed_skinned_model_is_removed_in_place() {
 /// vertices two joints hold, weights that do not sum to one, a primitive with tangents and one without normals, a
 /// mesh on a node beside the skin that mirrors it, a joint turned about an axis that is neither the normals' nor the
 /// tangents', its materials in an order a mesh laid out by material does not keep; and arm.glb), two of each, each
-/// a mesh of its own, in a scene with world-space triangles before the meshes': after each new pose the GPU's
+/// a mesh of its own, in a scene with a movable light's card: after each new pose the GPU's
 /// triangles, shading attributes and BLAS input of each mesh are its model's triangles for the pose, the previous
 /// frame's vertices are the pose before, and the CPU has the mesh as it is now when asked. One posed alone leaves
 /// the others' as they were. Also after the scene's buffers were made again larger, and a pose that mirrors other

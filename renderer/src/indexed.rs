@@ -1,8 +1,6 @@
-//! The scene's geometry as the GPU holds it: vertices kept once, a triangle three indices and a row. The build still
-//! makes triangles with corners of their own (`Scene::tris`, `attrs`); what they share is found here, scope by scope:
-//! a mesh's triangles share within the mesh, the still world-space triangles among themselves, what the CPU writes
-//! whole each frame (the dynamic world-space triangles) has three vertices a triangle, and a particle system's
-//! mesh four a quad.
+//! The scene's geometry as the GPU holds it: vertices kept once, a triangle three indices. The build makes triangles
+//! with corners of their own (`Scene::pool_tris`, `attrs`); what they share is found here, mesh by mesh: a mesh's
+//! triangles share within the mesh, and a particle system's mesh has four vertices a quad.
 
 use crate::scene::GpuTriAttr;
 use glam::Vec3A;
@@ -14,16 +12,10 @@ use std::hash::Hash;
 pub type Vertex = [[f32; 4]; 3];
 pub const VERTEX_BYTES: usize = std::mem::size_of::<Vertex>();
 
-/// The row of a triangle no instance places (software traversal's, of an instance that is no unit): its material, its
-/// object, its flags (`scene::TRI_*`), its emitter entry + 1. A mesh's triangle needs none on the GPU: a ray's hit
-/// says which section of its mesh it is in, and the rest is its instance's. (The build has one for every triangle,
-/// a mesh's with its section and its index there: `Indexed::rows`.)
-pub type TriRow = [u32; 4];
-
 /// A triangle as a software tree keeps it in its leaves, the tree's own copy (hardware traversal's acceleration
 /// structures keep theirs): (v0, id), (v1 - v0, id), (v2 - v0, -), so a candidate's test reads one place. The ids:
-/// a world-space triangle's flags (`scene::TRI_*`), -; a mesh's section, and its index in the section. Three vec4s a
-/// triangle, in the triangles' order (a tree's leaves name runs of it).
+/// its section of its mesh, and its index in the section. Three vec4s a triangle, in the triangles' order (a tree's
+/// leaves name runs of it).
 pub type Leaf = [[f32; 4]; 3];
 pub const LEAF_BYTES: usize = std::mem::size_of::<Leaf>();
 
@@ -154,22 +146,6 @@ pub fn source_vertices(source: &[[crate::skin::SkinCorner; 3]], scope: &Scope) -
     out
 }
 
-/// A scope's triangles with three vertices each: what is written whole, a triangle at a time.
-pub fn apart(tris: &[[Vec3A; 3]], attrs: &[GpuTriAttr]) -> Scope {
-    let mut s = Scope::default();
-    for (k, (t, a)) in tris.iter().zip(attrs).enumerate() {
-        // (One with a corner that is not finite: its three vertices at the origin, as `share` has it.)
-        let finite = t.iter().all(|p| p.is_finite());
-        for (c, p) in t.iter().enumerate() {
-            let (n, uv, tangent) = corner(a, c);
-            let p = if finite { *p } else { Vec3A::ZERO };
-            s.vertices.push([[p.x, p.y, p.z, uv[0]], [n[0], n[1], n[2], uv[1]], tangent]);
-        }
-        s.indices.push([k as u32 * 3, k as u32 * 3 + 1, k as u32 * 3 + 2]);
-    }
-    s
-}
-
 /// A particle system's quads (two triangles each, the second the first's first and third corners and its own
 /// third) as four vertices a quad, in the order the particle pass writes them.
 pub fn quads(tris: &[[Vec3A; 3]], attrs: &[GpuTriAttr]) -> Scope {
@@ -185,50 +161,25 @@ pub fn quads(tris: &[[Vec3A; 3]], attrs: &[GpuTriAttr]) -> Scope {
     s
 }
 
-/// Triangles written whole as their vertices alone (their indices do not change): `corners`, three a triangle, and
-/// their attributes; the vertices, as `apart` has them.
-pub fn apart_vertices(corners: &[[f32; 3]], attrs: &[GpuTriAttr]) -> Vec<Vertex> {
-    let mut out = Vec::with_capacity(corners.len());
-    for (t, a) in corners.chunks_exact(3).zip(attrs) {
-        let finite = t.iter().flatten().all(|x| x.is_finite());
-        for (c, p) in t.iter().enumerate() {
-            let (n, uv, tangent) = corner(a, c);
-            let p = if finite { *p } else { [0.0; 3] };
-            out.push([[p[0], p[1], p[2], uv[0]], [n[0], n[1], n[2], uv[1]], tangent]);
-        }
-    }
-    out
-}
-
 /// The scene's geometry: every scope's vertices one after another, the triangles in the GPU's order.
 #[derive(Clone, Debug, Default)]
 pub struct Indexed {
     pub vertices: Vec<Vertex>,
-    /// A triangle's three vertices: a mesh's count from the mesh's first vertex, a world-space triangle's from 0.
+    /// A triangle's three vertices, counted from its mesh's first vertex.
     pub indices: Vec<[u32; 3]>,
-    pub rows: Vec<TriRow>,
     /// Software traversal: every triangle as its tree's leaf has it. Empty under hardware traversal.
     pub leaves: Vec<Leaf>,
-    /// The meshes' first triangle: those before it are in world space.
-    pub pool_first: u32,
     /// By mesh (`Scene::meshes`): its first vertex and how many it has.
     pub meshes: Vec<(u32, u32)>,
-    /// The world-space triangles' vertices: the first so many (the still ones', then those that move).
-    pub flat: u32,
     /// By skin source (`Scene::skin_sources`): the model's vertices a mesh of it is skinned from (`source_vertices`)
     /// and its triangles' indices, which every mesh of the source has. Empty: no mesh is skinned from it.
     pub skins: Vec<(Vec<crate::skin::SkinCorner>, Vec<[u32; 3]>)>,
-    /// The vertices that move (the dynamic world-space triangles', then the deforming meshes'): the first and how
-    /// many. Their previous frame's positions are kept in this order.
+    /// The vertices that move (the deforming meshes'): the first and how many. Their previous frame's positions are
+    /// kept in this order.
     pub dynamic: (u32, u32),
 }
 
 impl Indexed {
-    /// The rows the GPU holds: the world-space triangles' (a mesh's triangles have none).
-    pub fn gpu_rows(&self) -> &[TriRow] {
-        &self.rows[..(self.pool_first as usize).min(self.rows.len())]
-    }
-
     /// A scope's vertices after those there are, its triangles after those there are, their indices raised by `by`
     /// (0: they count from the scope's first vertex). The scope's first vertex.
     pub fn push(&mut self, s: Scope, by: u32) -> u32 {
@@ -293,8 +244,7 @@ mod tests {
     }
 
     /// Triangles that the build made from a sheet of (n + 1)^2 vertices come back as that many, with tangents or
-    /// without; and each triangle read through its indices is the build's. Written whole, they have three vertices
-    /// each.
+    /// without; and each triangle read through its indices is the build's.
     #[test]
     fn a_scopes_triangles_share_their_vertices() {
         for own in [false, true] {
@@ -302,9 +252,6 @@ mod tests {
             let s = shared(&tris, &attrs);
             same(&format!("own tangents {own}"), &s, &tris, &attrs);
             assert_eq!(s.vertices.len(), 13 * 13, "own tangents {own}: the sheet's vertices, each once");
-            let a = apart(&tris, &attrs);
-            same(&format!("apart, own tangents {own}"), &a, &tris, &attrs);
-            assert_eq!(a.vertices.len(), tris.len() * 3);
         }
     }
 
@@ -356,24 +303,21 @@ mod tests {
     }
 
     /// A triangle with a corner that is not finite is three times one vertex at the origin (no ray meets it; a BLAS is
-    /// built from these positions), shared or apart; the others are as they were.
+    /// built from these positions); the others are as they were.
     #[test]
     fn a_triangle_that_is_not_finite_has_no_size() {
         let (mut tris, attrs) = sheet(4, false);
         tris[5][1] = Vec3A::new(f32::NAN, 0.0, 0.0);
         tris[9][2] = Vec3A::new(0.0, f32::INFINITY, 0.0);
-        for s in [shared(&tris, &attrs), apart(&tris, &attrs)] {
-            assert!(s.vertices.iter().flat_map(|v| v[0]).all(|x| x.is_finite()), "every position is finite");
-            for k in [5, 9] {
-                let p = s.indices[k].map(|v| s.vertices[v as usize][0]);
-                assert!(p[0][..3] == [0.0; 3] && p[0][..3] == p[1][..3] && p[1][..3] == p[2][..3], "triangle {k}: {p:?}");
-            }
-            let all = Indexed { vertices: s.vertices.clone(), indices: s.indices.clone(), ..Default::default() };
-            for (k, t) in tris.iter().enumerate().filter(|(k, _)| ![5, 9].contains(k)) {
-                assert_eq!(all.triangle(k, 0).0, t.map(|p| p.to_array()), "triangle {k}'s corners");
-            }
+        let s = shared(&tris, &attrs);
+        assert!(s.vertices.iter().flat_map(|v| v[0]).all(|x| x.is_finite()), "every position is finite");
+        for k in [5, 9] {
+            let p = s.indices[k].map(|v| s.vertices[v as usize][0]);
+            assert!(p[0][..3] == [0.0; 3] && p[0][..3] == p[1][..3] && p[1][..3] == p[2][..3], "triangle {k}: {p:?}");
         }
-        let corners: Vec<[f32; 3]> = tris.iter().flatten().map(|p| p.to_array()).collect();
-        assert!(apart_vertices(&corners, &attrs).iter().flat_map(|v| v[0]).all(|x| x.is_finite()));
+        let all = Indexed { vertices: s.vertices.clone(), indices: s.indices.clone(), ..Default::default() };
+        for (k, t) in tris.iter().enumerate().filter(|(k, _)| ![5, 9].contains(k)) {
+            assert_eq!(all.triangle(k, 0).0, t.map(|p| p.to_array()), "triangle {k}'s corners");
+        }
     }
 }
