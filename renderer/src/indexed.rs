@@ -1,7 +1,8 @@
 //! The scene's geometry as the GPU holds it: vertices kept once, a triangle three indices and a row. The build still
 //! makes triangles with corners of their own (`Scene::tris`, `attrs`); what they share is found here, scope by scope:
-//! a mesh's triangles share within the mesh, the still world-space triangles among themselves, and what a pass or the
-//! CPU writes whole each frame (the dynamic world-space triangles, particles) has three vertices a triangle.
+//! a mesh's triangles share within the mesh, the still world-space triangles among themselves, what the CPU writes
+//! whole each frame (the dynamic world-space triangles) has three vertices a triangle, and a particle system's
+//! mesh four a quad.
 
 use crate::scene::GpuTriAttr;
 use glam::Vec3A;
@@ -13,7 +14,7 @@ use std::hash::Hash;
 pub type Vertex = [[f32; 4]; 3];
 pub const VERTEX_BYTES: usize = std::mem::size_of::<Vertex>();
 
-/// The row of a triangle no instance places (a light's card, a particle's, a flattened scene's): its material, its
+/// The row of a triangle no instance places (what the build flattens): its material, its
 /// object, its flags (`scene::TRI_*`), its emitter entry + 1. A mesh's triangle needs none on the GPU: a ray's hit
 /// says which section of its mesh it is in, and the rest is its instance's. (The build has one for every triangle,
 /// a mesh's with its section and its index there: `Indexed::rows`.)
@@ -135,6 +136,21 @@ pub fn apart(tris: &[[Vec3A; 3]], attrs: &[GpuTriAttr]) -> Scope {
     s
 }
 
+/// A particle system's quads (two triangles each, the second the first's first and third corners and its own
+/// third) as four vertices a quad, in the order the particle pass writes them.
+pub fn quads(tris: &[[Vec3A; 3]], attrs: &[GpuTriAttr]) -> Scope {
+    let mut s = Scope::default();
+    for (q, (t, a)) in tris.chunks_exact(2).zip(attrs.chunks_exact(2)).enumerate() {
+        for (k, c) in [(0, 0), (0, 1), (0, 2), (1, 2)] {
+            let (p, (n, uv, tangent)) = (t[k][c], corner(&a[k], c));
+            s.vertices.push([[p.x, p.y, p.z, uv[0]], [n[0], n[1], n[2], uv[1]], tangent]);
+        }
+        let v = q as u32 * 4;
+        s.indices.extend([[v, v + 1, v + 2], [v, v + 2, v + 3]]);
+    }
+    s
+}
+
 /// Triangles written whole as their vertices alone (their indices do not change): `corners`, three a triangle, and
 /// their attributes; the vertices, as `apart` has them.
 pub fn apart_vertices(corners: &[[f32; 3]], attrs: &[GpuTriAttr]) -> Vec<Vertex> {
@@ -159,16 +175,12 @@ pub struct Indexed {
     pub rows: Vec<TriRow>,
     /// Software traversal: every triangle as its tree's leaf has it. Empty under hardware traversal.
     pub leaves: Vec<Leaf>,
-    /// The meshes' first triangle: those before it are in world space. And the translucent particles' first (they
-    /// lie after the meshes') and how many.
+    /// The meshes' first triangle: those before it are in world space.
     pub pool_first: u32,
-    pub translucent_tris: (u32, u32),
     /// By mesh (`Scene::meshes`): its first vertex and how many it has.
     pub meshes: Vec<(u32, u32)>,
     /// The world-space triangles' vertices: the first so many (the still ones', then those that move).
     pub flat: u32,
-    /// The translucent particles' first vertex (three a triangle, after every mesh's).
-    pub translucent: u32,
     /// By skin source (`Scene::skin_sources`): the model's vertices a mesh of it is skinned from (`source_vertices`)
     /// and its triangles' indices, which every mesh of the source has. Empty: no mesh is skinned from it.
     pub skins: Vec<(Vec<crate::skin::SkinCorner>, Vec<[u32; 3]>)>,
@@ -178,11 +190,9 @@ pub struct Indexed {
 }
 
 impl Indexed {
-    /// The rows the GPU holds: the world-space triangles', then the translucent particles' (found from `pool_first`
-    /// on: the meshes' triangles lie between and have none).
-    pub fn gpu_rows(&self) -> Vec<TriRow> {
-        let (first, n) = (self.translucent_tris.0 as usize, self.translucent_tris.1 as usize);
-        self.rows[..(self.pool_first as usize).min(self.rows.len())].iter().chain(self.rows.get(first..first + n).unwrap_or(&[])).copied().collect()
+    /// The rows the GPU holds: the world-space triangles' (a mesh's triangles have none).
+    pub fn gpu_rows(&self) -> &[TriRow] {
+        &self.rows[..(self.pool_first as usize).min(self.rows.len())]
     }
 
     /// A scope's vertices after those there are, its triangles after those there are, their indices raised by `by`

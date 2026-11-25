@@ -260,13 +260,6 @@ fn mesh_is_the_cpus(what: &str, c: &LiveCore, id: u32) {
     assert_eq!(got.p, want, "{what}: the mesh's corners through its indices");
 }
 
-/// The world-space triangles that move, on the GPU through their indices, are the CPU's (`LoadedScene::dynamic`).
-fn moving_triangles_are_the_cpus(what: &str, c: &LiveCore) {
-    let (first, rows, _, corners) = &c.sc.dynamic;
-    let got = triangles_on_gpu(c, *first as u64, rows.len() as u64 / 3, 0, None);
-    assert_eq!(got.p, corners.iter().flatten().copied().collect::<Vec<f32>>(), "{what}: the moving triangles' corners through their indices");
-}
-
 /// Mean absolute difference of two pictures, in 8-bit steps.
 fn apart(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
@@ -482,35 +475,30 @@ fn an_emitting_particle_lights_both_its_sides_beside_a_lights_card() {
     assert!(b > 20.0 && (a / b - 1.0).abs() < 0.05, "the wall beside the particle: {a:.1} of 255 with its back to the wall, {b:.1} with its face");
 }
 
-/// Primary visibility by rasterization (`Raster`): a path starts at the triangle the pass drew at its pixel, which is
-/// the one its camera ray hits: the picture is the traced one's. The pass draws world-space triangles and is off in a
-/// scene with instances, which every mesh of a world is: a scene of rect lights' cards alone.
+/// A rect light's card lights its front side alone: a wall it faces is lit, and with its back to the wall the wall is
+/// dark (the light list's entry says that an emitter is a card's: `EMITTER_CARD`). Under either traversal.
 #[test]
-fn a_rasterized_first_hit_is_the_traced_one() {
+fn a_card_lights_its_front_side_alone() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
-    let mut w = World::default();
-    // (Turned to face the camera: a card lights the side of its node's -z.)
-    for (id, at, turn) in [(21, Vec3::new(-0.9, 0.2, 0.0), 3.6), (22, Vec3::new(0.8, -0.3, 1.0), 2.5)] {
-        let card = serde_json::from_value(serde_json::json!({ "type": "rect", "color": [1, 0.6, 0.3], "castShadow": true, "intensity": 3, "width": 1.2, "height": 0.8, "range": 0 })).unwrap();
-        w.set_object(id, format!("card{id}"), None, Kind::Light(card), true, false).unwrap();
-        w.set_transform(id, at, glam::Quat::from_rotation_y(turn), Vec3::ONE).unwrap();
-    }
-    w.set_object(4, "camera".into(), None, Kind::Camera(camera(50.0, None, manual(0.0))), true, false).unwrap();
-    w.set_transform(4, Vec3::new(0.0, 0.0, 5.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
-    w.set_settings(Settings { camera: Some(4), ..Default::default() });
-    let (mut traced, mut drawn) = match (open(&w), open(&w)) {
+    let scene = |turned: bool| {
+        let mut w = wall_world(3.0, serde_json::json!({ "name": "none", "color": [0, 0, 0], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [0, 0, 0], "emissiveIntensity": 0, "doubleSided": true }));
+        let card = serde_json::from_value(serde_json::json!({ "type": "rect", "color": [1, 1, 1], "castShadow": true, "intensity": 5, "width": 0.4, "height": 0.4, "range": 0 })).unwrap();
+        w.set_object(21, "card".into(), None, Kind::Light(card), true, false).unwrap();
+        // (Half a metre before the wall; a rect light shines down its own -Z: at the wall, or turned, at the camera.)
+        w.set_transform(21, Vec3::new(0.0, 0.0, 0.5), glam::Quat::from_rotation_y(if turned { std::f32::consts::PI } else { 0.0 }), Vec3::ONE).unwrap();
+        w
+    };
+    let (mut facing, mut turned) = match (open(&scene(false)), open(&scene(true))) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => return eprintln!("skipped: {e}"),
     };
-    assert!(!drawn.sc.instanced && drawn.sc.tris.len() == 4 && traced.raster.is_none(), "a scene of four world-space triangles, traced unless asked");
-    drawn.raster = Some(super::frame::Raster::new(&drawn.g, drawn.w, drawn.h));
-    (drawn.kernel_bg, drawn.tl_kernel_bg) = super::kernel_bind_groups(&drawn.g, drawn.raster.as_ref(), &drawn.targets);
-    let (a, b) = (picture(&mut traced, 64), picture(&mut drawn, 64));
-    let lit = a.chunks_exact(4).filter(|p| p[0] > 100).count();
-    assert!(lit > a.len() / 4 / 50, "the cards are in the picture ({lit} pixels)");
-    // (0 steps as measured; 4.9 with each index read one word on.)
-    assert!(apart(&a, &b) < 0.5, "the picture is {:.2} steps from the traced one", apart(&a, &b));
+    let e = &facing.sc.tables.emitter_tris;
+    assert!(e.len() == 2 && e.iter().all(|e| e.card && e.inst != crate::NO_INST), "the light list: the card's two triangles, its instance's");
+    // (The wall beside the card, as the camera sees it.)
+    let region = [26, 18, 36, 36];
+    let (a, b) = (region_mean(&picture(&mut facing, 64), region), region_mean(&picture(&mut turned, 64), region));
+    assert!(a > 20.0 && b < a * 0.1, "the wall beside the card: {a:.1} of 255 with the card's face to it, {b:.1} with its back");
 }
 
 /// A mesh changed in place to triangles of more vertices (a crease: its two triangles share no corner any more) takes
@@ -568,12 +556,11 @@ fn a_mesh_changed_in_place_to_more_vertices_takes_another_run() {
     against_a_build("flat again", &mut live, &w);
 }
 
-/// Two movable rect lights' cards (world-space triangles that move, one card after the other; a still card's
-/// vertices lie before theirs): each moved alone is written where it lies, the other's vertices as they were; the
-/// motion vectors at its pixels are its step back (its previous positions are its own); the picture is a build's.
-/// (Hardware traversal: under software traversal a world-space triangle that moves is a rebuild's.)
+/// Two movable rect lights' cards beside a still one (instances of the card mesh): each moved alone has its instance
+/// where its light is, the others' as they were; the motion vectors at its pixels are its step back; the picture is
+/// a build's.
 #[test]
-fn a_moved_card_beside_another_is_written_where_it_lies() {
+fn a_moved_card_beside_another_is_placed_where_its_light_is() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
     let turn = glam::Quat::from_rotation_y(3.3);
@@ -585,22 +572,42 @@ fn a_moved_card_beside_another_is_written_where_it_lies() {
         w.set_transform(id + 100, at[k], turn, Vec3::ONE).unwrap();
     }
     let mut live = match open(&w) {
-        Ok(c) if c.g.hwrt => c,
-        Ok(_) => return eprintln!("skipped: no hardware RT"),
+        Ok(c) => c,
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    assert!(live.sc.dynamic.1.len() == 12 && live.sc.dynamic_verts.0 > 0, "two cards that move, four triangles, after vertices that do not");
-    moving_triangles_are_the_cpus("as loaded", &live);
+    // Each card's instance: its transform, and its record's on the GPU.
+    let cards = |live: &LiveCore| -> Vec<(glam::Mat4, scene::GpuInstance)> {
+        (120..123u32)
+            .map(|id| {
+                let i = live.sc.tables.retained.instance(id).expect("a card is an instance").instance as usize;
+                let size = std::mem::size_of::<scene::GpuInstance>() as u64;
+                let r: Vec<scene::GpuInstance> = read_back(live, &live.sc.up.heap.buffer, live.sc.up.heap.at(Table::Instances) + i as u64 * size, size);
+                assert_eq!(r[0].m, live.sc.gpu_instances[i].m, "card {id}: its record on the GPU is the CPU's");
+                (live.sc.instances[i].world, r[0])
+            })
+            .collect()
+    };
+    let placed = |m: glam::Mat4, to: Vec3| m.abs_diff_eq(scene::card_world(glam::Mat4::from_rotation_translation(turn, to), 0.4, 0.3), 1e-6);
+    assert!(live.sc.dynamic.1.is_empty() && live.sc.tris.is_empty(), "a card is no world-space triangle");
+    let first = cards(&live);
+    assert!((0..3).all(|k| placed(first[k].0, at[k])), "as loaded: each card where its light is");
+    assert!(first.iter().all(|c| c.1.m == c.1.p), "as loaded: nothing has moved");
     picture(&mut live, 2);
     for (k, to) in [(2, Vec3::new(0.5, 0.5, 1.4)), (1, Vec3::new(-0.4, 0.3, 1.0)), (2, Vec3::new(0.9, 0.9, 1.1))] {
-        let (what, before, step) = (format!("card {k} moved"), live.sc.dynamic.3.clone(), at[k] - to);
+        let (what, before, step) = (format!("card {k} moved"), cards(&live), at[k] - to);
         at[k] = to;
         w.set_transform(120 + k as u32, to, turn, Vec3::ONE).unwrap();
         assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
-        let moved = (0..4).filter(|&t| live.sc.dynamic.3[t * 3..t * 3 + 3] != before[t * 3..t * 3 + 3]).collect::<Vec<_>>();
-        assert!(moved == [0, 1] || moved == [2, 3], "{what}: its two triangles alone ({moved:?})");
-        moving_triangles_are_the_cpus(&what, &live);
+        let now = cards(&live);
+        for j in 0..3 {
+            if j == k {
+                assert!(placed(now[j].0, to), "{what}: its instance is where its light is");
+                assert_eq!(now[j].1.p, before[j].1.m, "{what}: its record keeps where it was");
+            } else {
+                assert_eq!(now[j].0, before[j].0, "{what}: card {j} stays");
+            }
+        }
         // The frame after: where the card is seen, the way back to where it was.
         live.render(1, |_, _| {});
         let m = &live.targets.kernel.motion;
@@ -613,14 +620,46 @@ fn a_moved_card_beside_another_is_written_where_it_lies() {
     }
 }
 
-/// A particle that drifts: its vertices' previous positions are the pass's last (the motion vectors at its pixels
-/// are its step back), and the pass leaves its vertices' UVs as the build made them.
+/// Ray tracing off and on again (`LiveCore::set_rays`): off, nothing is shadowed (what the panel shadowed on the
+/// wall is lit); on again, the picture is the first one's.
+#[test]
+fn rays_off_is_another_picture_and_on_again_the_first() {
+    let presets = crate::default_presets_dir();
+    let w = world();
+    let mut live = match gpu::Gpu::new().and_then(|g| LiveCore::new(g, &w, Path::new("."), &presets, 96, 54)) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    // (Pixels more than 20 steps apart in a colour: where a shadow was, where light had bounced.)
+    let changed = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| (0..3).any(|c| x[c].abs_diff(y[c]) > 20)).count();
+    let on = picture(&mut live, 48);
+    live.set_rays(false);
+    forget(&mut live);
+    let off = picture(&mut live, 48);
+    live.set_rays(true);
+    forget(&mut live);
+    let again = picture(&mut live, 48);
+    // What changes is what was in shadow: lit now, none dimmed as much. (Measured: 47 pixels, none on again.)
+    let by = |a: &[u8], b: &[u8], up: bool| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| (0..3).any(|c| if up { y[c] > x[c].saturating_add(20) } else { x[c] > y[c].saturating_add(20) })).count();
+    let (lit, dimmed) = (by(&on, &off, true), by(&on, &off, false));
+    eprintln!("rays off: {lit} pixels lit, {dimmed} dimmed");
+    assert!(changed(&on, &off) > 20 && lit > 20 && dimmed * 4 < lit, "rays off: {} pixels of the traced picture changed, {lit} lit and {dimmed} dimmed", changed(&on, &off));
+    assert!(changed(&on, &again) < 4 && apart(&on, &again) < 0.2, "rays on again: {} pixels from the first picture, {:.2} steps", changed(&on, &again), apart(&on, &again));
+}
+
+/// A particle that drifts, beside a system that stands still: its vertices' previous positions are the pass's last
+/// (the motion vectors at its pixels are its step back, and nothing else moves), and the pass leaves the vertices'
+/// UVs as the build made them.
 #[test]
 fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
     let mut w = world();
     w.set_particle_fn("drift", "fn pf_drift(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.6 * i.time, 0.5, 1.0), vec3<f32>(0.3, 0.0, 0.0), vec3<f32>(0.0, 0.3, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    // (Another system before it, two quads that stand still: the drifting one's vertices and their previous positions
+    // are not the scene's first that move.)
+    w.set_particle_fn("still", "fn pf_still(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.5 * f32(i.index), -0.5, 1.0), vec3<f32>(0.1, 0.0, 0.0), vec3<f32>(0.0, 0.1, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(17, "still".into(), None, Kind::Particles { count: 2, emitter: "still".into(), params: vec![], material: 1, emitter_area: 0.0 }, true, false).unwrap();
     w.set_object(18, "drift".into(), None, Kind::Particles { count: 1, emitter: "drift".into(), params: vec![], material: 1, emitter_area: 0.01 }, true, false).unwrap();
     let mut live = match open(&w) {
         Ok(c) if c.g.hwrt => c,
@@ -628,7 +667,7 @@ fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    // (The vertices that move: the particle's six.)
+    // (The vertices that move: four a particle, the systems' meshes.)
     let vertices = |c: &LiveCore| -> (Vec<[f32; 3]>, Vec<[f32; 2]>) {
         let (first, n) = (c.sc.dynamic_verts.0 as u64, c.sc.dynamic_verts.1 as u64);
         let size = crate::indexed::VERTEX_BYTES as u64;
@@ -636,11 +675,17 @@ fn a_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         (v.iter().map(|v| [v[0][0], v[0][1], v[0][2]]).collect(), v.iter().map(|v| [v[0][3], v[1][3]]).collect())
     };
     let built = vertices(&live);
-    assert!(built.1.len() == 6 && built.1.iter().any(|uv| uv[0] != 0.0) && built.1.iter().any(|uv| uv[1] != 0.0), "the particle's six vertices, with the build's UVs ({:?})", built.1);
+    assert!(built.1.len() == 12 && built.1.chunks(4).all(|q| q == [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]), "four vertices a particle (its mesh's quad, in the order the pass writes it), with the build's UVs: {:?}", built.1);
     live.fixed_dt = Some(1.0 / 60.0);
-    for _ in 0..4 {
+    for k in 0..4 {
         live.advance_time(1.0 / 60.0);
         live.render(1, |_, _| {});
+        // (A pass's first run has no last frame: the previous positions are the positions, and nothing moves.)
+        if k == 0 {
+            let m = &live.targets.kernel.motion;
+            let moved = read_back::<f32>(&live, &m.buffer, m.offset, m.size).chunks_exact(4).filter(|p| p[3] > 0.5 && Vec3::new(p[0], p[1], p[2]).length() > 1e-4).count();
+            assert_eq!(moved, 0, "the first frame: no pixel moves");
+        }
     }
     let now = vertices(&live);
     assert!(now.0 != built.0 && now.1 == built.1, "the pass moved the vertices and left their UVs ({:?} -> {:?})", built.1, now.1);
@@ -658,6 +703,10 @@ fn a_gpu_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
     let mut w = world();
     let emit = "fn pe_drift(i: EIn, p: array<vec4<f32>, 8>) -> PState { var s: PState; s.pos = i.at; s.life = 1000.0; s.color = i.color; s.size = 0.3; s.vel = vec3<f32>(0.6, 0.0, 0.0); return s; }";
     w.set_particle_program("drift", emit.into(), "fn pu_drift(s: PState, i: UIn, p: array<vec4<f32>, 8>) -> PState { return s; }".into(), String::new());
+    // (Another system before it, two quads that stand still: the drifting one's vertices and their previous positions
+    // are not the scene's first that move.)
+    w.set_particle_fn("still", "fn pf_still(i: PIn, p: array<vec4<f32>, 8>) -> POut { return POut(vec3<f32>(-0.6 + 0.5 * f32(i.index), -0.5, 1.0), vec3<f32>(0.1, 0.0, 0.0), vec3<f32>(0.0, 0.1, 0.0), true, vec4<f32>(0.0)); }".into(), String::new());
+    w.set_object(17, "still".into(), None, Kind::Particles { count: 2, emitter: "still".into(), params: vec![], material: 1, emitter_area: 0.0 }, true, false).unwrap();
     w.set_object(18, "drift".into(), None, Kind::GpuParticles { capacity: 1, program: "drift".into(), params: vec![], material: 1, emitter_area: 0.01, rate: 0.0, collide: Default::default() }, true, false).unwrap();
     let mut live = match open(&w) {
         Ok(c) if c.g.hwrt => c,
@@ -675,11 +724,17 @@ fn a_gpu_particle_that_moves_has_its_last_positions_and_keeps_its_uvs() {
         (v.iter().map(|v| [v[0][0], v[0][1], v[0][2]]).collect(), v.iter().map(|v| [v[0][3], v[1][3]]).collect())
     };
     let built = vertices(&live);
-    assert!(built.1.len() == 6 && built.1.iter().any(|uv| uv[0] != 0.0) && built.1.iter().any(|uv| uv[1] != 0.0), "the particle's six vertices, with the build's UVs ({:?})", built.1);
+    assert!(built.1.len() == 12 && built.1.chunks(4).all(|q| q == [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]), "four vertices a particle (its mesh's quad, in the order the pass writes it), with the build's UVs: {:?}", built.1);
     live.fixed_dt = Some(1.0 / 60.0);
-    for _ in 0..6 {
+    for k in 0..6 {
         live.advance_time(1.0 / 60.0);
         live.render(1, |_, _| {});
+        // (A pass's first run has no last frame: the previous positions are the positions, and nothing moves.)
+        if k == 0 {
+            let m = &live.targets.kernel.motion;
+            let moved = read_back::<f32>(&live, &m.buffer, m.offset, m.size).chunks_exact(4).filter(|p| p[3] > 0.5 && Vec3::new(p[0], p[1], p[2]).length() > 1e-4).count();
+            assert_eq!(moved, 0, "the first frame: no pixel moves");
+        }
     }
     let now = vertices(&live);
     assert!(now.0 != built.0 && now.1 == built.1, "the pass moved the vertices and left their UVs ({:?} -> {:?})", built.1, now.1);
@@ -3079,11 +3134,11 @@ fn a_model_with_emitters_is_placed_again_in_place() {
     lit_as_a_build("another posed rigid model placed after one was removed", &mut live, &mut open(&w).unwrap());
 }
 
-/// A posed rigid model with triangles flattened beside its parts (tests/render/data/panel-decal.glb: a cutout on
-/// exactly an emitter's vertices leaves the mesh with it) is hidden, and removed, by a rebuild: an instance's mask
-/// hides no world-space triangle. The picture is a build's.
+/// A posed rigid model with a part's second mesh (tests/render/data/panel-decal.glb: a cutout on exactly an
+/// emitter's vertices is a mesh apart, an instance beside the part's) is hidden, and removed, as its instances are:
+/// in place. The picture is a build's.
 #[test]
-fn a_posed_rigid_model_with_flattened_triangles_is_hidden_and_removed_by_a_rebuild() {
+fn a_posed_rigid_model_with_a_second_mesh_is_hidden_and_removed_in_place() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
     let model = || Kind::Model { uri: "tests/render/data/panel-decal.glb".into(), nodes: None, animation: Some(crate::desc::Animation { clip: "slide".into(), time: 0.25, r#loop: true, nodes: Default::default() }), functions: vec![] };
@@ -3107,20 +3162,23 @@ fn a_posed_rigid_model_with_flattened_triangles_is_hidden_and_removed_by_a_rebui
         Err(e) => return eprintln!("skipped: {e}"),
     };
     w.take_changes();
-    assert!(!live.sc.tables.retained.rigid(32).expect("a posed rigid model").rest.mats.is_empty(), "the model has triangles flattened beside its part");
+    {
+        let r = live.sc.tables.retained.rigid(32).expect("a posed rigid model");
+        assert!(live.sc.tris.is_empty() && r.records().iter().any(|&i| live.sc.meshes.iter().any(|m| m.over == live.sc.instances[i as usize].mesh)), "one of its instances is of a part's second mesh");
+    }
     let before = picture(&mut live, 48);
     w.set_visible(32, false).unwrap();
-    assert!(live.commit(&mut w).unwrap(), "hidden: a rebuild");
-    let hidden = pictured("a posed rigid model with flattened triangles hidden", &mut live, &w);
+    assert!(!live.commit(&mut w).unwrap(), "hidden: in place ({:?})", live.fallback);
+    let hidden = pictured("a posed rigid model with a second mesh hidden", &mut live, &w);
     assert!(apart(&before, &hidden) > 0.5, "it is gone from the picture ({:.2} steps)", apart(&before, &hidden));
     let mut w = scene();
     let mut live = open(&w).unwrap();
     w.take_changes();
     w.remove(32);
-    assert!(live.commit(&mut w).unwrap(), "removed: a rebuild");
-    let removed = pictured("a posed rigid model with flattened triangles removed", &mut live, &w);
+    assert!(!live.commit(&mut w).unwrap(), "removed: in place ({:?})", live.fallback);
+    let removed = pictured("a posed rigid model with a second mesh removed", &mut live, &w);
     assert!(apart(&hidden, &removed) < 0.5, "as when it was hidden ({:.2} steps)", apart(&hidden, &removed));
-    // Placed again: what is flattened beside its part is a build's to make.
+    // Placed again: a model with a second mesh is a build's to make.
     let mut w = scene();
     // (A mesh the scene says it edits: room for what is placed.)
     w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
@@ -3131,7 +3189,7 @@ fn a_posed_rigid_model_with_flattened_triangles_is_hidden_and_removed_by_a_rebui
     w.set_object(33, "again".into(), None, model(), true, false).unwrap();
     w.set_transform(33, Vec3::new(0.6, -0.4, 0.8), glam::Quat::IDENTITY, Vec3::splat(0.08)).unwrap();
     assert!(live.commit(&mut w).unwrap(), "placed again: a rebuild");
-    let two = pictured("a posed rigid model with flattened triangles placed again", &mut live, &w);
+    let two = pictured("a posed rigid model with a second mesh placed again", &mut live, &w);
     assert!(apart(&one, &two) > 0.5, "the second is in the picture ({:.2} steps)", apart(&one, &two));
 }
 
@@ -3303,7 +3361,7 @@ fn a_posed_skinned_model_is_added_in_place() {
     let prev_size = live.sc.up.prev_vertices.size();
     {
         let i = &live.sc.instances[live.sc.tables.retained.skinned[of(&live, 31)].instance as usize];
-        assert!(live.sc.dynamic.1.len() == 6 && i.prev == i.verts - live.sc.dynamic_verts.0 && i.prev >= 6, "a mesh's previous positions lie after the card's six vertices'");
+        assert!(i.prev == i.verts - live.sc.dynamic_verts.0, "a mesh's previous positions are counted from the first vertex that moves");
     }
 
     // One of a model the scene has, in a pose of its own.
@@ -3331,9 +3389,6 @@ fn a_posed_skinned_model_is_added_in_place() {
     check("posed on", &live, 32, &bend(0.8), &bend(0.3));
     check("the built one posed on", &live, 30, &bend(0.8), &bend(0.0));
     check("the other built one posed on", &live, 31, &bend(0.8), &bend(0.0));
-    // (The card did not move: its previous vertices are its own, whatever the meshes' did.)
-    let card = 6 * crate::indexed::VERTEX_BYTES as u64;
-    assert_eq!(read(&live, &live.sc.up.prev_vertices, 0, card), read(&live, &live.sc.up.vertices, live.sc.dynamic_verts.0 as u64 * crate::indexed::VERTEX_BYTES as u64, card), "the card's previous vertices are its vertices");
     let motion = |c: &mut LiveCore| -> Vec<f32> {
         (c.fixed_dt, c.frame, c.reset) = (Some(1.0 / 60.0), 16, true);
         c.render(1, |_, _| {});
@@ -3633,7 +3688,7 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
         w.set_object(id, format!("m{id}"), None, Kind::Model { uri: format!("tests/render/data/{uri}.glb"), nodes: None, animation: Some(bend(0.0)), functions: vec![] }, true, false).unwrap();
         w.set_transform(id, Vec3::new(x, -0.6, 0.8), glam::Quat::from_rotation_y(0.3), Vec3::splat(1.1)).unwrap();
     }
-    // (A rect light's card, far below: world-space triangles, which come before the meshes' in the GPU's order.)
+    // (A rect light's card, far below: an instance of a mesh that does not deform.)
     let card = serde_json::from_value(serde_json::json!({ "type": "rect", "color": [1, 1, 1], "castShadow": true, "intensity": 1, "width": 0.2, "height": 0.2, "range": 0 })).unwrap();
     w.set_object(21, "card".into(), None, Kind::Light(card), true, false).unwrap();
     w.set_transform(21, Vec3::new(0.0, -60.0, 0.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
@@ -3643,7 +3698,7 @@ fn the_skinning_pass_writes_what_the_cpu_skin_writes() {
     };
     w.take_changes();
     let hw = live.g.hwrt;
-    assert!(live.sc.edit.pool_first > 0, "a mesh's first triangle on the GPU is not its first in the pool");
+    assert!(live.sc.meshes.iter().any(|m| m.deforms && m.first > 0), "a deforming mesh that is not the pool's first");
     {
         let g = live.sc.tables.retained.skinned.iter().find(|g| g.uri.ends_with("skin-blend.glb")).expect("the model's mesh");
         assert!(g.order.iter().enumerate().any(|(at, &(k, _, _))| at as u32 != k), "the mesh has the model's triangles in another order (by material)");
