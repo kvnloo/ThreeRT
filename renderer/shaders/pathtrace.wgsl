@@ -1,6 +1,6 @@
 // ThreeRT native path tracer. One sample per pixel per dispatch, accumulated in `accum`.
 // Shading model mirrors UE5 DefaultLit: Lambert diffuse + GGX / Smith-joint-approx / Schlick(F90 = saturate(50 F0.g)),
-// with UE's GGX multi-scattering energy conservation and diffuse energy preservation.
+// with GGX multiple-scattering energy compensation and diffuse energy preservation.
 // Material / atmosphere extensions: texture pages with ray-cone LOD, alpha cutout, world mapping,
 // wetness / puddles / ripples / grime, procedural facade windows, emissive animation, RIS many-light sampling, height
 // fog with volumetric single scattering. Each is compiled out when the scene does not use it (FEAT).
@@ -15,13 +15,11 @@
 //   units                 software traversal's second level (gpu.rs `F_UNITS`); a scene's other features are bits
 //                         of `FEAT`, a pipeline-overridable constant
 //   merged                the merged binding layout (merged.rs: at most eight storage buffers a stage, a browser's)
-//   uniform_tables        four tables in uniform buffers (merged.rs `UNIFORM_TABLES`: Android's drivers)
 //   whole_tables          the seven typed tables read from the tables' buffer whole, as `merged` reads them, and
 //                         no views of their sections (gpu.rs `GpuOptions::table_views`: Android's drivers)
 //   guard                 the loop guard (gpu.rs `loop_guard_of`, `guard_loops`)
 // The numbers a variant is compiled for are WESL constants (`import constants::`, gpu.rs `KernelVariant::constants`): the
-// uniform tables' lengths, the loop guard's limit.
-@if(uniform_tables) import constants::{UT_TEX_INFO, UT_OBJECTS, UT_INSTANCES, UT_MEDIA};
+// loop guard's words and its limit.
 @if(merged || guard) import constants::GUARD_WORDS;
 @if(guard) import constants::LOOP_GUARD_LIMIT;
 @if(hwrt) enable wgpu_ray_query;
@@ -112,7 +110,7 @@ struct Params {
     fog_color: vec4<f32>, // ambient inscattering radiance, max opacity
     vol: vec4<f32>,       // volumetric scattering albedo (0 = off), HG anisotropy, extinction scale in range, -
     vol2: vec4<f32>,      // volumetric albedo tint rgb, range (m, 0 = unlimited)
-    raster: vec4<f32>,    // live: primary visibility from the raster pass (1 = on), this frame's sub-pixel jitter x, y (every camera ray's); ray tracing off (1)
+    jitter: vec4<f32>,    // live: this frame's sub-pixel jitter x, y (every camera ray's); ray tracing off (1); -
     cache: vec4<f32>,     // live radiance cache (1 = on), history cap in samples, history cap in frames, -
     motion: vec4<f32>,    // live motion vectors: 1 = on, -, -, - (first dynamic triangle: group_first[1].x)
     group_first: array<vec4<u32>, 2>, // first global triangle of each traversal group ([1].x = the first dynamic one)
@@ -185,7 +183,8 @@ struct Medium { w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, a: vec4<u32>, b: ve
 //  - objects, per object (scene node): pivot (world position), world bounds size (UE ObjectPositionWS /
 //    ObjectBounds), then what `OBJECT_STRIDE` says;
 //  - instances (Instance), media (Medium);
-//  - the GGX energy LUT: (E.x, E.y) for 32 roughness x 32 NoV, two per vec4;
+//  - the GGX energy table (`energy_lookup`): the specular lobe's two albedo terms at 32 roughnesses x 32 sqrt(NoV), two
+//    nodes per vec4;
 //  - the glass energy table (`glass_energy`): four values per vec4.
 // The buffer whole is `tables` in every layout (unsigned words: integers are read as they are, floats by a bit
 // cast): the light groups, the light tree and the energy LUT are read from it, and what a scene has more of is
@@ -202,8 +201,8 @@ fn glass_energy_at(i: u32) -> vec4<f32> { return table_f(P.table_first[2].z + i)
 // no placement (what moves it is copied again: emitter_fill.wgsl); `tri`: its triangle in the triangles' table
 // (attributes: `emitter_attrs`), `inst`: the instance that places it (NO_INST: none), `code`: the light tree's path
 // code (0: not one of the tree's), EMITTER_MOVES if it moves; `part`: as a hit's (`Hit.part`): its section of its
-// instance's mesh, or its own row. Four vec4s, a cache line.
-struct EmitterTri { v0: vec3<f32>, tri: u32, e1: vec3<f32>, inst: u32, e2: vec3<f32>, code: u32, part: u32 };
+// instance's mesh, or its own row; `flags`: EMITTER_CARD. Four vec4s, a cache line.
+struct EmitterTri { v0: vec3<f32>, tri: u32, e1: vec3<f32>, inst: u32, e2: vec3<f32>, code: u32, part: u32, flags: u32 };
 const EMITTER_TRI_VEC4: u32 = 4u;
 const EMITTER_MOVES: u32 = 0x80000000u;
 fn emitter_tri_at(i: u32) -> EmitterTri {
@@ -211,7 +210,8 @@ fn emitter_tri_at(i: u32) -> EmitterTri {
     let r0 = tables[b];
     let r1 = tables[b + 1u];
     let r2 = tables[b + 2u];
-    return EmitterTri(bitcast<vec3<f32>>(r0.xyz), r0.w, bitcast<vec3<f32>>(r1.xyz), r1.w, bitcast<vec3<f32>>(r2.xyz), r2.w, tables[b + 3u].x);
+    let r3 = tables[b + 3u];
+    return EmitterTri(bitcast<vec3<f32>>(r0.xyz), r0.w, bitcast<vec3<f32>>(r1.xyz), r1.w, bitcast<vec3<f32>>(r2.xyz), r2.w, r3.x, r3.y);
 }
 // The seven tables read at every hit or light, through `material_at`, `light_at`, `emitter_at`, `tex_info_at`,
 // `object_at`, `instance_at` and `medium_at` in every layout.
@@ -257,28 +257,14 @@ fn emitter_tri_at(i: u32) -> EmitterTri {
     fn material_at(i: u32) -> Material { return materials[i]; }
     fn light_at(i: u32) -> Light { return lights[i]; }
     fn emitter_at(i: u32) -> vec4<f32> { return emitters[i]; }
-    @if(uniform_tables) {
-        // The uniform tables (merged.rs `UNIFORM_TABLES`): these four from sized uniform arrays, copies of their
-        // sections, every index held to the array (a scene with more entries than one holds reads the last for the
-        // rest; nothing outside the buffer is read).
-        @group(0) @binding(15) var<uniform> tex_info: array<vec4<f32>, UT_TEX_INFO>;
-        @group(0) @binding(16) var<uniform> objects: array<vec4<f32>, UT_OBJECTS>;
-        @group(0) @binding(17) var<uniform> instances: array<Instance, UT_INSTANCES>;
-        @group(0) @binding(18) var<uniform> media: array<Medium, UT_MEDIA>;
-        fn tex_info_at(i: u32) -> vec4<f32> { return tex_info[min(i, UT_TEX_INFO - 1u)]; }
-        fn object_at(i: u32) -> vec4<f32> { return objects[min(i, UT_OBJECTS - 1u)]; }
-        fn instance_at(i: u32) -> Instance { return instances[min(i, UT_INSTANCES - 1u)]; }
-        fn medium_at(i: u32) -> Medium { return media[min(i, UT_MEDIA - 1u)]; }
-    } @else {
-        @group(0) @binding(15) var<storage, read> tex_info: array<vec4<f32>>;
-        @group(0) @binding(16) var<storage, read> objects: array<vec4<f32>>;
-        @group(0) @binding(17) var<storage, read> instances: array<Instance>;
-        @group(0) @binding(18) var<storage, read> media: array<Medium>;
-        fn tex_info_at(i: u32) -> vec4<f32> { return tex_info[i]; }
-        fn object_at(i: u32) -> vec4<f32> { return objects[i]; }
-        fn instance_at(i: u32) -> Instance { return instances[i]; }
-        fn medium_at(i: u32) -> Medium { return media[i]; }
-    }
+    @group(0) @binding(15) var<storage, read> tex_info: array<vec4<f32>>;
+    @group(0) @binding(16) var<storage, read> objects: array<vec4<f32>>;
+    @group(0) @binding(17) var<storage, read> instances: array<Instance>;
+    @group(0) @binding(18) var<storage, read> media: array<Medium>;
+    fn tex_info_at(i: u32) -> vec4<f32> { return tex_info[i]; }
+    fn object_at(i: u32) -> vec4<f32> { return objects[i]; }
+    fn instance_at(i: u32) -> Instance { return instances[i]; }
+    fn medium_at(i: u32) -> Medium { return media[i]; }
 }
 // Density grids (gpu.rs F_GRID, `GridsGpu`): field A of every grid, stacked along z; one cell in scenes without.
 @group(0) @binding(10) var grid_tex: texture_3d<f32>;
@@ -337,7 +323,7 @@ fn tri_indices(ti: u32) -> vec3<u32> {
     let k = P.word_first[1].x + ti * 3u;
     return vec3<u32>(words[k], words[k + 1u], words[k + 2u]);
 }
-// The row of a triangle no instance places (a light's card, a scene's that is flattened), four words:
+// The row of a triangle no instance places (what the build flattens), four words:
 // its material, its object, its flags (TRI_*), its emitter entry + 1. A mesh's triangle has none: which section of
 // its mesh it is in is its hit's to say (`Hit.part`), and the rest is its instance's.
 fn tri_row(row: u32) -> vec4<u32> {
@@ -345,12 +331,9 @@ fn tri_row(row: u32) -> vec4<u32> {
     return vec4<u32>(words[k], words[k + 1u], words[k + 2u], words[k + 3u]);
 }
 fn tri_flags(row: u32) -> u32 { return words[P.word_first[1].y + row * 4u + 2u]; }
-// Whether an emitter is a rect light's card, which lights one side. (A card is in world space: its row has its
-// material. No mesh is drawn with a card's.)
-fn emitter_is_card(em: EmitterTri) -> bool {
-    if (has(F_INST) && em.inst != NO_INST) { return false; }
-    return material_at(tri_row(em.part).x).tex1.z == MAT_EMITTER_CARD;
-}
+// Whether an emitter is a rect light's card, which lights one side: its entry says (lib.rs `EMITTER_CARD`).
+const EMITTER_CARD: u32 = 1u;
+fn emitter_is_card(em: EmitterTri) -> bool { return (em.flags & EMITTER_CARD) != 0u; }
 // A triangle read whole: its first corner and its edges, and its attributes as a hit has them: normals and UVs a
 // corner; `uv.w`: its section (an instance's: `part`) or its material; `x`: -, its object (an instance's: where its
 // attributes are placed, `inst_x`), -, its emitter entry + 1. `vi`: where its three vertices are in `vertices`
@@ -449,7 +432,7 @@ fn inst_attr(r: Instance, a: TriAttr) -> TriAttr {
 
 // Path vertex index of the current shading point (cheaper procedural detail / fewer candidates past the first hit).
 var<private> cur_depth: u32;
-// Live "ray tracing off" (P.raster.w, LiveCore::rays): set once the camera's own ray has found its surface. From then
+// Live "ray tracing off" (P.jitter.z, LiveCore::rays): set once the camera's own ray has found its surface. From then
 // on `trace` reports a miss, so nothing is shadowed, a bounce sees the sky and a mirror reflects the sky: what a
 // rasterizer without shadow maps draws, on any GPU, from the same scene and the same shading. The switch is a uniform:
 // no kernel is rebuilt to flip it.
@@ -745,24 +728,6 @@ fn proc_normal(h: Hit) -> vec3<f32> {
     return normalize(vec3<f32>(dot(r.n0.xyz, n), dot(r.n1.xyz, n), dot(r.n2.xyz, n)));
 }
 
-// Live primary visibility rasterized by the viewport (triangle index + 1, 0 = sky) at this frame's jitter.
-@group(1) @binding(0) var vis_tex: texture_2d<u32>;
-
-// The camera ray's hit on a known triangle (two-sided, no t range): the raster pass already resolved visibility.
-fn tri_hit(ti: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
-    let ix = tri_indices(ti) * VERTEX_VEC4;
-    let a = vertices[ix.x].xyz;
-    let e1 = vertices[ix.y].xyz - a;
-    let e2 = vertices[ix.z].xyz - a;
-    let p = cross(d, e2);
-    let det = dot(e1, p);
-    let inv = 1.0 / select(det, 1e-20, abs(det) < 1e-20);
-    let s = o - a;
-    let u = dot(s, p) * inv;
-    let q = cross(s, e1);
-    return Hit(dot(e2, q) * inv, ti, clamp(u, 0.0, 1.0), clamp(dot(d, q) * inv, 0.0, 1.0), NO_INST, ti);
-}
-
 // The software BVH walk (without `hwrt`: trace_hw.wgsl's traversal is the hardware's).
 
 @if(!hwrt) fn ray_aabb(o: vec3<f32>, inv_d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>, tmax: f32) -> f32 {
@@ -1046,9 +1011,9 @@ fn glass_at(h: Hit, d: vec3<f32>, t: f32) -> GlassAt {
     // through: water/furnace 1.16.)
     let r = (ior - 1.0) / (ior + 1.0);
     let f0 = r * r;
-    let e = energy_lookup(clamp(m.params.y, 0.02, 1.0), c);
-    let w = 1.0 + P.misc.z * f0 * ((1.0 - e.x) / e.x);
-    g.share = tr * (1.0 - w * (e.x * f0 + e.y * (clamp(50.0 * f0, 0.0, 1.0) - f0)));
+    // What the interface lets through: all but the specular lobe's directional albedo at this roughness and angle (as
+    // `lobes` has it: `spec_terms`).
+    g.share = tr * (1.0 - spec_terms(vec3<f32>(f0), energy_lookup(clamp(m.params.y, 0.02, 1.0), c), P.misc.z).e.x);
     return g;
 }
 
@@ -1564,23 +1529,48 @@ fn surface_proc(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
 }
 
 // ------------------------------------------------------------------------------------------------
-// BSDF (UE DefaultLit)
+// BSDF
 
+// The specular lobe's directional albedo at a roughness and cos(view), as the two terms of the split sum (Karis,
+// "Real Shading in Unreal Engine 4", SIGGRAPH 2013 course notes, "Environment BRDF"; with f90: Lagarde & de Rousiers
+// 2014, eq. 58): with Schlick's Fresnel the lobe (`d_ggx` x `vis_smith_joint_approx`, single scattering) reflects
+// f0 x .x + f90 x .y of a uniform surround, .x + .y at F = 1.
+// From the table lib.rs `energy_lut` computes (`specular_albedo`): ENERGY_N x ENERGY_N nodes over sqrt(cos(view))
+// (along a row) and the roughness, two nodes a vec4 (32 x 32 over sqrt(cos) and sqrt(alpha): the tables' shape of
+// Kulla & Conty 2017 and Turquin 2019, section 3.1.1); between the nodes, bilinear.
+const ENERGY_N: u32 = 32u;
+fn energy_node(i: u32) -> vec2<f32> {
+    let v = energy_at(i >> 1u);
+    return select(v.xy, v.zw, (i & 1u) == 1u);
+}
 fn energy_lookup(roughness: f32, nov: f32) -> vec2<f32> {
-    let x = clamp(nov * 31.0, 0.0, 31.0);
-    let y = clamp(roughness * 31.0, 0.0, 31.0);
-    let x0 = u32(floor(x)); let y0 = u32(floor(y));
-    let x1 = min(x0 + 1u, 31u); let y1 = min(y0 + 1u, 31u);
-    let fx = x - f32(x0); let fy = y - f32(y0);
-    let a = mix(lut(x0, y0), lut(x1, y0), fx);
-    let b = mix(lut(x0, y1), lut(x1, y1), fx);
-    return mix(a, b, fy);
+    let x = sqrt(clamp(nov, 0.0, 1.0)) * f32(ENERGY_N - 1u);
+    let y = clamp(roughness, 0.0, 1.0) * f32(ENERGY_N - 1u);
+    let x0 = min(u32(x), ENERGY_N - 2u);
+    let y0 = min(u32(y), ENERGY_N - 2u);
+    let i = y0 * ENERGY_N + x0;
+    let fx = x - f32(x0);
+    return mix(mix(energy_node(i), energy_node(i + 1u), fx), mix(energy_node(i + ENERGY_N), energy_node(i + ENERGY_N + 1u), fx), y - f32(y0));
 }
 
-fn lut(x: u32, y: u32) -> vec2<f32> {
-    let i = y * 32u + x;
-    let v = energy_at(i / 2u);
-    return select(v.xy, v.zw, (i & 1u) == 1u);
+// The specular lobe's Fresnel and energy terms for a reflectance at normal incidence `f0`, from the lobe's albedo terms
+// `e` (`energy_lookup`).
+// f90, the reflectance at grazing incidence: 1, fading to 0 as f0 falls below 2 %, less than any real material has, so
+// that a material can switch its specular off: saturate(50 x the mean of f0) (Lagarde & de Rousiers, "Moving Frostbite
+// to Physically Based Rendering", SIGGRAPH 2014 course notes, section 4.10.3, Listing 27, after Schuler, "An Efficient
+// and Physically Plausible Real-Time Shading Model", ShaderX7; Filament's documentation, "Specular occlusion").
+// w, the lobe's scale for the light that leaves the microsurface after more than one bounce, which the single-
+// scattering lobe lacks: 1 + f0 (1 - E) / E, E = e.x + e.y the lobe's albedo at F = 1 (Turquin, "Practical multiple
+// scattering compensation for microfacet models", 2019, eq. 16; the energy to return: Kulla & Conty, "Revisiting
+// Physically Based Shading at Imageworks", SIGGRAPH 2017 course; Filament's documentation, "Energy loss in specular
+// reflectance"). `comp` (P.misc.z) of it: at 0 the lobe is single scattering, at 1 a white (f0 = 1) lobe reflects all
+// it receives (the white furnace test).
+// e, the lobe's directional albedo with both: (f0 e.x + f90 e.y) w.
+struct SpecTerms { f90: f32, w: vec3<f32>, e: vec3<f32> };
+fn spec_terms(f0: vec3<f32>, e: vec2<f32>, comp: f32) -> SpecTerms {
+    let f90 = clamp(dot(f0, vec3<f32>(50.0 / 3.0)), 0.0, 1.0);
+    let w = 1.0 + f0 * (comp * (1.0 / max(e.x + e.y, 1e-3) - 1.0));
+    return SpecTerms(f90, w, (f0 * e.x + f90 * e.y) * w);
 }
 
 // Base layer: diffuse + GGX specular (e_spec: the specular's directional albedo; kd: what it leaves the diffuse
@@ -1702,6 +1692,8 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
     var l: Lobes;
     let t = s.transmission * (1.0 - s.metallic);
     l.diffuse = s.base * (1.0 - s.metallic) * (1.0 - t);
+    // The dielectric's reflectance at normal incidence: `specular` 0..1 is 0..8 % (Burley, "Physically-Based Shading at
+    // Disney", SIGGRAPH 2012 course notes, section 5.4: 0.5 is the 4 % of common dielectrics, ior 1.5).
     var f0 = 0.08 * s.specular;
     if (t > 0.0) {
         // Glass: F0 from the index of refraction.
@@ -1709,11 +1701,14 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
         f0 = r * r;
     }
     l.f0 = mix(vec3<f32>(f0), s.base, s.metallic);
-    l.f90 = vec3<f32>(clamp(50.0 * l.f0.g, 0.0, 1.0));
-    let e = energy_lookup(s.roughness, nov);
-    // misc.z = multiple-scattering compensation amount (1 = energy conserving, matches the white furnace).
-    l.w = 1.0 + P.misc.z * l.f0 * ((1.0 - e.x) / e.x);
-    l.e_spec = l.w * (e.x * l.f0 + e.y * (l.f90 - l.f0));
+    // The specular lobe's grazing reflectance, its multiple-scattering scale (P.misc.z of it) and its directional
+    // albedo (`spec_terms`); the diffuse under it gets what the lobe does not reflect toward the view, 1 - E_spec
+    // (the specular's missing energy modulates the diffuse: Kulla & Conty 2017, "Microfacet Dielectrics - Diffuse
+    // Term"; here by the view's albedo alone, not theirs of both directions).
+    let st = spec_terms(l.f0, energy_lookup(s.roughness, nov), P.misc.z);
+    l.f90 = vec3<f32>(st.f90);
+    l.w = st.w;
+    l.e_spec = st.e;
     l.kd = 1.0 - l.e_spec;
     if (has(F_GLASS) && t > 0.0) {
         // The share that is not the dielectric keeps this specular lobe (the diffuse, 1 - t of it already, under it).
@@ -1728,9 +1723,10 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
     if (wd <= 0.0) { l.p_spec = 1.0; }
     l.coat_alpha = 1.0;
     if (has(F_COAT) && s.coat > 0.0) {
-        let ec = energy_lookup(s.coat_rough, nov);
         l.coat = s.coat;
-        l.e_coat = s.coat * (ec.x * 0.04 + ec.y * 0.96);
+        // The coat's directional albedo: a single-scattering lobe of F0 0.04 (ior 1.5), F90 1, at its own roughness.
+        let ec = energy_lookup(s.coat_rough, nov);
+        l.e_coat = s.coat * (0.04 * ec.x + ec.y);
         l.coat_alpha = s.coat_rough * s.coat_rough;
     }
     let under = 1.0 - l.e_coat;
@@ -1751,21 +1747,35 @@ fn lobes(s: Surface, nov: f32) -> Lobes {
     return l;
 }
 
+// The microfacet terms of the specular lobes (a2 = alpha^2, alpha = roughness^2: Burley 2012).
+// The GGX (Trowbridge-Reitz) distribution of microfacet normals: Walter et al., "Microfacet Models for Refraction
+// through Rough Surfaces", EGSR 2007, eq. 33, written over cos(theta_h): a2 / (pi ((n.h)^2 (a2 - 1) + 1)^2), the
+// denominator arranged as in Lagarde & de Rousiers 2014, Listing 2 (`D_GGX`). (In f32 a mirror's a2, 1.6e-7 at the
+// roughness floor of 0.02, is a few steps of n.h below 1: light samples see such a lobe coarsely whatever the
+// arrangement; BSDF samples divide by the same D.)
 fn d_ggx(a2: f32, noh: f32) -> f32 {
     let d = (noh * a2 - noh) * noh + 1.0;
     return a2 / (PI * d * d);
 }
 
+// The visibility V = G2 / (4 n.v n.l) of the height-correlated Smith masking-shadowing for GGX (Heitz, "Understanding
+// the Masking-Shadowing Function in Microfacet-Based BRDFs", JCGT 2014: G2 = 1 / (1 + Lambda(v) + Lambda(l)), which is
+// V = 0.5 / (n.l sqrt(a2 + (1 - a2) (n.v)^2) + n.v sqrt(a2 + (1 - a2) (n.l)^2))), with each square root
+// sqrt(a2 + (1 - a2) c^2) replaced by alpha + (1 - alpha) c, exact at c = 0, c = 1, alpha = 0 and alpha = 1: the
+// denominator becomes a blend of 2 n.l n.v and n.l + n.v by alpha (Hammon, "PBR Diffuse Lighting for GGX+Smith
+// Microsurfaces", GDC 2017; Filament, `V_SmithGGXCorrelated_Fast`, Apache-2.0,
+// https://github.com/google/filament/blob/main/shaders/src/surface_brdf.fs). No square root over the directions; the
+// one here turns the lobes' a2 back into alpha. (lib.rs `specular_albedo` and `glass_energy` integrate this form.)
 fn vis_smith_joint_approx(a2: f32, nov: f32, nol: f32) -> f32 {
-    let a = sqrt(a2);
-    let v = nol * (nov * (1.0 - a) + a);
-    let l = nov * (nol * (1.0 - a) + a);
-    return 0.5 / max(v + l, 1e-7);
+    return 0.5 / max(mix(2.0 * nol * nov, nol + nov, sqrt(a2)), 1e-7);
 }
 
+// Fresnel reflectance by Schlick's approximation ("An Inexpensive BRDF Model for Physically-based Rendering", 1994)
+// with a reflectance at grazing incidence: f0 + (f90 - f0) (1 - v.h)^5.
 fn f_schlick(f0: vec3<f32>, f90: vec3<f32>, voh: f32) -> vec3<f32> {
-    let fc = pow(1.0 - voh, 5.0);
-    return f0 + (f90 - f0) * fc;
+    let c = 1.0 - voh;
+    let c2 = c * c;
+    return f0 + (f90 - f0) * (c2 * c2 * c);
 }
 
 // BSDF * NoL with the specular lobe scaled (per-light specular scale)
@@ -2128,8 +2138,13 @@ fn local_light(li: Light, x: vec3<f32>, u: vec2<f32>) -> LS {
         atten *= win * win;
     }
     if (u32(li.pos.w) == 2u) {
-        let m = clamp((dot(-l, li.dir.xyz) - li.ext.x) * li.ext.y, 0.0, 1.0);
-        atten *= m * m;
+        // The cone: nothing outside its half angle (ext.x its cosine), all of the light inside the inner cone, and
+        // between them linear in the cosine of the angle from the axis (ext.y = 1 / the two cosines' difference),
+        // squared: the angular attenuation of glTF 2.0 KHR_lights_punctual (its reference code, which is `getAngleAtt`
+        // of Lagarde & de Rousiers, "Moving Frostbite to Physically Based Rendering", SIGGRAPH 2014 course notes,
+        // Listing 4). The inner cone from `penumbra`: scene.rs `spot_cone`.
+        let cone = clamp((dot(-l, li.dir.xyz) - li.ext.x) * li.ext.y, 0.0, 1.0);
+        atten *= cone * cone;
     }
     let ls = lp - x;
     let dist = max(length(ls), 1e-6);
@@ -3293,8 +3308,7 @@ fn sphere_hit(x: vec3<f32>, l: vec3<f32>, hit: Hit) -> vec3<f32> {
 }
 
 fn resolve_bound() -> bool { return LIVE && refl_len() >= 2u * P.size.x * P.size.y; }
-// THREERT_CACHE_FLAGS bit 16 turns the resolve off (rays then stay in their pixel's specular, the resolve reads zeros).
-fn resolve_on() -> bool { return resolve_bound() && P.motion.y == 0.0 && (u32(P.cache.w) & 16u) == 0u; }
+fn resolve_on() -> bool { return resolve_bound() && P.motion.y == 0.0; }
 
 // Density of l under the base specular lobe alone (VNDF sampling).
 fn pdf_spec(s: Surface, lb: Lobes, v: vec3<f32>, l: vec3<f32>) -> f32 {
@@ -3579,7 +3593,7 @@ fn cache_end(s: Surface, d: vec3<f32>, cone: vec2<f32>, thr: vec3<f32>, depth: u
     cur_depth = depth;
     var c = thr * cache_reflectance(lb1) * e.rgb;
     // Resampled lights, not the exact loop camera hits get (that costs 2x here: mirror pixels are scattered).
-    mirror_path = mirror_path && (u32(P.cache.w) & 8u) != 0u;
+    mirror_path = false;
     // (The lights alone: the sky's light is in the cache's indirect part, whole. Its samples taken afresh
     // here against the white-lobe ones the cache left out do not add up on a glossy surface: a white metal
     // ground in a mirror read 0.80 of a uniform sky. The lights' still are: weights of two lobes, right for a
@@ -3631,7 +3645,7 @@ fn finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     let depth = (fl >> 8u) & 0xffu;
     cur_depth = depth;
     mirror_path = (fl & DF_MIRROR) != 0u;
-    rays_off = LIVE && P.raster.w > 0.5;
+    rays_off = LIVE && P.jitter.z > 0.5;
     if (has(F_LISTS)) {
         lt_list = r0.z & ~(LT_LIST - 1u);
         lt_list_n = r0.z & (LT_LIST - 1u);
@@ -3701,11 +3715,11 @@ fn guide_hit(origin: vec3<f32>, dir: vec3<f32>, footprint: f32, through_glass: b
     // Rough surfaces have no single reflected point. A stochastic second-bounce hit would move
     // their guide even when both the object and camera stand still.
     accum[q].spec.w = 0.0;
-    if (px.color.w > 0.0 && rough < MIRROR_ROUGHNESS && P.raster.w == 0.0 &&
+    if (px.color.w > 0.0 && rough < MIRROR_ROUGHNESS && P.jitter.z == 0.0 &&
         (any(specular.rgb > vec3<f32>(0.005)) || diffuse.w > 0.0)) {
         cur_depth = 1u;
         mirror_path = true;
-        let ndc = ((vec2<f32>(gid.xy) + P.raster.yz) / vec2<f32>(P.size.xy) * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
+        let ndc = ((vec2<f32>(gid.xy) + P.jitter.xy) / vec2<f32>(P.size.xy) * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
         let d = normalize(P.cam_fwd.xyz + P.cam_right.xyz * ndc.x * P.cam_pos.w * P.cam_fwd.w + P.cam_up.xyz * ndc.y * P.cam_pos.w);
         let x = P.cam_pos.xyz + d * px.color.w;
         let width = px.color.w * 2.0 * P.cam_pos.w / lod_height();
@@ -3809,7 +3823,7 @@ fn media_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     cur_depth = 0u;
     mirror_path = false;
     var px = accum[pix];
-    let ndc = vec2<f32>((f32(gid.x) + P.raster.y) / f32(w) * 2.0 - 1.0, 1.0 - (f32(gid.y) + P.raster.z) / f32(h) * 2.0);
+    let ndc = vec2<f32>((f32(gid.x) + P.jitter.x) / f32(w) * 2.0 - 1.0, 1.0 - (f32(gid.y) + P.jitter.y) / f32(h) * 2.0);
     let d = normalize(P.cam_fwd.xyz + P.cam_right.xyz * (ndc.x * P.cam_pos.w * P.cam_fwd.w) + P.cam_up.xyz * (ndc.y * P.cam_pos.w));
     let ft = px.color.w;
     let mm = media_march(P.cam_pos.xyz, d, select(1.0e30, ft, ft > 0.0), true, rng_dim(D_MEDIA));
@@ -3870,15 +3884,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     cur_depth = 0u;
     let cam = rng4(rng_dim(D_CAMERA));
 
-    // Raster primary: one visibility sample per pixel at the frame's jitter (lens sampling would need its own rays).
-    let raster = LIVE && P.raster.x > 0.5 && P.cam_right.w <= 0.0;
     // Live: one sub-pixel jitter a frame for the whole image (live/frame.rs: Halton 2, 3), which the temporal upscaler
-    // resolves (live.wgsl `upscale`) and the raster pass draws at. Offline, every sample draws its own.
+    // resolves (live.wgsl `upscale`). Offline, every sample draws its own.
     var jx = cam.x;
     var jy = cam.y;
     if (LIVE) {
-        jx = P.raster.y;
-        jy = P.raster.z;
+        jx = P.jitter.x;
+        jy = P.jitter.y;
     }
     let ndc = vec2<f32>((f32(gid.x) + jx) / f32(w) * 2.0 - 1.0, 1.0 - (f32(gid.y) + jy) / f32(h) * 2.0);
     var d = normalize(P.cam_fwd.xyz + P.cam_right.xyz * (ndc.x * P.cam_pos.w * P.cam_fwd.w) + P.cam_up.xyz * (ndc.y * P.cam_pos.w));
@@ -3944,23 +3956,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     mirror_path = false;
     for (var depth = 0u; depth <= P.counts.z; depth++) {
         cur_depth = depth;
-        var hit: Hit;
-        if (raster && depth == 0u) {
-            let id = textureLoad(vis_tex, vec2<i32>(gid.xy), 0).x;
-            if (id == 0u) {
-                hit = Hit(INF, 0xffffffffu, 0.0, 0.0, NO_INST, 0u);
-            } else {
-                hit = tri_hit(id - 1u, o, d);
-                // The raster pass draws cutout triangles whole: the alpha test decides here, else trace past them.
-                if (has(F_MASKED) && (tri_flags(hit.part) & TRI_MASKED) != 0u && !alpha_pass(hit.tri, NO_INST, hit.part, hit.u, hit.v, hit.t)) {
-                    hit = trace(o, d, INF, TRACE_CLOSEST);
-                }
-            }
-        } else {
-            hit = trace(o, d, INF, TRACE_CLOSEST);
-        }
+        var hit = trace(o, d, INF, TRACE_CLOSEST);
         // Ray tracing off: the camera ray above was the last one traced for this pixel.
-        if (depth == 0u) { rays_off = LIVE && P.raster.w > 0.5; }
+        if (depth == 0u) { rays_off = LIVE && P.jitter.z > 0.5; }
         if (has(F_FOG) && P.fog.x > 0.0) {
             // Height fog on every segment (attenuation + ambient inscattering); lit volumetric scattering on camera rays.
             let t0 = select(0.0, P.fog.w, depth == 0u);
@@ -4153,8 +4151,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // Live: the path ends in the radiance cache at its first bounce (`cache_end`).
         if (cache_on() && depth >= 1u && !(has(F_GLASS) && s.transmission > 0.0)) {
-            let hit_light = spec_lobe && rough0 < 0.4 && depth == 1u && (u32(P.cache.w) & 2u) == 0u;
-            let train = (((gid.x >> 3u) + 3u * (gid.y >> 2u) + pcg(P.size.z)) & CACHE_TRAIN_MASK) == 0u && (u32(P.cache.w) & 4u) == 0u;
+            let hit_light = spec_lobe && rough0 < 0.4 && depth == 1u;
+            let train = (((gid.x >> 3u) + 3u * (gid.y >> 2u) + pcg(P.size.z)) & CACHE_TRAIN_MASK) == 0u;
             @if(merged) { radiance += cache_end(s, d, vec2<f32>(width, cone_a), thr, depth, train, hit_light, straight); }
             @if(!merged) {
                 // Here only what a warm voxel holds; a pixel with more to trace is left for `finish`.
