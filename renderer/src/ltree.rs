@@ -434,7 +434,7 @@ mod tests {
     use super::*;
 
     fn tri(i: u32, x: f32) -> (EmitterTri, [[f32; 4]; 3]) {
-        (EmitterTri { tri: i, mat: 0, obj: 0, area: 0.5, c: [x + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: crate::NO_INST, part: 0 }, [[x, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        (EmitterTri { tri: i, mat: 0, obj: 0, area: 0.5, c: [x + 1.0 / 3.0, 1.0 / 3.0, 0.0], moves: false, nominal: false, in_tree: false, inst: crate::NO_INST, part: 0, card: false }, [[x, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
     }
 
     /// A deterministic stream of numbers in [0, 1).
